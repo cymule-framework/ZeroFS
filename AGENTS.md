@@ -171,3 +171,63 @@ attribution intact.
   this repository as part of the authority core.
 - Read `RHIZOME_EXPORT_AUTHORITY.md` before changing the reserved namespace,
   transition model, commit-time fence validation, or feature boundary.
+
+- `fs::workspace_genesis` is the non-default `rhizome-workspace-genesis-core`
+  mechanics candidate. It reuses the sole 0x0A Workspace operation ledger;
+  0x0C stores only the immutable genesis domain record and is not another
+  lifecycle state machine.
+- Genesis root objects are SHA-256 addressed and installed with native
+  conditional Create followed by exact-key byte/digest readback. Never replace
+  this with HEAD-before-PUT, overwrite, retrying an unknown mutation, or Redis
+  authority.
+- The generic ZeroFS object-store stack is not a genesis mutation executor: it
+  may contain automatic or unbounded PUT retries. Genesis uses a dedicated
+  single-dispatch adapter. The production adapter is intentionally unavailable
+  in this candidate; only tests have a direct non-retrying implementation.
+- Before the one Create attempt, atomically advance the same 0x0A operation from
+  PENDING to its immutable effect-dispatch claim. Only the call that installs
+  that claim may send Create. Bind a fresh random installer identity into the
+  claim so another claimant cannot satisfy an unknown claim readback. Every
+  replay, including cold reopen after unknown Create/readback, may perform
+  exact-key GET only. Generic terminal completion is rejected after a claim;
+  only the typed genesis completion path may finish it after exact receipt and
+  durable graph verification.
+- The coordinator atomically publishes the sparse `.nbd` file, immutable 0x0C
+  record, and both 0x0B reverse bindings, then flushes and reads writer epoch
+  plus durable sequence from one `DbStatus` snapshot. Activation under this
+  profile requires the exact genesis/export/Actor-generation binding.
+- Genesis and NBD must obtain `storage_shard_id` from the same process-lifetime
+  shard guard installed into the export coordinator. Never add a Genesis-local
+  configured shard, caller fallback, or second shard identity source.
+- Keep the production capability-verifier and receipt-signer constructors
+  unreachable until Rhizome's normative CDDL and official fixtures exist.
+  Tests may use only the sealed test constructors. Genesis records use the
+  explicit closed codec; do not serialize them with bincode or protobuf.
+- Keep the canonical genesis command separate from the derived physical plan.
+  `virtual_size_bytes` belongs to the command; export name and initial root
+  bytes/digest belong to a separately sealed plan derived from the exact
+  immutable template/root-policy inputs. The current candidate has only a
+  test constructor for that seal and must not accept caller-selected plan data
+  in production.
+- The dispatch claim binds a versioned deterministic plan digest covering the
+  canonical request digest, export name, virtual size, and root digest, plus a
+  unique installer UUID. A replay under a different plan must not materialize.
+- The 0x0C row binds the complete operation key, authority creation baseline,
+  tenant, immutable template/root-policy refs, source CreateActor digest,
+  object lineage, storage shard/routing revision, root identity, and exact
+  export identity. Validate the guarded local shard before lookup or effect.
+  Activation requires the same home/authority baseline and a durable 0x0A
+  SUCCEEDED outcome; PENDING or effect-dispatched is not genesis success.
+- If the unique installer disappears after its claim becomes durable but before
+  Create dispatch, the operation remains fail-closed at EffectDispatched. A new
+  invocation may GET only and cannot adopt or repeat the mutation. Closing that
+  liveness gap requires a future supervised installer-incarnation receipt, not
+  a retry heuristic.
+- Deterministic physical conflicts after dispatch use the typed genesis
+  rejection request. The coordinator atomically rechecks the exact 0x0A claim
+  and that no matching 0x0C result exists before writing signed FAILED bytes.
+  It must never manufacture NOT_COMMITTED from absence or use this path for an
+  unknown object/database outcome.
+- Different bytes at the expected SHA-256 object key are shard/storage
+  corruption, not a request conflict. Leave the operation claimed, return
+  Corrupt, and never turn that condition into an ordinary FAILED receipt.

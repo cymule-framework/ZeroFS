@@ -299,3 +299,11 @@ fn export_authority_transition_model() {
         zerofs::fs::export_authority::dst_export_authority_model(seed);
     }
 }
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+#[test]
+fn workspace_genesis_codec_model() {
+    for seed in [1, 3, 17, 101, 65_537, u32::MAX as u64] {
+        zerofs::fs::workspace_genesis::dst_workspace_genesis_codec_model(seed);
+    }
+}

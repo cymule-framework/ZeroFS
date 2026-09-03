@@ -2011,7 +2011,7 @@ pub(crate) async fn read_reverse_binding_current(
     decode_reverse_binding(&bytes, key).map(Some)
 }
 
-async fn read_reverse_binding_durable(
+pub(crate) async fn read_reverse_binding_durable(
     db: &Db,
     key: &Bytes,
 ) -> Result<Option<ExportReverseBinding>, ExportAuthorityError> {
@@ -3472,6 +3472,13 @@ mod tests {
     use crate::frame_codec::FrameCodec;
     use crate::fs::ZeroFS;
     use crate::fs::inode::test_file_inode;
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    use crate::fs::workspace_genesis::{
+        ContentDigest, GenesisCommand, GenesisMaterializationPlan, GenesisMaterializeResult,
+        VerifiedGenesisInput, VerifiedGenesisTerminal,
+    };
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    use crate::fs::workspace_operation::{CanonicalRequestDigest, WorkspaceOperationKey};
     use bytes::Bytes;
     use futures::TryStreamExt;
     use proptest::prelude::*;
@@ -7144,6 +7151,99 @@ mod tests {
         assert_eq!(
             validate_nbd_install_expectation(&altered, true),
             Err(ExportAuthorityError::Invalid)
+        );
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[tokio::test]
+    async fn genesis_activation_and_nbd_claim_share_one_guarded_authority_graph() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.export_authority
+            .install_process_guard(ShardProcessGuard::for_test())
+            .unwrap();
+        fs.mkdir(
+            &crate::fs::test_util::test_creds(),
+            0,
+            b".nbd",
+            &crate::fs::types::SetAttributes::default(),
+        )
+        .await
+        .unwrap();
+
+        let operation = WorkspaceOperationKey::new("workspace-a", 101, "request-genesis-a");
+        let request_digest = CanonicalRequestDigest::new([0x31; SHA256_SIZE]);
+        let root_bytes = Bytes::from_static(b"combined-genesis-root");
+        let verified = VerifiedGenesisInput::for_test(
+            GenesisCommand {
+                operation: operation.clone(),
+                request_digest,
+                actor: "tenants/t/actors/a".into(),
+                actor_generation: 7,
+                home_cell: "cells/c".into(),
+                home_revision: 11,
+                authority_epoch: 13,
+                tenant: "tenants/t".into(),
+                template: "templates/base@sha256:01".into(),
+                root_policy: "policies/root@1".into(),
+                source_create_actor_request_digest: ContentDigest::new([0x32; SHA256_SIZE]),
+                object_lineage: "lineage-combined-a".into(),
+                storage_shard_id: "test-shard-a".into(),
+                storage_routing_revision: 17,
+                virtual_size_bytes: 4096,
+            },
+            GenesisMaterializationPlan {
+                export_name: b"disk-a".to_vec(),
+                root_digest: ContentDigest::new(Sha256::digest(&root_bytes).into()),
+                root_bytes,
+            },
+        )
+        .unwrap();
+        let GenesisMaterializeResult::Materialized(receipt) = fs
+            .workspace_genesis
+            .materialize(verified.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected combined genesis materialization");
+        };
+        fs.workspace_genesis
+            .complete(
+                &verified,
+                VerifiedGenesisTerminal::for_test(
+                    operation,
+                    request_digest,
+                    (*receipt).clone(),
+                    Bytes::from_static(b"signed-genesis-terminal"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        fs.export_authority
+            .enable_standalone_profile()
+            .await
+            .unwrap();
+        fs.write_coordinator.dst_enable_workspace_genesis_gate();
+        let active = fs
+            .export_authority
+            .activate(ActivateExport {
+                workspace_id: receipt.record.workspace_id.clone(),
+                export: receipt.record.export.clone(),
+                authority: authority(3, 5),
+                session: session("session-a", "capability-a", u64::MAX - 1),
+            })
+            .await
+            .unwrap();
+        let claim = nbd_install_complete_and_claim(&fs, &active, 0x41, 0x4200).await;
+        assert_eq!(claim.install.expectation.token.workspace_id, "workspace-a");
+        assert_eq!(
+            claim.install.expectation.reverse_binding.export,
+            receipt.record.export
+        );
+        assert_eq!(
+            claim.install.expectation.server.storage_shard_id,
+            receipt.record.storage_shard_id
         );
     }
 

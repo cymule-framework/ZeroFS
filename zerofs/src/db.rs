@@ -502,6 +502,17 @@ impl Db {
             .map_or(0, |status| status.borrow().durable_seq)
     }
 
+    /// One coherent post-flush durability snapshot. The writer epoch and
+    /// durable sequence must never be assembled from separate watch borrows.
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn rhizome_durability_snapshot(&self) -> Option<(u64, u64)> {
+        let snapshot = self.status.as_ref()?.borrow();
+        Some((
+            snapshot.current_manifest.writer_epoch(),
+            snapshot.durable_seq,
+        ))
+    }
+
     /// Attach the HA leader lease; reads/writes are then refused while it is
     /// invalid. Single-node `Db`s have no lease and are never gated.
     pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {

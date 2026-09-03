@@ -32,6 +32,7 @@ use bytes::Bytes;
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
 //   0x0A WORKSPACE_OP   Rhizome Workspace operation ledger, versioned composite key
 //   0x0B EXPORT_AUTHORITY Rhizome per-export authority/session state
+//   0x0C WORKSPACE_GENESIS Rhizome immutable Workspace genesis domain record
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -45,6 +46,7 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_WORKSPACE_OPERATION: u8 = 0x0A;
 const PREFIX_EXPORT_AUTHORITY: u8 = 0x0B;
+const PREFIX_WORKSPACE_GENESIS: u8 = 0x0C;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -109,6 +111,7 @@ pub(crate) fn is_reserved_mutation_key(key: &[u8]) -> bool {
     let kind = key[META_DOMAIN.len()];
     kind == PREFIX_WORKSPACE_OPERATION
         || kind == PREFIX_EXPORT_AUTHORITY
+        || kind == PREFIX_WORKSPACE_GENESIS
         || (kind == PREFIX_SYSTEM
             && key.get(META_DOMAIN.len() + 1) == Some(&SYSTEM_EXPORT_BOOT_SUBTYPE))
 }
@@ -237,6 +240,42 @@ pub(crate) enum ExportBindingMetadataKey {
 impl KeyCodec {
     pub fn new() -> Self {
         Self
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn workspace_genesis_key(&self, workspace_id: &str) -> Bytes {
+        let bytes = workspace_id.as_bytes();
+        let len = u16::try_from(bytes.len()).expect("validated Workspace id fits u16");
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 2 + bytes.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_GENESIS);
+        key.push(1);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(bytes);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn workspace_genesis_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 2);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_GENESIS);
+        key.push(1);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn parse_workspace_genesis_workspace<'a>(&self, key: &'a [u8]) -> Option<&'a str> {
+        let prefix = self.workspace_genesis_prefix();
+        if !key.starts_with(&prefix) || key.len() < prefix.len() + 2 {
+            return None;
+        }
+        let offset = prefix.len();
+        let len = u16::from_be_bytes(key[offset..offset + 2].try_into().ok()?) as usize;
+        if key.len() != offset + 2 + len {
+            return None;
+        }
+        std::str::from_utf8(&key[offset + 2..]).ok()
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -1033,6 +1072,10 @@ mod tests {
         let codec = KeyCodec::new();
         let ledger = codec.workspace_operation_key(1, b"workspace-a", 10, b"request-a");
         assert!(is_reserved_mutation_key(&ledger));
+        #[cfg(feature = "rhizome-workspace-genesis-core")]
+        assert!(is_reserved_mutation_key(
+            &codec.workspace_genesis_key("workspace-a")
+        ));
         #[cfg(feature = "rhizome-export-authority-core")]
         {
             assert!(is_reserved_mutation_key(
@@ -1068,6 +1111,40 @@ mod tests {
         assert!(!is_reserved_mutation_key(&codec.inode_key(1)));
         assert!(!is_reserved_mutation_key(&codec.system_counter_key()));
         assert!(!is_reserved_mutation_key(&codec.extent_key(1, 0)));
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[test]
+    fn genesis_namespace_is_disjoint_from_every_nbd_authority_subtype() {
+        let codec = KeyCodec::new();
+        let session = NbdSessionKey {
+            workspace_id: "workspace-a",
+            actor: "actor-a",
+            actor_generation: 1,
+            placement_epoch: 2,
+            session_id: "session-a",
+            server_boot_id: "boot-a",
+        };
+        let genesis = codec.workspace_genesis_key("workspace-a");
+        assert_eq!(genesis[META_DOMAIN.len()], PREFIX_WORKSPACE_GENESIS);
+        assert_eq!(
+            codec.parse_workspace_genesis_workspace(&genesis),
+            Some("workspace-a")
+        );
+
+        let nbd_keys = [
+            codec.nbd_session_install_key(&session),
+            codec.nbd_session_install_outcome_key("workspace-a", &[1; 16]),
+            codec.nbd_connection_receipt_key(&session, &[2; 16]),
+            codec.nbd_connection_reservation_key(&[2; 16]),
+        ];
+        for (key, expected_subtype) in nbd_keys.into_iter().zip(5u8..=8) {
+            assert_eq!(key[META_DOMAIN.len()], PREFIX_EXPORT_AUTHORITY);
+            assert_eq!(key[META_DOMAIN.len() + 1], EXPORT_KEY_VERSION);
+            assert_eq!(key[META_DOMAIN.len() + 2], expected_subtype);
+            assert!(!key.starts_with(&codec.workspace_genesis_prefix()));
+            assert_eq!(codec.parse_workspace_genesis_workspace(&key), None);
+        }
     }
 
     #[test]

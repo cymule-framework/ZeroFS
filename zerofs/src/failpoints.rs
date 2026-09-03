@@ -9,6 +9,11 @@ pub const WRITE_AFTER_COMMIT: &str = "write_after_commit";
 pub const WORKSPACE_OPERATION_AFTER_COMMIT_BEFORE_REPLY: &str =
     "workspace_operation_after_commit_before_reply";
 
+/// Genesis physical state and reverse bindings are durable, but the caller did
+/// not observe the materialization receipt.
+pub const WORKSPACE_GENESIS_AFTER_COMMIT_BEFORE_REPLY: &str =
+    "workspace_genesis_after_commit_before_reply";
+
 pub const FALLOCATE_AFTER_EXTENTS: &str = "fallocate_after_extents";
 pub const FALLOCATE_AFTER_INODE: &str = "fallocate_after_inode";
 pub const FALLOCATE_AFTER_COMMIT: &str = "fallocate_after_commit";

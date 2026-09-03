@@ -16,6 +16,11 @@ pub mod stats;
 pub mod store;
 pub mod tracing;
 pub mod types;
+#[cfg(all(feature = "rhizome-workspace-genesis-core", not(dst)))]
+pub(crate) mod workspace_genesis;
+#[cfg(all(feature = "rhizome-workspace-genesis-core", dst))]
+#[doc(hidden)]
+pub mod workspace_genesis;
 pub mod workspace_operation;
 pub mod write_coordinator;
 
@@ -33,6 +38,8 @@ use self::metrics::FileSystemStats;
 use self::stats::FileSystemGlobalStats;
 use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use self::tracing::AccessTracer;
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+use self::workspace_genesis::WorkspaceGenesisStore;
 use self::workspace_operation::WorkspaceOperationLedger;
 use self::write_coordinator::WriteCoordinator;
 use crate::db::Db;
@@ -131,6 +138,17 @@ pub struct ZeroFS {
     /// Durable Rhizome Workspace operation intent/outcome ledger. This is an
     /// internal storage primitive; it does not execute or sign operations.
     pub workspace_operations: WorkspaceOperationLedger,
+    /// Non-default immutable Workspace genesis mechanics. Inputs are accepted
+    /// only through the sealed verifier boundary in `workspace_genesis`.
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "feature-staged until verified control-plane wiring"
+        )
+    )]
+    pub(crate) workspace_genesis: WorkspaceGenesisStore,
     /// Durable per-export Rhizome authority and session state. Transitions and
     /// fenced mutations are serialized by the single WriteCoordinator.
     #[cfg(feature = "rhizome-export-authority-core")]

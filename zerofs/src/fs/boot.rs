@@ -155,7 +155,11 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let segment_store = Arc::new(SegmentStore::new(object_store, segment_codec, writer_epoch));
+        let segment_store = Arc::new(SegmentStore::new(
+            object_store.clone(),
+            segment_codec,
+            writer_epoch,
+        ));
         let extent_store = ExtentStore::new(
             db.clone(),
             key_codec.clone(),
@@ -215,6 +219,13 @@ impl ZeroFS {
             db.clone(),
             write_coordinator.clone(),
         );
+        #[cfg(feature = "rhizome-workspace-genesis-core")]
+        let workspace_genesis = crate::fs::workspace_genesis::WorkspaceGenesisStore::new(
+            db.clone(),
+            write_coordinator.clone(),
+            workspace_operations.clone(),
+            object_store.clone(),
+        );
         #[cfg(feature = "rhizome-export-authority-core")]
         let export_authority = crate::fs::export_authority::ExportAuthorityStore::new(
             db.clone(),
@@ -249,6 +260,8 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             workspace_operations,
+            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            workspace_genesis,
             #[cfg(feature = "rhizome-export-authority-core")]
             export_authority,
             ignore_fsync,

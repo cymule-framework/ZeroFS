@@ -190,6 +190,15 @@ record plus key-bound reverse-name and reverse-inode rows in one coordinator
 batch. Refresh, deactivate, and fence retain these rows. Retirement and garbage
 collection are intentionally outside this core slice.
 
+With `rhizome-workspace-genesis-core`, genesis creates that physical graph and
+the two reverse rows before activation. The 0x0C genesis row is a separate
+immutable domain record, while NBD Install/outcome/connection/reservation remain
+0x0B version-2 subtypes 5 through 8. Both genesis admission and NBD admission
+read the storage shard installed from the same retained process guard. A
+combined test covers genesis terminal completion, gated activation, NBD Install
+completion, and first-FD claim without inventing a second shard or lifecycle
+authority.
+
 Export key and envelope version 2 are an explicit pre-release schema boundary.
 Profile enablement scans the narrow reserved version-1 prefix and fails with
 `MigrationRequired` if any legacy forward or mutation-outcome row exists. It
