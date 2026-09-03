@@ -1088,6 +1088,13 @@ mod tests {
     }
 
     async fn open_reopen_fs(object_store: Arc<dyn ObjectStore>) -> ZeroFS {
+        open_reopen_fs_with_shard(object_store, "test-shard-a").await
+    }
+
+    async fn open_reopen_fs_with_shard(
+        object_store: Arc<dyn ObjectStore>,
+        shard_id: &str,
+    ) -> ZeroFS {
         let test_key = [0u8; 32];
         let transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default()).unwrap();
@@ -1117,7 +1124,7 @@ mod tests {
         .await
         .unwrap();
         fs.export_authority
-            .install_process_guard(ShardProcessGuard::for_test())
+            .install_process_guard(ShardProcessGuard::for_test_shard(shard_id))
             .unwrap();
         if fs
             .lookup(&crate::fs::test_util::test_creds(), 0, b".nbd")
@@ -1195,6 +1202,19 @@ mod tests {
                 .size(),
             4096
         );
+        let contents = fs
+            .extent_store
+            .read(durable.export.inode, 0, 4096)
+            .await
+            .unwrap();
+        assert_eq!(contents.as_ref(), &[0; 4096]);
+        assert_eq!(
+            fs.db
+                .get_bytes(&KeyCodec::new().extent_key(durable.export.inode, 0))
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(
             fs.directory_store
                 .get(durable.export.nbd_directory_inode, &durable.export.name)
@@ -1234,6 +1254,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_genesis_batch_publishes_no_partial_physical_or_authority_graph() {
+        let fs = new_fs().await;
+        let input = verified("workspace-a", "request-a", b"root-a");
+        let nbd_directory_inode = fs
+            .lookup(&crate::fs::test_util::test_creds(), 0, b".nbd")
+            .await
+            .unwrap();
+        let device_inode = fs.inode_store.next_id();
+        let export = ExportIdentity {
+            nbd_directory_inode,
+            name: input.plan.export_name.clone(),
+            inode: device_inode,
+            advertised_size: input.command.virtual_size_bytes,
+        };
+        let binding = ExportReverseBinding {
+            workspace_id: input.command.operation.workspace_id.clone(),
+            actor: input.command.actor.clone(),
+            actor_generation: input.command.actor_generation,
+            export: export.clone(),
+        };
+        let (reverse_name_key, reverse_inode_key) = reverse_binding_keys(&binding);
+        fs.write_coordinator.dst_fail_next_genesis_before_write();
+        assert_eq!(
+            fs.workspace_genesis.materialize(input).await,
+            Err(GenesisError::CommitOutcomeUnknown)
+        );
+
+        let codec = KeyCodec::new();
+        for key in [
+            codec.workspace_genesis_key("workspace-a"),
+            codec.inode_key(device_inode),
+            codec.dir_entry_key(nbd_directory_inode, &export.name),
+            reverse_name_key,
+            reverse_inode_key,
+        ] {
+            assert_eq!(
+                fs.db.get_bytes(&key).await.unwrap(),
+                None,
+                "partial key {key:?}"
+            );
+        }
+        assert_eq!(
+            fs.directory_store
+                .get(nbd_directory_inode, &export.name)
+                .await,
+            Err(crate::fs::errors::FsError::NotFound)
+        );
     }
 
     #[tokio::test]
@@ -1898,6 +1968,174 @@ mod tests {
             missing,
             Err(crate::fs::export_authority::ExportAuthorityError::NotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_genesis_reopened_under_a_different_guarded_shard() {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_reopen_fs_with_shard(object_store.clone(), "test-shard-a").await;
+        let input = verified("workspace-a", "request-a", b"root-a");
+        let GenesisMaterializeResult::Materialized(receipt) = first
+            .workspace_genesis
+            .materialize(input.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected materialized genesis");
+        };
+        first
+            .workspace_genesis
+            .complete(
+                &input,
+                VerifiedGenesisTerminal::for_test(
+                    input.command().operation.clone(),
+                    input.command().request_digest,
+                    (*receipt).clone(),
+                    Bytes::from_static(b"signed-terminal"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        first.db.close().await.unwrap();
+        drop(first);
+
+        let reopened = open_reopen_fs_with_shard(object_store, "test-shard-b").await;
+        reopened
+            .export_authority
+            .enable_standalone_profile()
+            .await
+            .unwrap();
+        reopened
+            .write_coordinator
+            .dst_enable_workspace_genesis_gate();
+        let command = ActivateExport {
+            workspace_id: receipt.record.workspace_id.clone(),
+            export: receipt.record.export.clone(),
+            authority: AuthorityVersion {
+                actor: receipt.record.actor.clone(),
+                actor_generation: receipt.record.actor_generation,
+                home_cell: receipt.record.home_cell.clone(),
+                home_revision: receipt.record.home_revision,
+                authority_epoch: receipt.record.authority_epoch,
+                placement_epoch: 1,
+                assignment_revision: 1,
+            },
+            session: ExportSessionState {
+                session_id: "session-a".into(),
+                capability_id: "capability-a".into(),
+                expires_at_unix_millis: u64::MAX - 1,
+                node_incarnation_id: "node-a".into(),
+                runtime_id: "runtime-a".into(),
+                server_boot_id: "caller-value".into(),
+                committed_through_sequence: 0,
+            },
+        };
+        assert_eq!(
+            reopened.export_authority.activate(command).await,
+            Err(crate::fs::export_authority::ExportAuthorityError::Conflict)
+        );
+        assert_eq!(
+            reopened.export_authority.get("workspace-a").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_revalidates_each_physical_axis_with_genesis_reverse_rows_present() {
+        for damaged_axis in 0..3 {
+            let fs = new_fs().await;
+            let input = verified("workspace-a", "request-a", b"root-a");
+            let GenesisMaterializeResult::Materialized(receipt) = fs
+                .workspace_genesis
+                .materialize(input.clone())
+                .await
+                .unwrap()
+            else {
+                panic!("expected materialized genesis");
+            };
+            fs.workspace_genesis
+                .complete(
+                    &input,
+                    VerifiedGenesisTerminal::for_test(
+                        input.command().operation.clone(),
+                        input.command().request_digest,
+                        (*receipt).clone(),
+                        Bytes::from_static(b"signed-terminal"),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let binding = reverse_binding(&receipt.record);
+            let (reverse_name_key, reverse_inode_key) = reverse_binding_keys(&binding);
+            let damaged_key = match damaged_axis {
+                0 => KeyCodec::new().inode_key(receipt.record.export.inode),
+                1 => KeyCodec::new().dir_entry_key(
+                    receipt.record.export.nbd_directory_inode,
+                    &receipt.record.export.name,
+                ),
+                2 => KeyCodec::new().dir_entry_key(0, b".nbd"),
+                _ => unreachable!(),
+            };
+            fs.db
+                .inject_export_binding_metadata_delete_for_test(damaged_key)
+                .await
+                .unwrap();
+            fs.flush_coordinator.flush().await.unwrap();
+            assert_eq!(
+                crate::fs::export_authority::read_reverse_binding_current(
+                    &fs.db,
+                    &reverse_name_key,
+                )
+                .await
+                .unwrap(),
+                Some(binding.clone())
+            );
+            assert_eq!(
+                crate::fs::export_authority::read_reverse_binding_current(
+                    &fs.db,
+                    &reverse_inode_key,
+                )
+                .await
+                .unwrap(),
+                Some(binding)
+            );
+
+            fs.export_authority
+                .enable_standalone_profile()
+                .await
+                .unwrap();
+            fs.write_coordinator.dst_enable_workspace_genesis_gate();
+            let command = ActivateExport {
+                workspace_id: receipt.record.workspace_id.clone(),
+                export: receipt.record.export.clone(),
+                authority: AuthorityVersion {
+                    actor: receipt.record.actor.clone(),
+                    actor_generation: receipt.record.actor_generation,
+                    home_cell: receipt.record.home_cell.clone(),
+                    home_revision: receipt.record.home_revision,
+                    authority_epoch: receipt.record.authority_epoch,
+                    placement_epoch: 1,
+                    assignment_revision: 1,
+                },
+                session: ExportSessionState {
+                    session_id: "session-a".into(),
+                    capability_id: "capability-a".into(),
+                    expires_at_unix_millis: u64::MAX - 1,
+                    node_incarnation_id: "node-a".into(),
+                    runtime_id: "runtime-a".into(),
+                    server_boot_id: "caller-value".into(),
+                    committed_through_sequence: 0,
+                },
+            };
+            assert_eq!(
+                fs.export_authority.activate(command).await,
+                Err(crate::fs::export_authority::ExportAuthorityError::Invalid)
+            );
+            assert_eq!(fs.export_authority.get("workspace-a").await.unwrap(), None);
+        }
     }
 
     #[test]

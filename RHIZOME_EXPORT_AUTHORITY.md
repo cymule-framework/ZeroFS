@@ -197,7 +197,9 @@ immutable domain record, while NBD Install/outcome/connection/reservation remain
 read the storage shard installed from the same retained process guard. A
 combined test covers genesis terminal completion, gated activation, NBD Install
 completion, and first-FD claim without inventing a second shard or lifecycle
-authority.
+authority. It exercises protocol-neutral durable core structs only: it does not
+open an accepted Unix stream, own the listener lifecycle, or qualify same-FD
+handshake/claim behavior.
 
 Export key and envelope version 2 are an explicit pre-release schema boundary.
 Profile enablement scans the narrow reserved version-1 prefix and fails with

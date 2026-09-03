@@ -204,6 +204,8 @@ struct WorkspaceDurableTestHook {
     release_before_apply: tokio::sync::Notify,
     fail_next_flush: std::sync::atomic::AtomicBool,
     drop_next_reply: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
+    fail_next_genesis_before_write: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
     pause_export_after_permit: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
@@ -759,6 +761,13 @@ impl WriteCoordinator {
     pub fn dst_drop_next_workspace_durable_reply(&self) {
         self.workspace_durable_test_hook
             .drop_next_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
+    pub(crate) fn dst_fail_next_genesis_before_write(&self) {
+        self.workspace_durable_test_hook
+            .fail_next_genesis_before_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1969,6 +1978,17 @@ async fn commit_workspace_genesis(
         .stage_delta(ctx.global_stats.shard_of(inode), 0, 1);
     batch.put_bytes(stats.key.clone(), stats.value.clone());
 
+    #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
+    if ctx
+        .workspace_durable_test_hook
+        .fail_next_genesis_before_write
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        ctx.export_binding_index.initialized = false;
+        ctx.inode_store.allocate();
+        return Err(GenesisError::CommitOutcomeUnknown);
+    }
+
     #[cfg(any(test, dst))]
     if ctx
         .workspace_durable_test_hook
@@ -2111,6 +2131,13 @@ async fn commit_export_authority_transition(
             .await
             .map_err(|_| ExportAuthorityError::Corrupt)?
             .ok_or(ExportAuthorityError::NotFound)?;
+        let guarded_shard = ctx
+            .export_storage_shard_id
+            .get()
+            .ok_or(ExportAuthorityError::ProfileDisabled)?;
+        if genesis.storage_shard_id != guarded_shard.as_ref() {
+            return Err(ExportAuthorityError::Conflict);
+        }
         crate::fs::workspace_genesis::validate_activation_genesis(
             &genesis,
             &workspace_id,
@@ -2675,6 +2702,59 @@ async fn validate_nbd_session_authority(
         .is_none_or(|shard| shard.as_ref() != expected.server.storage_shard_id)
     {
         return Err(ExportAuthorityError::Conflict);
+    }
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    if ctx
+        .genesis_gate_enabled
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let genesis = crate::fs::workspace_genesis::read_record_current(
+            &ctx.db,
+            &expected.token.workspace_id,
+        )
+        .await
+        .map_err(|_| ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::NotFound)?;
+        if genesis.storage_shard_id != expected.server.storage_shard_id
+            || genesis.storage_routing_revision != expected.storage_routing_revision
+        {
+            return Err(ExportAuthorityError::Conflict);
+        }
+        crate::fs::workspace_genesis::validate_activation_genesis(
+            &genesis,
+            &expected.token.workspace_id,
+            &expected.token.authority,
+            &expected.token.export,
+        )
+        .map_err(|error| match error {
+            GenesisError::Conflict => ExportAuthorityError::Conflict,
+            _ => ExportAuthorityError::Corrupt,
+        })?;
+        let operation = crate::fs::workspace_operation::WorkspaceOperationKey::new(
+            genesis.workspace_id.clone(),
+            genesis.operation_kind,
+            genesis.request_id.clone(),
+        );
+        match crate::fs::workspace_operation::read_operation_durable(
+            &ctx.db,
+            &operation,
+            genesis.request_digest,
+        )
+        .await
+        .map_err(|_| ExportAuthorityError::Corrupt)?
+        {
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Known(record)
+                if matches!(
+                    record.state,
+                    crate::fs::workspace_operation::WorkspaceOperationState::Succeeded(_)
+                ) => {}
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Known(_) => {
+                return Err(ExportAuthorityError::Conflict);
+            }
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Unknown => {
+                return Err(ExportAuthorityError::NotFound);
+            }
+        }
     }
     let boot = ctx
         .db

@@ -910,6 +910,27 @@ impl Db {
             .await
     }
 
+    /// Test-only corruption injector for an export's physical inode, extent,
+    /// directory entry, or root `.nbd` mapping. Production writes remain on the
+    /// coordinator path and are fenced by the reverse-binding deny index.
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    pub(crate) async fn inject_export_binding_metadata_delete_for_test(
+        &self,
+        key: Bytes,
+    ) -> Result<u64> {
+        assert!(
+            crate::fs::key_codec::KeyCodec::new()
+                .parse_export_binding_metadata_key(&key)
+                .is_some()
+        );
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.acquire_write_permit()
+            .await?
+            .write_with_options(batch, &WriteOptions::default())
+            .await
+    }
+
     pub(crate) async fn put_with_options(
         &self,
         key: &Bytes,

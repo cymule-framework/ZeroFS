@@ -730,12 +730,16 @@ impl ShardProcessGuard {
 
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn for_test() -> Self {
+        Self::for_test_shard("test-shard-a")
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn for_test_shard(shard_id: &str) -> Self {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let directory = tempfile::tempdir().unwrap().keep();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let shard_id = "test-shard-a".to_owned();
-        let lock_path = directory.join(shard_lock_name(&shard_id));
+        let lock_path = directory.join(shard_lock_name(shard_id));
         let lock = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -755,7 +759,7 @@ impl ShardProcessGuard {
         drop(lock);
         Self::acquire_at(
             directory_file,
-            &shard_id,
+            shard_id,
             ShardGuardValidation {
                 identity,
                 directory_uid: directory_metadata.uid(),
@@ -770,6 +774,11 @@ impl ShardProcessGuard {
 
     #[cfg(all(test, not(target_os = "linux")))]
     pub(super) fn for_test() -> Self {
+        Self::for_test_shard("test-shard-a")
+    }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    pub(super) fn for_test_shard(shard_id: &str) -> Self {
         Self {
             _directory: tempfile::tempfile().unwrap(),
             _lock: tempfile::tempfile().unwrap(),
@@ -779,7 +788,7 @@ impl ShardProcessGuard {
                 lock_device: 0,
                 lock_inode: 0,
             },
-            shard_id: "test-shard-a".into(),
+            shard_id: shard_id.into(),
         }
     }
 
@@ -7235,6 +7244,32 @@ mod tests {
             })
             .await
             .unwrap();
+        let wrong_routing = nbd_install(&active, 0x40);
+        let mut wrong_routing_expectation = wrong_routing.expectation();
+        wrong_routing_expectation.storage_routing_revision += 1;
+        let wrong_routing = InstallNbdSession::for_test(wrong_routing_expectation.clone()).unwrap();
+        assert_eq!(
+            fs.export_authority.install_nbd_session(wrong_routing).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+        assert_eq!(
+            read_nbd_session_install_current(
+                &fs.db,
+                &nbd_session_install_key(&wrong_routing_expectation),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            read_nbd_connection_reservation_current(
+                &fs.db,
+                &nbd_connection_reservation_key(&wrong_routing_expectation),
+            )
+            .await
+            .unwrap(),
+            None
+        );
         let claim = nbd_install_complete_and_claim(&fs, &active, 0x41, 0x4200).await;
         assert_eq!(claim.install.expectation.token.workspace_id, "workspace-a");
         assert_eq!(
