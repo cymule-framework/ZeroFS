@@ -4,6 +4,11 @@ pub const WRITE_AFTER_EXTENT: &str = "write_after_extent";
 pub const WRITE_AFTER_INODE: &str = "write_after_inode";
 pub const WRITE_AFTER_COMMIT: &str = "write_after_commit";
 
+/// A Workspace ledger record is durable, but the caller has not observed the
+/// successful commit response. Readback must return the original record.
+pub const WORKSPACE_OPERATION_AFTER_COMMIT_BEFORE_REPLY: &str =
+    "workspace_operation_after_commit_before_reply";
+
 pub const FALLOCATE_AFTER_EXTENTS: &str = "fallocate_after_extents";
 pub const FALLOCATE_AFTER_INODE: &str = "fallocate_after_inode";
 pub const FALLOCATE_AFTER_COMMIT: &str = "fallocate_after_commit";

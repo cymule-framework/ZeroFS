@@ -15,6 +15,10 @@ pub enum FsError {
     InvalidArgument,
     #[error("I/O error")]
     IoError,
+    /// The mutation applied locally, but its required durability barrier did
+    /// not complete. The caller must read back instead of assuming rejection.
+    #[error("Commit outcome unknown after local apply")]
+    CommitOutcomeUnknown,
     #[error("Directory not empty")]
     NotEmpty,
     #[error("Too many links")]
@@ -61,7 +65,7 @@ impl From<FsError> for nfsstat3 {
             FsError::NotFound => nfsstat3::NFS3ERR_NOENT,
             FsError::Exists => nfsstat3::NFS3ERR_EXIST,
             FsError::InvalidArgument => nfsstat3::NFS3ERR_INVAL,
-            FsError::IoError => nfsstat3::NFS3ERR_IO,
+            FsError::IoError | FsError::CommitOutcomeUnknown => nfsstat3::NFS3ERR_IO,
             FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
             FsError::TooManyLinks => nfsstat3::NFS3ERR_MLINK,
             FsError::NoSpace => nfsstat3::NFS3ERR_NOSPC,
@@ -120,6 +124,7 @@ impl FsError {
             FsError::Exists => libc::EEXIST as u32,
             FsError::InvalidArgument => libc::EINVAL as u32,
             FsError::IoError => libc::EIO as u32,
+            FsError::CommitOutcomeUnknown => libc::EIO as u32,
             FsError::NotEmpty => libc::ENOTEMPTY as u32,
             FsError::TooManyLinks => libc::EMLINK as u32,
             FsError::NoSpace => libc::ENOSPC as u32,

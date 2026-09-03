@@ -33,6 +33,7 @@ type Reply = oneshot::Sender<Result<(), FsError>>;
 #[allow(clippy::large_enum_variant)]
 enum Request {
     Commit(Transaction, Reply),
+    DurableCommit(Transaction, Reply, tokio::sync::OwnedMutexGuard<()>),
     #[cfg(any(test, dst))]
     Barrier(Reply),
 }
@@ -40,6 +41,22 @@ enum Request {
 #[derive(Clone)]
 pub struct WriteCoordinator {
     sender: mpsc::UnboundedSender<Request>,
+    /// Serializes Workspace ledger read-decide-commit sequences. The durable
+    /// mutation still flows through `sender`; this lock is not a second commit
+    /// authority or worker.
+    workspace_ledger_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(any(test, dst))]
+    workspace_durable_test_hook: Arc<WorkspaceDurableTestHook>,
+}
+
+#[cfg(any(test, dst))]
+#[derive(Default)]
+struct WorkspaceDurableTestHook {
+    pause_before_apply: std::sync::atomic::AtomicBool,
+    entered_before_apply: tokio::sync::Notify,
+    release_before_apply: tokio::sync::Notify,
+    fail_next_flush: std::sync::atomic::AtomicBool,
+    drop_next_reply: std::sync::atomic::AtomicBool,
 }
 
 /// Commit worker dependencies.
@@ -59,6 +76,8 @@ struct WorkerContext {
     lineage_token: u64,
     /// Data plane used to attach un-PUT segment bytes to replication.
     extent_store: ExtentStore,
+    #[cfg(any(test, dst))]
+    workspace_durable_test_hook: Arc<WorkspaceDurableTestHook>,
 }
 
 impl WriteCoordinator {
@@ -80,6 +99,8 @@ impl WriteCoordinator {
         // worker's initial persisted watermark.
         let initial_counter = inode_store.next_id();
         let (sender, receiver) = mpsc::unbounded_channel();
+        #[cfg(any(test, dst))]
+        let workspace_durable_test_hook = Arc::new(WorkspaceDurableTestHook::default());
         let ctx = WorkerContext {
             db,
             inode_store,
@@ -92,9 +113,16 @@ impl WriteCoordinator {
             dedup,
             lineage_token,
             extent_store,
+            #[cfg(any(test, dst))]
+            workspace_durable_test_hook: workspace_durable_test_hook.clone(),
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
-        Self { sender }
+        Self {
+            sender,
+            workspace_ledger_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(test, dst))]
+            workspace_durable_test_hook,
+        }
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
@@ -103,6 +131,58 @@ impl WriteCoordinator {
             .send(Request::Commit(txn, reply_tx))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+
+    pub(crate) async fn commit_workspace_durable(
+        &self,
+        txn: Transaction,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), FsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::DurableCommit(txn, reply_tx, guard))
+            .map_err(|_| FsError::IoError)?;
+        reply_rx.await.map_err(|_| FsError::CommitOutcomeUnknown)?
+    }
+
+    pub(crate) async fn lock_workspace_ledger(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.workspace_ledger_lock.clone().lock_owned().await
+    }
+
+    #[cfg(any(test, dst))]
+    pub fn dst_pause_next_workspace_durable_before_apply(&self) {
+        self.workspace_durable_test_hook
+            .pause_before_apply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, dst))]
+    pub async fn dst_wait_workspace_durable_before_apply(&self) {
+        self.workspace_durable_test_hook
+            .entered_before_apply
+            .notified()
+            .await;
+    }
+
+    #[cfg(any(test, dst))]
+    pub fn dst_release_workspace_durable_before_apply(&self) {
+        self.workspace_durable_test_hook
+            .release_before_apply
+            .notify_one();
+    }
+
+    #[cfg(any(test, dst))]
+    pub fn dst_fail_next_workspace_durable_flush(&self) {
+        self.workspace_durable_test_hook
+            .fail_next_flush
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, dst))]
+    pub fn dst_drop_next_workspace_durable_reply(&self) {
+        self.workspace_durable_test_hook
+            .drop_next_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Wait until every commit submitted before this call has finished,
@@ -247,20 +327,25 @@ async fn worker_loop(
                 commit
             }
         };
-        let (txn, reply) = match first {
-            Request::Commit(txn, reply) => (txn, reply),
+        let (txn, reply, mut require_durable, workspace_guard) = match first {
+            Request::Commit(txn, reply) => (txn, reply, false, None),
+            Request::DurableCommit(txn, reply, guard) => (txn, reply, true, Some(guard)),
             #[cfg(any(test, dst))]
             Request::Barrier(reply) => {
                 let _ = reply.send(Ok(()));
                 continue;
             }
         };
-        let mut batch = vec![(txn, reply)];
+        let mut batch = vec![(txn, reply, workspace_guard)];
         #[cfg(any(test, dst))]
         let mut barrier_reply = None;
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Request::Commit(txn, reply) => batch.push((txn, reply)),
+                Request::Commit(txn, reply) => batch.push((txn, reply, None)),
+                Request::DurableCommit(txn, reply, guard) => {
+                    require_durable = true;
+                    batch.push((txn, reply, Some(guard)));
+                }
                 #[cfg(any(test, dst))]
                 Request::Barrier(reply) => {
                     barrier_reply = Some(reply);
@@ -281,7 +366,11 @@ async fn worker_loop(
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
-        for (mut txn, reply) in batch {
+        let mut workspace_guards = Vec::new();
+        for (mut txn, reply, workspace_guard) in batch {
+            if let Some(guard) = workspace_guard {
+                workspace_guards.push(guard);
+            }
             if let Some(guard) = txn.take_extent_ref_guard() {
                 extent_ref_guards.push(guard);
             }
@@ -318,6 +407,7 @@ async fn worker_loop(
             }
             replies.push(reply);
         }
+        let workspace_durable_prefix = !workspace_guards.is_empty();
 
         // Persist the allocation watermark only after it advances.
         let current = ctx.inode_store.next_id();
@@ -389,6 +479,22 @@ async fn worker_loop(
 
         // Dedup-only outcomes follow the same ordered replication path.
         let has_logical_work = any_ops || !batch_dedup_entries.is_empty();
+
+        #[cfg(any(test, dst))]
+        if require_durable
+            && ctx
+                .workspace_durable_test_hook
+                .pause_before_apply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            ctx.workspace_durable_test_hook
+                .entered_before_apply
+                .notify_one();
+            ctx.workspace_durable_test_hook
+                .release_before_apply
+                .notified()
+                .await;
+        }
 
         // After Solo operation, the local base must be durable before the first
         // dependent replicated suffix is shipped.
@@ -556,17 +662,47 @@ async fn worker_loop(
         drop(extent_ref_guards);
 
         // `sync_writes` returns success only after the batch is durable.
-        if ctx.sync_writes && result.is_ok() && any_ops {
-            result = ctx.flush_coordinator.flush().await;
+        if ((ctx.sync_writes && any_ops) || require_durable) && result.is_ok() {
+            #[cfg(any(test, dst))]
+            let fail_injected = require_durable
+                && ctx
+                    .workspace_durable_test_hook
+                    .fail_next_flush
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let fail_injected = false;
+            let flush_result = if fail_injected {
+                Err(FsError::IoError)
+            } else {
+                ctx.flush_coordinator.flush().await
+            };
+            if let Err(error) = flush_result {
+                result = Err(if local_applied || workspace_durable_prefix {
+                    FsError::CommitOutcomeUnknown
+                } else {
+                    error
+                });
+            }
         }
 
         // Burn one ID when a failed batch may have dropped its staged watermark.
         if counter_staged && result.is_err() {
             ctx.inode_store.allocate();
         }
-        for reply in replies {
-            let _ = reply.send(result);
+        #[cfg(any(test, dst))]
+        let drop_replies = require_durable
+            && ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(any(test, dst)))]
+        let drop_replies = false;
+        if !drop_replies {
+            for reply in replies {
+                let _ = reply.send(result);
+            }
         }
+        drop(workspace_guards);
         #[cfg(any(test, dst))]
         if let Some(reply) = barrier_reply {
             let _ = reply.send(result);

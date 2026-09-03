@@ -30,6 +30,7 @@ use bytes::Bytes;
 //   0x07 TOMBSTONE     deferred-deletion entries, scanned only by GC
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
+//   0x0A WORKSPACE_OP   Rhizome Workspace operation ledger, versioned composite key
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -41,6 +42,7 @@ const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
 const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
+const PREFIX_WORKSPACE_OPERATION: u8 = 0x0A;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
@@ -83,6 +85,7 @@ pub enum KeyPrefix {
     System,
     DirCookie,
     SegCount,
+    WorkspaceOperation,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -100,6 +103,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
             PREFIX_SEGCOUNT => Ok(Self::SegCount),
+            PREFIX_WORKSPACE_OPERATION => Ok(Self::WorkspaceOperation),
             _ => Err(()),
         }
     }
@@ -118,6 +122,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
             KeyPrefix::SegCount => PREFIX_SEGCOUNT,
+            KeyPrefix::WorkspaceOperation => PREFIX_WORKSPACE_OPERATION,
         }
     }
 }
@@ -135,6 +140,7 @@ impl KeyPrefix {
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
             Self::SegCount => "SEGCOUNT",
+            Self::WorkspaceOperation => "WORKSPACE_OPERATION",
         }
     }
 
@@ -288,6 +294,40 @@ impl KeyCodec {
     /// Half-open `[start, end)` covering every segcount key, for a full scan.
     pub fn segcount_prefix_range(&self) -> (Bytes, Bytes) {
         self.prefix_range(KeyPrefix::SegCount)
+    }
+
+    /// Versioned composite key for one Rhizome Workspace operation.
+    ///
+    /// Callers validate both identifiers before encoding. Length prefixes keep
+    /// boundaries unambiguous without hashing away the authoritative identity.
+    pub(crate) fn workspace_operation_key(
+        &self,
+        key_version: u8,
+        workspace_id: &[u8],
+        kind: i32,
+        request_id: &[u8],
+    ) -> Bytes {
+        let workspace_len = u16::try_from(workspace_id.len())
+            .expect("workspace operation identity was validated before key encoding");
+        let request_len = u16::try_from(request_id.len())
+            .expect("workspace operation identity was validated before key encoding");
+        let mut key = Vec::with_capacity(
+            self.id_offset(KeyPrefix::WorkspaceOperation)
+                + 1 // key version
+                + 2 // workspace length
+                + workspace_id.len()
+                + 4 // protobuf enum number
+                + 2 // request length
+                + request_id.len(),
+        );
+        self.push_prefix(&mut key, KeyPrefix::WorkspaceOperation);
+        key.push(key_version);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace_id);
+        key.extend_from_slice(&kind.to_be_bytes());
+        key.extend_from_slice(&request_len.to_be_bytes());
+        key.extend_from_slice(request_id);
+        Bytes::from(key)
     }
 
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {

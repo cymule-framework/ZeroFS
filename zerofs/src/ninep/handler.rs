@@ -6362,102 +6362,110 @@ mod tests {
     // drops the guardless slot and strands the lock — which, with no in-session
     // backstop, leaks for the whole connection. Run with `--features failpoints`.
     #[cfg(feature = "failpoints")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_lock_register_guard_atomic_vs_tversion() {
-        let _scenario = fail::FailScenario::setup();
-        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let lock_manager = Arc::new(FileLockManager::new());
-        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"t".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 10,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(3, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
-            .await;
+    #[test]
+    fn test_lock_register_guard_atomic_vs_tversion() {
+        crate::test_helpers::isolated_failpoint::run(
+            "ninep::handler::tests::test_lock_register_guard_atomic_vs_tversion",
+            crate::test_helpers::isolated_failpoint::Runtime::MultiThread { worker_threads: 4 },
+            || async {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let lock_manager = Arc::new(FileLockManager::new());
+                let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+                handler
+                    .handle_message(
+                        0,
+                        Message::Tversion(Tversion {
+                            msize: DEFAULT_MSIZE,
+                            version: P9String::new(VERSION_9P2000L.to_vec()),
+                        }),
+                    )
+                    .await;
+                handler
+                    .handle_message(
+                        1,
+                        Message::Tattach(Tattach {
+                            fid: 1,
+                            afid: u32::MAX,
+                            uname: P9String::new(b"t".to_vec()),
+                            aname: P9String::new(Vec::new()),
+                            n_uname: 1000,
+                        }),
+                    )
+                    .await;
+                handler
+                    .handle_message(
+                        2,
+                        Message::Twalk(Twalk {
+                            fid: 1,
+                            newfid: 10,
+                            nwname: 0,
+                            wnames: vec![],
+                        }),
+                    )
+                    .await;
+                handler
+                    .handle_message(3, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
+                    .await;
 
-        // Pause lock() after it registers the lock, before installing the guard.
-        fail::cfg(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD, "pause").unwrap();
+                // Pause lock() after it registers the lock, before installing the guard.
+                let armed = crate::test_helpers::isolated_failpoint::arm(
+                    fp::LOCK_AFTER_REGISTER_BEFORE_GUARD,
+                    "pause",
+                );
 
-        let h1 = handler.clone();
-        let lock_task = tokio::spawn(async move {
-            h1.handle_message(
-                4,
-                Message::Tlock(Tlock {
-                    fid: 10,
-                    lock_type: LockType::WriteLock,
-                    flags: 0,
-                    start: 0,
-                    length: 0,
-                    proc_id: 1,
-                    client_id: P9String::new(b"c".to_vec()),
-                }),
-            )
-            .await
-        });
+                let h1 = handler.clone();
+                let lock_task = tokio::spawn(async move {
+                    h1.handle_message(
+                        4,
+                        Message::Tlock(Tlock {
+                            fid: 10,
+                            lock_type: LockType::WriteLock,
+                            flags: 0,
+                            start: 0,
+                            length: 0,
+                            proc_id: 1,
+                            client_id: P9String::new(b"c".to_vec()),
+                        }),
+                    )
+                    .await
+                });
 
-        // Wait for lock registration under the session lock.
-        let mut registered = false;
-        for _ in 0..400 {
-            if lock_manager.session_has_locks(handler.handler_id()) {
-                registered = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(registered, "lock task did not register/pause in time");
+                // Wait for lock registration under the session lock.
+                let mut registered = false;
+                for _ in 0..400 {
+                    if lock_manager.session_has_locks(handler.handler_id()) {
+                        registered = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert!(registered, "lock task did not register/pause in time");
 
-        // `Tversion` blocks on the session lock.
-        let h2 = handler.clone();
-        let version_task = tokio::spawn(async move {
-            h2.handle_message(
-                5,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await
-        });
+                // `Tversion` blocks on the session lock.
+                let h2 = handler.clone();
+                let version_task = tokio::spawn(async move {
+                    h2.handle_message(
+                        5,
+                        Message::Tversion(Tversion {
+                            msize: DEFAULT_MSIZE,
+                            version: P9String::new(VERSION_9P2000L.to_vec()),
+                        }),
+                    )
+                    .await
+                });
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Resume lock installation before session reset.
-        fail::cfg(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD, "off").unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Resume lock installation before session reset.
+                drop(armed);
 
-        let _ = lock_task.await;
-        let _ = version_task.await;
+                let _ = lock_task.await;
+                let _ = version_task.await;
 
-        assert!(
-            !lock_manager.session_has_locks(handler.handler_id()),
-            "Tlock racing Tversion stranded a phantom byte-range lock (register+guard not atomic)"
+                assert!(
+                    !lock_manager.session_has_locks(handler.handler_id()),
+                    "Tlock racing Tversion stranded a phantom byte-range lock (register+guard not atomic)"
+                );
+            },
         );
     }
 

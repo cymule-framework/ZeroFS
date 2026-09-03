@@ -898,65 +898,79 @@ mod tests {
     }
 
     #[cfg(feature = "failpoints")]
-    #[tokio::test]
-    async fn fallocate_failpoints_cover_transaction_stages() {
-        let _scenario = fail::FailScenario::setup();
-        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let (file_id, _) = fs
-            .create(
-                &test_creds(),
-                0,
-                b"fallocate-failpoints.bin",
-                &SetAttributes::default(),
-            )
-            .await
-            .unwrap();
-        let auth: AuthContext = (&test_auth()).into();
-        let original = Bytes::from_static(b"abcdefghijkl");
-        fs.write(&auth, file_id, 0, &original).await.unwrap();
-
-        for (point, offset) in [
-            (fp::FALLOCATE_AFTER_EXTENTS, 0),
-            (fp::FALLOCATE_AFTER_INODE, 4),
-        ] {
-            fail::cfg(point, "panic").unwrap();
-            let fs_clone = Arc::clone(&fs);
-            let auth_clone = auth.clone();
-            let result = tokio::spawn(async move {
-                fs_clone
-                    .fallocate_opened(&auth_clone, file_id, offset, 2, FallocateMode::PunchHole)
+    #[test]
+    fn fallocate_failpoints_cover_transaction_stages() {
+        crate::test_helpers::isolated_failpoint::run(
+            "fs::ops::io::tests::fallocate_failpoints_cover_transaction_stages",
+            crate::test_helpers::isolated_failpoint::Runtime::CurrentThread,
+            || async {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let (file_id, _) = fs
+                    .create(
+                        &test_creds(),
+                        0,
+                        b"fallocate-failpoints.bin",
+                        &SetAttributes::default(),
+                    )
                     .await
-            })
-            .await;
-            fail::cfg(point, "off").unwrap();
+                    .unwrap();
+                let auth: AuthContext = (&test_auth()).into();
+                let original = Bytes::from_static(b"abcdefghijkl");
+                fs.write(&auth, file_id, 0, &original).await.unwrap();
 
-            assert!(result.unwrap_err().is_panic(), "{point} must be reached");
-            let (data, _) = fs.read_file(&auth, file_id, 0, 12).await.unwrap();
-            assert_eq!(
-                data, original,
-                "pre-commit crash must discard the transaction"
-            );
-        }
+                for (point, offset) in [
+                    (fp::FALLOCATE_AFTER_EXTENTS, 0),
+                    (fp::FALLOCATE_AFTER_INODE, 4),
+                ] {
+                    let armed = crate::test_helpers::isolated_failpoint::arm(point, "panic");
+                    let fs_clone = Arc::clone(&fs);
+                    let auth_clone = auth.clone();
+                    let result = tokio::spawn(async move {
+                        fs_clone
+                            .fallocate_opened(
+                                &auth_clone,
+                                file_id,
+                                offset,
+                                2,
+                                FallocateMode::PunchHole,
+                            )
+                            .await
+                    })
+                    .await;
+                    drop(armed);
 
-        fail::cfg(fp::FALLOCATE_AFTER_COMMIT, "panic").unwrap();
-        let fs_clone = Arc::clone(&fs);
-        let auth_clone = auth.clone();
-        let result = tokio::spawn(async move {
-            fs_clone
-                .fallocate_opened(&auth_clone, file_id, 8, 2, FallocateMode::PunchHole)
-                .await
-        })
-        .await;
-        fail::cfg(fp::FALLOCATE_AFTER_COMMIT, "off").unwrap();
+                    assert!(result.unwrap_err().is_panic(), "{point} must be reached");
+                    let (data, _) = fs.read_file(&auth, file_id, 0, 12).await.unwrap();
+                    assert_eq!(
+                        data, original,
+                        "pre-commit crash must discard the transaction"
+                    );
+                }
 
-        assert!(
-            result.unwrap_err().is_panic(),
-            "post-commit failpoint must be reached"
+                let armed = crate::test_helpers::isolated_failpoint::arm(
+                    fp::FALLOCATE_AFTER_COMMIT,
+                    "panic",
+                );
+                let fs_clone = Arc::clone(&fs);
+                let auth_clone = auth.clone();
+                let result = tokio::spawn(async move {
+                    fs_clone
+                        .fallocate_opened(&auth_clone, file_id, 8, 2, FallocateMode::PunchHole)
+                        .await
+                })
+                .await;
+                drop(armed);
+
+                assert!(
+                    result.unwrap_err().is_panic(),
+                    "post-commit failpoint must be reached"
+                );
+                let (data, _) = fs.read_file(&auth, file_id, 0, 12).await.unwrap();
+                assert_eq!(&data[..8], b"abcdefgh");
+                assert_eq!(&data[8..10], &[0, 0]);
+                assert_eq!(&data[10..], b"kl");
+            },
         );
-        let (data, _) = fs.read_file(&auth, file_id, 0, 12).await.unwrap();
-        assert_eq!(&data[..8], b"abcdefgh");
-        assert_eq!(&data[8..10], &[0, 0]);
-        assert_eq!(&data[10..], b"kl");
     }
 
     #[tokio::test]

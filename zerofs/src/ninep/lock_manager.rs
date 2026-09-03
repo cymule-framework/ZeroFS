@@ -79,6 +79,7 @@ impl FileLockManager {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn session_has_locks(&self, session_id: u64) -> bool {
         self.lock_state()
             .values()

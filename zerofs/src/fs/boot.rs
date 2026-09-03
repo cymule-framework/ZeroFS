@@ -211,6 +211,10 @@ impl ZeroFS {
             lineage_token,
             extent_store.clone(),
         );
+        let workspace_operations = crate::fs::workspace_operation::WorkspaceOperationLedger::new(
+            db.clone(),
+            write_coordinator.clone(),
+        );
 
         // Route the data plane's GC/compaction seg-count txns through the single
         // commit worker (its sole writer). Weak, so it can't keep the worker alive.
@@ -236,6 +240,7 @@ impl ZeroFS {
             global_stats,
             flush_coordinator,
             write_coordinator,
+            workspace_operations,
             ignore_fsync,
             lineage_token,
             serving_writer_epoch,

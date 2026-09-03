@@ -11,6 +11,7 @@ pub mod stats;
 pub mod store;
 pub mod tracing;
 pub mod types;
+pub mod workspace_operation;
 pub mod write_coordinator;
 
 mod boot;
@@ -25,6 +26,7 @@ use self::metrics::FileSystemStats;
 use self::stats::FileSystemGlobalStats;
 use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use self::tracing::AccessTracer;
+use self::workspace_operation::WorkspaceOperationLedger;
 use self::write_coordinator::WriteCoordinator;
 use crate::db::Db;
 use crate::object_trace::ObjectTracer;
@@ -119,6 +121,9 @@ pub struct ZeroFS {
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: WriteCoordinator,
+    /// Durable Rhizome Workspace operation intent/outcome ledger. This is an
+    /// internal storage primitive; it does not execute or sign operations.
+    pub workspace_operations: WorkspaceOperationLedger,
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
     pub ignore_fsync: bool,

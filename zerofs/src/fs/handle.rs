@@ -508,38 +508,44 @@ mod tests {
     // failpoint pauses reclaim before it takes the inode lock so the reopen wins
     // the lock deterministically. Run with `--features failpoints`.
     #[cfg(feature = "failpoints")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_reclaim_aborts_on_concurrent_reopen() {
-        let _scenario = fail::FailScenario::setup();
-        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let file_id = make_file(&fs, b"a", b"data").await;
-        fs.open_handle_inc(file_id); // a handle is open
-        fs.remove(&(&test_auth()).into(), 0, b"a").await.unwrap(); // defer -> orphan
-        fs.open_handle_dec(file_id); // last handle closed -> count 0, reclaimable
-        assert_eq!(orphan_ids(&fs).await, vec![file_id]);
+    #[test]
+    fn test_reclaim_aborts_on_concurrent_reopen() {
+        crate::test_helpers::isolated_failpoint::run(
+            "fs::handle::tests::test_reclaim_aborts_on_concurrent_reopen",
+            crate::test_helpers::isolated_failpoint::Runtime::MultiThread { worker_threads: 4 },
+            || async {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let file_id = make_file(&fs, b"a", b"data").await;
+                fs.open_handle_inc(file_id); // a handle is open
+                fs.remove(&(&test_auth()).into(), 0, b"a").await.unwrap(); // defer -> orphan
+                fs.open_handle_dec(file_id); // last handle closed -> count 0, reclaimable
+                assert_eq!(orphan_ids(&fs).await, vec![file_id]);
 
-        fail::cfg(fp::RECLAIM_BEFORE_LOCK, "pause").unwrap();
-        let f = fs.clone();
-        let reclaim = tokio::spawn(async move { f.reclaim_if_unreferenced(file_id).await });
+                let armed =
+                    crate::test_helpers::isolated_failpoint::arm(fp::RECLAIM_BEFORE_LOCK, "pause");
+                let f = fs.clone();
+                let reclaim = tokio::spawn(async move { f.reclaim_if_unreferenced(file_id).await });
 
-        // Let reclaim reach the pause, then reopen: take the inode lock and bump
-        // the count exactly as lopen does (acquire + open_handle_inc).
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        {
-            let _g = fs.lock_manager.acquire(file_id).await;
-            fs.open_handle_inc(file_id);
-        }
+                // Let reclaim reach the pause, then reopen: take the inode lock and bump
+                // the count exactly as lopen does (acquire + open_handle_inc).
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                {
+                    let _g = fs.lock_manager.acquire(file_id).await;
+                    fs.open_handle_inc(file_id);
+                }
 
-        // Resume reclaim: acquires the lock, rechecks count > 0, must abort.
-        fail::cfg(fp::RECLAIM_BEFORE_LOCK, "off").unwrap();
-        reclaim.await.unwrap();
+                // Resume reclaim: acquires the lock, rechecks count > 0, must abort.
+                drop(armed);
+                reclaim.await.unwrap();
 
-        assert!(
-            fs.inode_store.get(file_id).await.is_ok(),
-            "reclaim must abort when a reopen raced in before the recheck"
+                assert!(
+                    fs.inode_store.get(file_id).await.is_ok(),
+                    "reclaim must abort when a reopen raced in before the recheck"
+                );
+                assert_eq!(fs.open_handle_count(file_id), 1);
+                assert_eq!(orphan_ids(&fs).await, vec![file_id]);
+            },
         );
-        assert_eq!(fs.open_handle_count(file_id), 1);
-        assert_eq!(orphan_ids(&fs).await, vec![file_id]);
     }
 
     // The other ordering: a reopen that races into the reclaim window blocks on
@@ -547,43 +553,51 @@ mod tests {
     // it — a clean failure, not a dangling reference. A failpoint pauses reclaim
     // while it holds the lock, after the recheck.
     #[cfg(feature = "failpoints")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_reopen_after_reclaim_fails_cleanly() {
-        let _scenario = fail::FailScenario::setup();
-        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let file_id = make_file(&fs, b"a", b"data").await;
-        fs.open_handle_inc(file_id);
-        fs.remove(&(&test_auth()).into(), 0, b"a").await.unwrap();
-        fs.open_handle_dec(file_id);
+    #[test]
+    fn test_reopen_after_reclaim_fails_cleanly() {
+        crate::test_helpers::isolated_failpoint::run(
+            "fs::handle::tests::test_reopen_after_reclaim_fails_cleanly",
+            crate::test_helpers::isolated_failpoint::Runtime::MultiThread { worker_threads: 4 },
+            || async {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let file_id = make_file(&fs, b"a", b"data").await;
+                fs.open_handle_inc(file_id);
+                fs.remove(&(&test_auth()).into(), 0, b"a").await.unwrap();
+                fs.open_handle_dec(file_id);
 
-        fail::cfg(fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE, "pause").unwrap();
-        let f = fs.clone();
-        let reclaim = tokio::spawn(async move { f.reclaim_if_unreferenced(file_id).await });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let armed = crate::test_helpers::isolated_failpoint::arm(
+                    fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE,
+                    "pause",
+                );
+                let f = fs.clone();
+                let reclaim = tokio::spawn(async move { f.reclaim_if_unreferenced(file_id).await });
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Reopen races in and blocks on the inode lock reclaim is holding.
-        let f2 = fs.clone();
-        let reopen = tokio::spawn(async move {
-            let _g = f2.lock_manager.acquire(file_id).await;
-            f2.inode_store.get(file_id).await // the liveness check lopen does
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                // Reopen races in and blocks on the inode lock reclaim is holding.
+                let f2 = fs.clone();
+                let reopen = tokio::spawn(async move {
+                    let _g = f2.lock_manager.acquire(file_id).await;
+                    f2.inode_store.get(file_id).await // the liveness check lopen does
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Resume reclaim: it deletes the inode and releases the lock; the reopen
-        // then proceeds and must see the inode gone.
-        fail::cfg(fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE, "off").unwrap();
-        reclaim.await.unwrap();
-        let reopen_result = reopen.await.unwrap();
+                // Resume reclaim: it deletes the inode and releases the lock; the reopen
+                // then proceeds and must see the inode gone.
+                drop(armed);
+                reclaim.await.unwrap();
+                let reopen_result = reopen.await.unwrap();
 
-        assert!(
-            matches!(reopen_result, Err(FsError::NotFound)),
-            "a reopen racing into the reclaim window must see the inode gone, not a dangling reference"
+                assert!(
+                    matches!(reopen_result, Err(FsError::NotFound)),
+                    "a reopen racing into the reclaim window must see the inode gone, not a dangling reference"
+                );
+                assert!(matches!(
+                    fs.inode_store.get(file_id).await,
+                    Err(FsError::NotFound)
+                ));
+                assert!(orphan_ids(&fs).await.is_empty());
+            },
         );
-        assert!(matches!(
-            fs.inode_store.get(file_id).await,
-            Err(FsError::NotFound)
-        ));
-        assert!(orphan_ids(&fs).await.is_empty());
     }
 
     /// Open-unlink also covers special files: a FIFO unlinked while a handle is
