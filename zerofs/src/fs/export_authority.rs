@@ -3465,31 +3465,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_revalidates_single_link_after_activation() {
+    async fn ordinary_hardlink_cannot_change_an_active_export() {
         let fs = new_export_fs().await;
         let active = fs
             .export_authority
             .activate(activate_command(authority(3, 5)))
             .await
             .unwrap();
-        fs.link(
-            &crate::fs::types::AuthContext::default(),
-            active.export.inode,
-            active.export.nbd_directory_inode,
-            b"disk-hardlink",
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            fs.link(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                active.export.nbd_directory_inode,
+                b"disk-hardlink",
+            )
+            .await,
+            Err(crate::fs::errors::FsError::OperationNotPermitted)
+        );
         let mutation = ExportMutationBuilder::build(
             token(&active),
             [0x73; SHA256_SIZE],
             ExportMutationCommand::Flush,
         )
         .unwrap();
-        assert_eq!(
-            fs.export_authority.commit_mutation(mutation).await,
-            Err(ExportAuthorityError::Invalid)
-        );
+        fs.export_authority.commit_mutation(mutation).await.unwrap();
     }
 
     #[tokio::test]
