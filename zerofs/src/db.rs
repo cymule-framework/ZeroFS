@@ -625,20 +625,33 @@ impl Db {
         self.get_bytes_at(key, DurabilityLevel::Remote).await
     }
 
-    /// Capture one read-only database sequence for a related durable read set.
+    /// Read a related durable row set from one database sequence.
     ///
-    /// Callers must still select [`DurabilityLevel::Remote`] on every snapshot
-    /// read. The snapshot fixes the sequence boundary so a multi-row authority
-    /// graph cannot be assembled from different database states.
+    /// The snapshot fixes the sequence boundary so a multi-row authority graph
+    /// cannot be assembled from different database states. Serving authority
+    /// is checked before and after the complete read set; callers never receive
+    /// a snapshot handle that could outlive this wrapper's lease checks.
     #[cfg(feature = "rhizome-export-authority-core")]
-    pub(crate) async fn durable_snapshot(&self) -> Result<Arc<slatedb::DbSnapshot>> {
+    pub(crate) async fn get_bytes_durable_snapshot(
+        &self,
+        keys: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>> {
         self.check_lease()?;
         let snapshot = match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.snapshot().await?,
             SlateDbHandle::ReadOnly(_) => return Err(FsError::ReadOnlyFilesystem.into()),
         };
+        let read_options = ReadOptions {
+            durability_filter: DurabilityLevel::Remote,
+            cache_blocks: true,
+            ..Default::default()
+        };
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(snapshot.get_with_options(key, &read_options).await?);
+        }
         self.check_lease()?;
-        Ok(snapshot)
+        Ok(values)
     }
 
     async fn get_bytes_at(

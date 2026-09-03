@@ -2168,35 +2168,18 @@ pub(crate) async fn read_nbd_connection_receipt_durable(
     decode_nbd_connection_receipt(&bytes, key).map(Some)
 }
 
-async fn read_nbd_snapshot_value(
-    snapshot: &slatedb::DbSnapshot,
-    key: &Bytes,
-) -> Result<Option<Bytes>, ExportAuthorityError> {
-    snapshot
-        .get_with_options(
-            key,
-            &slatedb::config::ReadOptions {
-                durability_filter: slatedb::config::DurabilityLevel::Remote,
-                cache_blocks: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|_| ExportAuthorityError::Storage)
-}
-
 async fn read_nbd_install_graph_durable(
     db: &Db,
     expected: &NbdSessionInstallExpectation,
 ) -> Result<Option<(NbdSessionInstallOutcome, NbdSessionInstallRecord)>, ExportAuthorityError> {
-    let snapshot = db
-        .durable_snapshot()
-        .await
-        .map_err(|_| ExportAuthorityError::Storage)?;
     let outcome_key = nbd_install_outcome_key(expected);
     let install_key = nbd_session_install_key(expected);
-    let outcome_bytes = read_nbd_snapshot_value(&snapshot, &outcome_key).await?;
-    let install_bytes = read_nbd_snapshot_value(&snapshot, &install_key).await?;
+    let mut values = db
+        .get_bytes_durable_snapshot(&[outcome_key.clone(), install_key.clone()])
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let install_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
     match (outcome_bytes, install_bytes) {
         (None, None) => Ok(None),
         (Some(outcome), Some(install)) => {
@@ -2221,20 +2204,20 @@ async fn read_nbd_connection_graph_durable(
     ExportAuthorityError,
 > {
     let install_expected = &expected.install.expectation;
-    let snapshot = db
-        .durable_snapshot()
-        .await
-        .map_err(|_| ExportAuthorityError::Storage)?;
     let receipt_key = nbd_connection_receipt_key(expected);
     let outcome_key = nbd_install_outcome_key(install_expected);
     let install_key = nbd_session_install_key(install_expected);
-    let receipt_bytes = read_nbd_snapshot_value(&snapshot, &receipt_key).await?;
-    let outcome_bytes = read_nbd_snapshot_value(&snapshot, &outcome_key)
-        .await?
-        .ok_or(ExportAuthorityError::Corrupt)?;
-    let install_bytes = read_nbd_snapshot_value(&snapshot, &install_key)
-        .await?
-        .ok_or(ExportAuthorityError::Corrupt)?;
+    let mut values = db
+        .get_bytes_durable_snapshot(&[
+            receipt_key.clone(),
+            outcome_key.clone(),
+            install_key.clone(),
+        ])
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let install_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let receipt_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
     let outcome = decode_nbd_install_outcome(&outcome_bytes, &outcome_key, install_expected)?;
     let install = decode_nbd_session_install(&install_bytes, &install_key)?;
     ensure_nbd_install_state(&install, &outcome, install_expected)?;
