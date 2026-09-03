@@ -104,6 +104,17 @@ and may atomically activate a strictly higher placement epoch. There is no
 startup scan. Activation always resets the session sequence to zero; only the
 coordinator increments it.
 
+Before the authority profile can initialize its durable boot identity, the
+supervisor must supply a process-lifetime guard for the exact configured shard.
+On Linux the guard resolves a SHA-256-derived lock name with rustix `openat`
+from an absolute root-controlled directory, verifies the configured directory
+and lock device/inode plus ownership, exact modes, regular-file type and single
+link, then takes an exclusive file lock. Profile enablement is one-shot and
+retains the guard. A replacement process may proceed only after the supervisor
+kills and joins the previous process and obtains the same inode lock. This is a
+same-host boundary; cross-host takeover remains fail-closed until external
+STONITH/Node fencing exists.
+
 Block mutation lengths are bounded to the NBD `u32` command width. Admission
 rejects any range whose mathematical final extent cannot be represented in
 `u64`, before ExtentStore performs extent arithmetic.

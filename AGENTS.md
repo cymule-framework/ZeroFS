@@ -73,6 +73,18 @@ attribution intact.
 - Stale-cost tests use synchronous preparation counters as the primary witness;
   compressed payload size and an unjoined background PUT are not proof that
   ExtentStore preparation was skipped.
+- Enabling the Rhizome authority profile requires a process-lifetime Linux
+  shard guard acquired before the durable boot write. The guard opens the exact
+  SHA-256-derived shard lock with rustix `openat` from a configured absolute
+  root-controlled directory and verifies directory/lock uid, gid, exact mode,
+  device, inode, regular-file type, and `nlink == 1` before taking the exclusive
+  file lock. The root supervisor must create `root:zerofs 0750` directory and a
+  `zerofs:zerofs 0600` immutable lock inode, then kill and join the prior process
+  before replacement. Profile enable is one-shot and retains the guard for the
+  Store lifetime. Do not accept an arbitrary caller file as a shard guard.
+- This guard is host-local. Cross-host automatic writer takeover remains
+  unsupported and must fail closed without an external STONITH/Node fence
+  receipt.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct

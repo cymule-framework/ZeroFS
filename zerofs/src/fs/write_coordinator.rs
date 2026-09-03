@@ -2200,7 +2200,11 @@ mod tests {
         };
 
         assert_eq!(
-            fs.export_authority.enable_standalone_profile().await,
+            fs.export_authority
+                .enable_standalone_profile(
+                    crate::fs::export_authority::ShardProcessGuard::for_test(),
+                )
+                .await,
             Err(ExportAuthorityError::Storage)
         );
         assert_eq!(

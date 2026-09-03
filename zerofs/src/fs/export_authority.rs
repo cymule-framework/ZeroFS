@@ -158,6 +158,170 @@ impl FenceMutationConflict {
 
 pub(crate) type ExportAdmissionGuard = KeyedLockGuard<String>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShardLockIdentity {
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub lock_device: u64,
+    pub lock_inode: u64,
+}
+
+pub(crate) struct ShardProcessGuard {
+    _directory: std::fs::File,
+    _lock: std::fs::File,
+    _identity: ShardLockIdentity,
+}
+
+struct ShardGuardValidation {
+    identity: ShardLockIdentity,
+    directory_uid: u32,
+    lock_uid: u32,
+    gid: u32,
+    directory_mode: u32,
+    lock_mode: u32,
+}
+
+impl ShardProcessGuard {
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(test, allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the supervised Rhizome profile")
+    )]
+    pub(crate) fn acquire_configured(
+        lock_root: &std::path::Path,
+        shard_id: &str,
+        worker_uid: u32,
+        worker_gid: u32,
+        expected: ShardLockIdentity,
+    ) -> Result<Self, ExportAuthorityError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if !lock_root.is_absolute() {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(lock_root)
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        Self::acquire_at(
+            directory,
+            shard_id,
+            ShardGuardValidation {
+                identity: expected,
+                directory_uid: 0,
+                lock_uid: worker_uid,
+                gid: worker_gid,
+                directory_mode: 0o750,
+                lock_mode: 0o600,
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_at(
+        directory: std::fs::File,
+        shard_id: &str,
+        validation: ShardGuardValidation,
+    ) -> Result<Self, ExportAuthorityError> {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::MetadataExt;
+
+        validate_id(shard_id)?;
+        let directory_metadata = directory
+            .metadata()
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        if !directory_metadata.is_dir()
+            || directory_metadata.uid() != validation.directory_uid
+            || directory_metadata.gid() != validation.gid
+            || directory_metadata.mode() & 0o7777 != validation.directory_mode
+            || directory_metadata.dev() != validation.identity.directory_device
+            || directory_metadata.ino() != validation.identity.directory_inode
+        {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        let lock_fd: OwnedFd = rustix::fs::openat(
+            &directory,
+            shard_lock_name(shard_id),
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| ExportAuthorityError::Storage)?;
+        let lock = std::fs::File::from(lock_fd);
+        let lock_metadata = lock.metadata().map_err(|_| ExportAuthorityError::Storage)?;
+        if !lock_metadata.is_file()
+            || lock_metadata.uid() != validation.lock_uid
+            || lock_metadata.gid() != validation.gid
+            || lock_metadata.mode() & 0o7777 != validation.lock_mode
+            || lock_metadata.nlink() != 1
+            || lock_metadata.dev() != validation.identity.lock_device
+            || lock_metadata.ino() != validation.identity.lock_inode
+        {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        lock.try_lock()
+            .map_err(|_| ExportAuthorityError::Conflict)?;
+        Ok(Self {
+            _directory: directory,
+            _lock: lock,
+            _identity: validation.identity,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn for_test() -> Self {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shard_id = uuid::Uuid::new_v4().to_string();
+        let lock_path = directory.join(shard_lock_name(&shard_id));
+        let lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(lock_path)
+            .unwrap();
+        let directory_file = std::fs::File::open(directory).unwrap();
+        let directory_metadata = directory_file.metadata().unwrap();
+        let lock_metadata = lock.metadata().unwrap();
+        let identity = ShardLockIdentity {
+            directory_device: directory_metadata.dev(),
+            directory_inode: directory_metadata.ino(),
+            lock_device: lock_metadata.dev(),
+            lock_inode: lock_metadata.ino(),
+        };
+        drop(lock);
+        Self::acquire_at(
+            directory_file,
+            &shard_id,
+            ShardGuardValidation {
+                identity,
+                directory_uid: directory_metadata.uid(),
+                lock_uid: directory_metadata.uid(),
+                gid: directory_metadata.gid(),
+                directory_mode: 0o700,
+                lock_mode: 0o600,
+            },
+        )
+        .unwrap()
+    }
+}
+
+fn shard_lock_name(shard_id: &str) -> String {
+    let digest = Sha256::digest(shard_id.as_bytes());
+    let mut name = String::with_capacity("rhizome-shard-".len() + digest.len() * 2 + 5);
+    name.push_str("rhizome-shard-");
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name.push_str(".lock");
+    name
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MutationKind {
     Write { fua: bool },
@@ -448,6 +612,8 @@ pub(crate) struct ExportAuthorityStore {
     server_boot_id: String,
     admission_locks: Arc<crate::fs::lock_manager::KeyedLockManager<String>>,
     profile_enabled: Arc<std::sync::atomic::AtomicBool>,
+    process_guard: Arc<std::sync::Mutex<Option<ShardProcessGuard>>>,
+    enable_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pause_after_admission: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -476,6 +642,8 @@ impl ExportAuthorityStore {
             server_boot_id,
             admission_locks: Arc::new(crate::fs::lock_manager::KeyedLockManager::new()),
             profile_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            process_guard: Arc::new(std::sync::Mutex::new(None)),
+            enable_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             pause_after_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -867,8 +1035,16 @@ impl ExportAuthorityStore {
         not(test),
         expect(dead_code, reason = "feature-staged until verified adapter wiring")
     )]
-    pub(crate) async fn enable_standalone_profile(&self) -> Result<(), ExportAuthorityError> {
+    pub(crate) async fn enable_standalone_profile(
+        &self,
+        process_guard: ShardProcessGuard,
+    ) -> Result<(), ExportAuthorityError> {
+        let _enable = self.enable_lock.lock().await;
+        if self.process_guard.lock().unwrap().is_some() {
+            return Err(ExportAuthorityError::Conflict);
+        }
         self.coordinator.initialize_export_boot().await?;
+        *self.process_guard.lock().unwrap() = Some(process_guard);
         self.profile_enabled
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -1726,14 +1902,16 @@ mod tests {
             segment_codec,
         )
         .await?;
-        fs.export_authority.enable_standalone_profile().await?;
+        fs.export_authority
+            .enable_standalone_profile(ShardProcessGuard::for_test())
+            .await?;
         Ok(fs)
     }
 
     async fn new_export_fs() -> ZeroFS {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         fs.export_authority
-            .enable_standalone_profile()
+            .enable_standalone_profile(ShardProcessGuard::for_test())
             .await
             .unwrap();
         fs
@@ -2038,12 +2216,71 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_shard_guard_locks_exact_identity_and_rejects_replacement_inode() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shard_id = "shards/test-a";
+        let lock_path = directory.path().join(shard_lock_name(shard_id));
+        let lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        let directory_file = std::fs::File::open(directory.path()).unwrap();
+        let directory_metadata = directory_file.metadata().unwrap();
+        let lock_metadata = lock.metadata().unwrap();
+        let identity = ShardLockIdentity {
+            directory_device: directory_metadata.dev(),
+            directory_inode: directory_metadata.ino(),
+            lock_device: lock_metadata.dev(),
+            lock_inode: lock_metadata.ino(),
+        };
+        drop(lock);
+        let validation = || ShardGuardValidation {
+            identity,
+            directory_uid: directory_metadata.uid(),
+            lock_uid: directory_metadata.uid(),
+            gid: directory_metadata.gid(),
+            directory_mode: 0o700,
+            lock_mode: 0o600,
+        };
+        let acquire = || {
+            ShardProcessGuard::acquire_at(
+                std::fs::File::open(directory.path()).unwrap(),
+                shard_id,
+                validation(),
+            )
+        };
+        let first_store_guard = acquire().unwrap();
+        assert!(matches!(acquire(), Err(ExportAuthorityError::Conflict)));
+
+        let retired = directory.path().join("retired.lock");
+        std::fs::rename(&lock_path, retired).unwrap();
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(acquire(), Err(ExportAuthorityError::Invalid)));
+        drop(first_store_guard);
+    }
+
     #[tokio::test]
     async fn boot_flush_unknown_keeps_the_profile_disabled_until_durable_retry() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         fs.write_coordinator.dst_fail_next_workspace_durable_flush();
         assert_eq!(
-            fs.export_authority.enable_standalone_profile().await,
+            fs.export_authority
+                .enable_standalone_profile(ShardProcessGuard::for_test())
+                .await,
             Err(ExportAuthorityError::CommitOutcomeUnknown)
         );
         assert_eq!(
@@ -2061,13 +2298,30 @@ mod tests {
         );
 
         fs.export_authority
-            .enable_standalone_profile()
+            .enable_standalone_profile(ShardProcessGuard::for_test())
             .await
             .unwrap();
         fs.export_authority
             .activate(activate_command(authority(3, 5)))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_profile_cannot_replace_its_guard_or_reinitialize_boot() {
+        let fs = new_export_fs().await;
+        let boot_key = crate::fs::key_codec::KeyCodec::new().export_boot_key();
+        let boot = fs.db.get_bytes_durable(&boot_key).await.unwrap().unwrap();
+        assert_eq!(
+            fs.export_authority
+                .enable_standalone_profile(ShardProcessGuard::for_test())
+                .await,
+            Err(ExportAuthorityError::Conflict)
+        );
+        assert_eq!(
+            fs.db.get_bytes_durable(&boot_key).await.unwrap(),
+            Some(boot)
+        );
     }
 
     #[tokio::test]
