@@ -111,3 +111,10 @@ Actor READY/release. The production constructors remain absent until ADR-0005's
 registry and dual-language fixture gate covers the barrier command and receipt.
 NBD FLUSH remains a separate fenced durability command without a Rhizome
 barrier request identity.
+
+The current closed-graph verifier walks the complete immutable barrier history
+with remote-durable point reads. That is correct but O(history) and is not a
+qualified long-term scale shape. Before enabling the feature in production,
+replace it with an immutable verified-summary/checkpoint scheme that preserves
+the same corruption and fork detection; do not weaken closure or impose a
+product-visible barrier-count limit as a shortcut.

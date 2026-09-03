@@ -2058,7 +2058,14 @@ async fn validate_workspace_barrier_admission(
         .get_bytes(&codec.export_boot_key())
         .await
         .map_err(|_| BarrierError::Storage)?;
-    if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes()) {
+    let durable_boot = ctx
+        .db
+        .get_bytes_durable(&codec.export_boot_key())
+        .await
+        .map_err(|_| BarrierError::Storage)?;
+    if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes())
+        || durable_boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes())
+    {
         return Err(BarrierError::Conflict);
     }
     let authority_key = codec.export_authority_key(&command.operation.workspace_id);

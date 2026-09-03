@@ -616,6 +616,20 @@ pub(crate) async fn read_closed_head_graph(
         if head_digest(&previous.head) != receipt.expected_head_digest {
             return Err(BarrierError::Corrupt);
         }
+        let command = command_from_receipt(&receipt);
+        validate_command(&command).map_err(|_| BarrierError::Corrupt)?;
+        genesis_matches(genesis, &command).map_err(|_| BarrierError::Corrupt)?;
+        let recomputed = next_head(
+            &previous,
+            &command,
+            receipt.included_write_sequence,
+            receipt.zerofs_writer_epoch,
+            receipt.zerofs_manifest_id,
+            receipt.zerofs_durable_sequence,
+        )?;
+        if recomputed != cursor {
+            return Err(BarrierError::Corrupt);
+        }
         cursor = previous;
     }
     Ok(current)
@@ -783,6 +797,21 @@ pub(crate) fn ensure_receipt_matches_command(
         return Err(BarrierError::Conflict);
     }
     Ok(())
+}
+
+fn command_from_receipt(receipt: &BarrierDurabilityReceipt) -> BarrierCommand {
+    BarrierCommand {
+        operation: WorkspaceOperationKey::new(
+            receipt.workspace_id.clone(),
+            CREATE_BARRIER_KIND,
+            receipt.request_id.clone(),
+        ),
+        request_digest: CanonicalRequestDigest::new(receipt.request_digest),
+        token: receipt.token.clone(),
+        expected_head_digest: receipt.expected_head_digest,
+        storage_shard_id: receipt.storage_shard_id.clone(),
+        storage_routing_revision: receipt.storage_routing_revision,
+    }
 }
 
 pub(crate) fn encode_head_record(
@@ -1619,6 +1648,57 @@ mod tests {
                     .unwrap(),
                 )
                 .await,
+            Err(BarrierError::Corrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn checksummed_but_non_derivable_head_graph_is_corruption() {
+        let (fs, token, genesis) = active_workspace().await;
+        let command = command(
+            "barrier-tampered-head",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let mut receipt = materialize(&fs, command.clone()).await;
+        receipt.head.base_root_digest = [0x7a; 32];
+        receipt.receipt_digest = receipt_digest(&receipt);
+        validate_receipt(&receipt).unwrap();
+        let tampered_head = WorkspaceHeadRecord {
+            head: receipt.head.clone(),
+            last_barrier_request_id: Some(receipt.request_id.clone()),
+            last_barrier_request_digest: Some(receipt.request_digest),
+        };
+        let codec = KeyCodec::new();
+        let head_key = codec.workspace_head_key(&receipt.workspace_id);
+        let version_key =
+            codec.workspace_head_version_key(&receipt.workspace_id, receipt.head.workspace_version);
+        let receipt_key =
+            codec.workspace_barrier_record_key(&receipt.workspace_id, &receipt.request_id);
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                head_key.clone(),
+                encode_head_record(&head_key, &tampered_head).unwrap(),
+            )
+            .await
+            .unwrap();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                version_key.clone(),
+                encode_head_record(&version_key, &tampered_head).unwrap(),
+            )
+            .await
+            .unwrap();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                receipt_key.clone(),
+                encode_barrier_record(&receipt_key, &receipt).unwrap(),
+            )
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.workspace_barriers.lookup_materialized(&command).await,
             Err(BarrierError::Corrupt)
         );
     }
