@@ -236,6 +236,31 @@ impl KeyCodec {
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_authority_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 3);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_AUTHORITY_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn parse_export_authority_workspace<'a>(&self, key: &'a [u8]) -> Option<&'a str> {
+        let prefix = self.export_authority_prefix();
+        if !key.starts_with(&prefix) || key.len() < prefix.len() + 2 {
+            return None;
+        }
+        let length =
+            u16::from_be_bytes(key[prefix.len()..prefix.len() + 2].try_into().ok()?) as usize;
+        let workspace = key.get(prefix.len() + 2..)?;
+        if workspace.len() != length {
+            return None;
+        }
+        std::str::from_utf8(workspace).ok()
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn legacy_export_v1_prefix(&self) -> Bytes {
         let mut key = Vec::with_capacity(META_DOMAIN.len() + 2);
         key.extend_from_slice(META_DOMAIN);
@@ -316,18 +341,6 @@ impl KeyCodec {
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
-    pub(crate) fn export_reverse_name_prefix(&self, directory_inode: Option<u64>) -> Bytes {
-        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + U64_SIZE);
-        key.extend_from_slice(META_DOMAIN);
-        key.push(PREFIX_EXPORT_AUTHORITY);
-        key.push(EXPORT_KEY_VERSION);
-        key.push(EXPORT_REVERSE_NAME_SUBTYPE);
-        if let Some(directory_inode) = directory_inode {
-            key.extend_from_slice(&directory_inode.to_be_bytes());
-        }
-        Bytes::from(key)
-    }
-
     #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn parse_export_binding_metadata_key(
         &self,

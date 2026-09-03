@@ -10,9 +10,9 @@ use crate::fs::errors::FsError;
 use crate::fs::export_authority::{
     ExportAdmissionGuard, ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition,
     ExportMutationContext, ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict,
-    MutationIdentity, apply_transition, encode_outcome, encode_record, encode_reverse_binding,
-    ensure_outcome, mutation_outcome_key, read_outcome_current, read_record_current,
-    read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
+    MutationIdentity, apply_transition, decode_record, encode_outcome, encode_record,
+    encode_reverse_binding, ensure_outcome, mutation_outcome_key, read_outcome_current,
+    read_record_current, read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
     trusted_now_unix_millis, validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
@@ -848,6 +848,30 @@ async fn worker_loop(
             continue;
         }
 
+        // A retained authority shard must never ship an ordinary mutation of
+        // bound export state and only discover the violation at local apply.
+        // Recheck again under the final local permit below; this early pass is
+        // the replication admission gate.
+        #[cfg(feature = "rhizome-export-authority-core")]
+        if replicating
+            && !export_binding_metadata_keys.is_empty()
+            && let Err(error) = reject_bound_export_metadata_mutations(
+                &ctx.db,
+                &ctx.key_codec,
+                &export_binding_metadata_keys,
+            )
+            .await
+        {
+            for reply in replies {
+                let _ = reply.send(Err(error));
+            }
+            #[cfg(any(test, dst))]
+            if let Some(reply) = barrier_reply {
+                let _ = reply.send(Err(error));
+            }
+            continue;
+        }
+
         // Persist the allocation watermark only after it advances.
         let current = ctx.inode_store.next_id();
         let counter_staged = current > last_emitted_counter;
@@ -1517,38 +1541,25 @@ async fn reject_bound_export_metadata_mutations(
         let Some(candidate) = key_codec.parse_export_binding_metadata_key(key) else {
             continue;
         };
-        let is_bound = match candidate {
+        let is_bound = match &candidate {
             ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
-                if read_reverse_binding_current(db, &key_codec.export_reverse_inode_key(inode))
+                read_reverse_binding_current(db, &key_codec.export_reverse_inode_key(*inode))
                     .await
                     .map_err(|_| FsError::InvalidData)?
                     .is_some()
-                {
-                    true
-                } else {
-                    reverse_prefix_has_entry(db, key_codec.export_reverse_name_prefix(Some(inode)))
-                        .await?
-                }
             }
             ExportBindingMetadataKey::DirectoryEntry {
                 directory_inode,
                 name,
             } => {
-                let exact = key_codec.export_reverse_name_key(directory_inode, &name);
-                if read_reverse_binding_current(db, &exact)
+                let exact = key_codec.export_reverse_name_key(*directory_inode, name);
+                read_reverse_binding_current(db, &exact)
                     .await
                     .map_err(|_| FsError::InvalidData)?
                     .is_some()
-                {
-                    true
-                } else if directory_inode == 0 && name.as_ref() == b".nbd" {
-                    reverse_prefix_has_entry(db, key_codec.export_reverse_name_prefix(None)).await?
-                } else {
-                    false
-                }
             }
         };
-        if is_bound {
+        if is_bound || forward_binding_matches(db, key_codec, &candidate).await? {
             return Err(FsError::OperationNotPermitted);
         }
     }
@@ -1556,16 +1567,47 @@ async fn reject_bound_export_metadata_mutations(
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
-async fn reverse_prefix_has_entry(db: &Db, prefix: bytes::Bytes) -> Result<bool, FsError> {
+async fn forward_binding_matches(
+    db: &Db,
+    key_codec: &KeyCodec,
+    candidate: &ExportBindingMetadataKey,
+) -> Result<bool, FsError> {
+    let prefix = key_codec.export_authority_prefix();
     let mut rows = db
         .scan_prefix(prefix, None, 4 * 1024)
         .await
         .map_err(|_| FsError::IoError)?;
-    rows.next()
+    while let Some((key, value)) = rows
+        .next()
         .await
         .transpose()
-        .map(|row| row.is_some())
-        .map_err(|_| FsError::IoError)
+        .map_err(|_| FsError::IoError)?
+    {
+        let workspace = key_codec
+            .parse_export_authority_workspace(&key)
+            .ok_or(FsError::InvalidData)?;
+        let record = decode_record(&value, workspace).map_err(|_| FsError::InvalidData)?;
+        if !record.binding_initialized {
+            continue;
+        }
+        let matches = match candidate {
+            ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
+                *inode == record.export.inode || *inode == record.export.nbd_directory_inode
+            }
+            ExportBindingMetadataKey::DirectoryEntry {
+                directory_inode,
+                name,
+            } => {
+                (*directory_inode == record.export.nbd_directory_inode
+                    && name.as_ref() == record.export.name.as_slice())
+                    || (*directory_inode == 0 && name.as_ref() == b".nbd")
+            }
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]

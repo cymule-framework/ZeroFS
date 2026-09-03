@@ -105,6 +105,10 @@ attribution intact.
   reverse-bound file, `.nbd` directory, exact entry, or root `.nbd` mapping.
   Keep the host-local `.nbd` ingress supervisor-owned as an additional adapter
   release gate; do not rely on metadata caches for this protection.
+- If a retained authority shard is opened with a replicator, ordinary bound
+  mutations must be rejected before replication ship and rechecked under the
+  final local write permit. The authority profile itself remains unsupported in
+  HA mode; never ship first and discover a binding violation only at local apply.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct
