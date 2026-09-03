@@ -95,6 +95,15 @@ attribution intact.
   reverse-name and reverse-inode rows with the forward authority record. Later
   refresh, deactivate, and fence transitions retain both reverse rows; never
   scan for or delete them outside a future typed retirement/GC protocol.
+- Export schema v2 enablement must fail with `MigrationRequired` when the narrow
+  reserved v1 prefix contains any forward or outcome row. Do not silently treat
+  v1 data as absent or rebuild missing reverse rows for an initialized record.
+  Physical checks at activation and the final mutation permit read and strictly
+  decode current DB inode/directory rows rather than trusting metadata caches.
+- Ordinary rename/link/truncate entry points are not yet reverse-index-aware.
+  The host-local NBD adapter must make `.nbd` a closed supervisor-owned ingress
+  before this feature can be release-enabled; post-binding typed mutations fail
+  closed if those ordinary paths changed the identity in the meantime.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct

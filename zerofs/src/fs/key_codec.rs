@@ -229,6 +229,15 @@ impl KeyCodec {
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn legacy_export_v1_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 2);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(1);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn export_mutation_outcome_key(&self, identity: &ExportMutationKey<'_>) -> Bytes {
         let workspace = identity.workspace_id.as_bytes();
         let actor = identity.actor.as_bytes();

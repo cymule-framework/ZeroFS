@@ -13,6 +13,7 @@ use crate::fs::store::{ExtentStore, InodeStore};
 use crate::fs::write_coordinator::WriteCoordinator;
 use bincode::Options;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -617,6 +618,8 @@ pub(crate) enum ExportAuthorityError {
     Storage,
     #[error("export authority profile is not durably enabled")]
     ProfileDisabled,
+    #[error("legacy export authority state requires an explicit migration")]
+    MigrationRequired,
 }
 
 impl ExportAuthorityError {
@@ -1054,6 +1057,17 @@ impl ExportAuthorityStore {
             .await
             .map_err(|_| ExportAuthorityError::Storage)?;
         let mut record = read_record_durable(&self.db, &key, workspace_id).await?;
+        if let Some(current) = record.as_ref() {
+            let binding = reverse_binding_for(current);
+            let (name_key, inode_key) = reverse_binding_keys(&binding);
+            let by_name = read_reverse_binding_durable(&self.db, &name_key).await?;
+            let by_inode = read_reverse_binding_durable(&self.db, &inode_key).await?;
+            match (current.binding_initialized, by_name, by_inode) {
+                (true, Some(name), Some(inode)) if name == binding && inode == binding => {}
+                (false, None, None) => {}
+                _ => return Err(ExportAuthorityError::Corrupt),
+            }
+        }
         if let Some(record) = record.as_mut()
             && (current_boot.as_deref() != Some(self.server_boot_id.as_bytes())
                 || record
@@ -1101,6 +1115,20 @@ impl ExportAuthorityStore {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Ok(());
+        }
+        let mut legacy = self
+            .db
+            .scan_prefix(KeyCodec::new().legacy_export_v1_prefix(), None, 4 * 1024)
+            .await
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        if legacy
+            .next()
+            .await
+            .transpose()
+            .map_err(|_| ExportAuthorityError::Storage)?
+            .is_some()
+        {
+            return Err(ExportAuthorityError::MigrationRequired);
         }
         self.coordinator.initialize_export_boot().await?;
         self.profile_enabled
@@ -1282,6 +1310,20 @@ pub(crate) async fn read_reverse_binding_current(
 ) -> Result<Option<ExportReverseBinding>, ExportAuthorityError> {
     let Some(bytes) = db
         .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_reverse_binding(&bytes, key).map(Some)
+}
+
+async fn read_reverse_binding_durable(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<ExportReverseBinding>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes_durable(key)
         .await
         .map_err(|_| ExportAuthorityError::Storage)?
     else {
@@ -3527,6 +3569,172 @@ mod tests {
             reopened.export_authority.activate(replacement).await,
             Err(ExportAuthorityError::Corrupt)
         );
+    }
+
+    #[tokio::test]
+    async fn durable_get_rejects_missing_or_mismatched_reverse_rows() {
+        for delete_name in [true, false] {
+            let fs = new_export_fs().await;
+            let active = fs
+                .export_authority
+                .activate(activate_command(authority(3, 5)))
+                .await
+                .unwrap();
+            let binding = reverse_binding_for(&active);
+            let (name_key, inode_key) = reverse_binding_keys(&binding);
+            fs.db
+                .inject_reserved_authority_delete_for_test(if delete_name {
+                    name_key
+                } else {
+                    inode_key
+                })
+                .await
+                .unwrap();
+            fs.flush_coordinator.flush().await.unwrap();
+            assert_eq!(
+                fs.export_authority.get("workspace-a").await,
+                Err(ExportAuthorityError::Corrupt)
+            );
+        }
+
+        for corrupt_name in [true, false] {
+            let fs = new_export_fs().await;
+            let active = fs
+                .export_authority
+                .activate(activate_command(authority(3, 5)))
+                .await
+                .unwrap();
+            let binding = reverse_binding_for(&active);
+            let (name_key, inode_key) = reverse_binding_keys(&binding);
+            let mismatched = ExportReverseBinding {
+                workspace_id: "workspace-other".into(),
+                ..binding
+            };
+            let target = if corrupt_name { name_key } else { inode_key };
+            fs.db
+                .inject_reserved_authority_value_for_test(
+                    target.clone(),
+                    encode_reverse_binding(&mismatched, &target).unwrap(),
+                )
+                .await
+                .unwrap();
+            fs.flush_coordinator.flush().await.unwrap();
+            assert_eq!(
+                fs.export_authority.get("workspace-a").await,
+                Err(ExportAuthorityError::Corrupt)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_forward_or_outcome_blocks_profile_enablement() {
+        for subtype in [1u8, 2u8] {
+            let fs = ZeroFS::new_in_memory().await.unwrap();
+            let mut key = b"meta".to_vec();
+            key.extend_from_slice(&[0x0b, 1, subtype]);
+            key.extend_from_slice(b"legacy");
+            fs.db
+                .inject_reserved_authority_value_for_test(
+                    Bytes::from(key),
+                    Bytes::from_static(b"legacy-v1"),
+                )
+                .await
+                .unwrap();
+            fs.export_authority
+                .install_process_guard(ShardProcessGuard::for_test())
+                .unwrap();
+            assert_eq!(
+                fs.export_authority.enable_standalone_profile().await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_requires_the_canonical_root_nbd_directory() {
+        let fs = new_export_fs().await;
+        let creds = crate::fs::test_util::test_creds();
+        let other_directory = fs
+            .mkdir(
+                &creds,
+                0,
+                b"other",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await
+            .unwrap()
+            .0;
+        let other_file = fs
+            .create(
+                &creds,
+                other_directory,
+                b"disk-a",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            fs.export_authority
+                .activate(activate_command_for(
+                    authority(3, 5),
+                    export_with_size(other_directory, other_file, 0),
+                ))
+                .await,
+            Err(ExportAuthorityError::Invalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn final_gate_ignores_warm_metadata_caches_and_reads_current_db_rows() {
+        for corrupt_inode in [true, false] {
+            let fs = new_export_fs().await;
+            let active = fs
+                .export_authority
+                .activate(activate_command(authority(3, 5)))
+                .await
+                .unwrap();
+            fs.inode_store.get(active.export.inode).await.unwrap();
+            fs.directory_store
+                .get(active.export.nbd_directory_inode, &active.export.name)
+                .await
+                .unwrap();
+            let mut corrupt = Transaction::new();
+            if corrupt_inode {
+                let mut inode = fs.inode_store.get(active.export.inode).await.unwrap();
+                let crate::fs::inode::Inode::File(file) = &mut inode else {
+                    panic!("export must remain a file");
+                };
+                file.size += 1;
+                corrupt.put_bytes(
+                    &crate::fs::key_codec::KeyCodec::new().inode_key(active.export.inode),
+                    bincode::serialize(&inode).unwrap().into(),
+                );
+            } else {
+                corrupt.put_bytes(
+                    &crate::fs::key_codec::KeyCodec::new()
+                        .dir_entry_key(active.export.nbd_directory_inode, &active.export.name),
+                    crate::fs::key_codec::KeyCodec::encode_dir_entry(active.export.inode + 100, 3),
+                );
+            }
+            fs.write_coordinator.commit(corrupt).await.unwrap();
+            let data_key = crate::fs::key_codec::KeyCodec::new()
+                .extent_key(active.export.inode, 900 + u64::from(corrupt_inode));
+            let mut transaction = Transaction::new();
+            transaction.put_bytes(&data_key, Bytes::from_static(b"must-not-apply"));
+            assert_eq!(
+                fs.export_authority
+                    .commit_mutation(mutation_for(
+                        &active,
+                        transaction,
+                        MutationKind::Write { fua: false },
+                        74 + u8::from(corrupt_inode),
+                    ))
+                    .await,
+                Err(ExportAuthorityError::Storage)
+            );
+            assert!(fs.db.get_bytes(&data_key).await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

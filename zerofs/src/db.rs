@@ -792,6 +792,20 @@ impl Db {
             .await
     }
 
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    pub(crate) async fn inject_reserved_authority_delete_for_test(
+        &self,
+        key: Bytes,
+    ) -> Result<u64> {
+        assert!(crate::fs::key_codec::is_reserved_mutation_key(&key));
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.acquire_write_permit()
+            .await?
+            .write_with_options(batch, &WriteOptions::default())
+            .await
+    }
+
     pub(crate) async fn put_with_options(
         &self,
         key: &Bytes,

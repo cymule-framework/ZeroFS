@@ -81,10 +81,11 @@ not implemented. The feature must remain disabled in ordinary and release
 profiles until strict capability verification and NBD session negotiation are
 connected to every mutating command.
 
-The remaining NBD adapter must extend immutable export identity with the `.nbd`
-directory inode and advertised size, then revalidate directory inode, exact name,
-device inode, and size at the final permit. That schema is intentionally not
-guessed before the host-local listener owns the verified binding. The first
+The remaining NBD adapter must install the already-defined immutable export
+identity and revalidate the root-owned `.nbd` ingress before opening a session.
+The core schema already binds the canonical `.nbd` directory inode, exact name,
+device inode, and advertised size, and revalidates raw current database rows at
+the final permit. The first
 listener profile is one root-owned Unix socket per export; it must not expose
 TCP, unauthenticated LIST, or `CAN_MULTI_CONN`. It must create operation IDs from
 a connection incarnation plus command ordinal/cookie, construct the exact typed
@@ -125,6 +126,12 @@ single-link file and exact directory entry, then commits the forward authority
 record plus key-bound reverse-name and reverse-inode rows in one coordinator
 batch. Refresh, deactivate, and fence retain these rows. Retirement and garbage
 collection are intentionally outside this core slice.
+
+Export key and envelope version 2 are an explicit pre-release schema boundary.
+Profile enablement scans the narrow reserved version-1 prefix and fails with
+`MigrationRequired` if any legacy forward or mutation-outcome row exists. It
+never treats old state as an empty database or performs an implicit reset.
+Deployments must use a fresh shard or a future typed one-shot migration.
 
 Block mutation lengths are bounded to the NBD `u32` command width. Admission
 rejects any range whose mathematical final extent cannot be represented in

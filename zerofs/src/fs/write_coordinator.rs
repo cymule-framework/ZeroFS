@@ -1047,8 +1047,6 @@ async fn worker_loop(
                         match validate_export_mutation_context(
                             &ctx.db,
                             &ctx.key_codec,
-                            &ctx.inode_store,
-                            &ctx.directory_store,
                             &ctx.authority_time_floor,
                             &ctx.export_server_boot_id,
                             context,
@@ -1270,6 +1268,9 @@ async fn commit_export_authority_transition(
                 }
                 record
             });
+    let binding_was_initialized = existing
+        .as_ref()
+        .is_some_and(|record| record.binding_initialized);
     let now = authority_now(&ctx.authority_time_floor);
     let desired = apply_transition(existing, transition, now, &ctx.export_server_boot_id)?;
     let encoded = encode_record(&desired)?;
@@ -1290,8 +1291,8 @@ async fn commit_export_authority_transition(
     }
     match (desired.binding_initialized, name_binding, inode_binding) {
         (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {}
-        (true, None, None) if is_activation => {
-            validate_physical_export(ctx, &desired.export).await?;
+        (true, None, None) if is_activation && !binding_was_initialized => {
+            validate_physical_export(&ctx.db, &ctx.key_codec, &desired.export).await?;
             batch.put_bytes(
                 name_key.clone(),
                 encode_reverse_binding(&binding, &name_key)?,
@@ -1327,23 +1328,53 @@ async fn commit_export_authority_transition(
 
 #[cfg(feature = "rhizome-export-authority-core")]
 async fn validate_physical_export(
-    ctx: &WorkerContext,
+    db: &Db,
+    key_codec: &KeyCodec,
     export: &crate::fs::export_authority::ExportIdentity,
 ) -> Result<(), ExportAuthorityError> {
-    let inode = ctx
-        .inode_store
-        .get(export.inode)
+    let root_mapping = db
+        .get_bytes(&key_codec.dir_entry_key(0, b".nbd"))
         .await
-        .map_err(|_| ExportAuthorityError::Invalid)?;
+        .map_err(|_| ExportAuthorityError::Storage)?
+        .ok_or(ExportAuthorityError::Invalid)
+        .and_then(|bytes| {
+            KeyCodec::decode_dir_entry(&bytes).map_err(|_| ExportAuthorityError::Corrupt)
+        })?;
+    if root_mapping.0 != export.nbd_directory_inode {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    let directory_bytes = db
+        .get_bytes(&key_codec.inode_key(export.nbd_directory_inode))
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+        .ok_or(ExportAuthorityError::Invalid)?;
+    let directory: crate::fs::inode::Inode =
+        bincode::deserialize(&directory_bytes).map_err(|_| ExportAuthorityError::Corrupt)?;
+    let crate::fs::inode::Inode::Directory(directory) = directory else {
+        return Err(ExportAuthorityError::Invalid);
+    };
+    if directory.parent != 0 || directory.name.as_deref() != Some(b".nbd") {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    let inode_bytes = db
+        .get_bytes(&key_codec.inode_key(export.inode))
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+        .ok_or(ExportAuthorityError::Invalid)?;
+    let inode: crate::fs::inode::Inode =
+        bincode::deserialize(&inode_bytes).map_err(|_| ExportAuthorityError::Corrupt)?;
     let crate::fs::inode::Inode::File(file) = inode else {
         return Err(ExportAuthorityError::Invalid);
     };
-    let mapped_inode = ctx
-        .directory_store
-        .get(export.nbd_directory_inode, export.name.as_slice())
+    let mapped_inode = db
+        .get_bytes(&key_codec.dir_entry_key(export.nbd_directory_inode, export.name.as_slice()))
         .await
-        .map_err(|_| ExportAuthorityError::Invalid)?;
-    if mapped_inode != export.inode
+        .map_err(|_| ExportAuthorityError::Storage)?
+        .ok_or(ExportAuthorityError::Invalid)
+        .and_then(|bytes| {
+            KeyCodec::decode_dir_entry(&bytes).map_err(|_| ExportAuthorityError::Corrupt)
+        })?;
+    if mapped_inode.0 != export.inode
         || file.parent != Some(export.nbd_directory_inode)
         || file.name.as_deref() != Some(export.name.as_slice())
         || file.nlink != 1
@@ -1447,8 +1478,6 @@ fn authority_now(floor: &std::sync::atomic::AtomicU64) -> u64 {
 async fn validate_export_mutation_context(
     db: &Db,
     key_codec: &KeyCodec,
-    inode_store: &InodeStore,
-    directory_store: &DirectoryStore,
     authority_time_floor: &std::sync::atomic::AtomicU64,
     export_server_boot_id: &str,
     context: &ExportMutationContext,
@@ -1492,28 +1521,9 @@ async fn validate_export_mutation_context(
     if name_binding.as_ref() != Some(&binding) || inode_binding.as_ref() != Some(&binding) {
         return Err(FsError::InvalidData);
     }
-    let inode = inode_store
-        .get(binding.export.inode)
+    validate_physical_export(db, key_codec, &binding.export)
         .await
         .map_err(|_| FsError::InvalidData)?;
-    let crate::fs::inode::Inode::File(file) = inode else {
-        return Err(FsError::InvalidData);
-    };
-    if file.parent != Some(binding.export.nbd_directory_inode)
-        || file.name.as_deref() != Some(binding.export.name.as_slice())
-        || file.nlink != 1
-        || file.size != binding.export.advertised_size
-        || directory_store
-            .get(
-                binding.export.nbd_directory_inode,
-                binding.export.name.as_slice(),
-            )
-            .await
-            .map_err(|_| FsError::InvalidData)?
-            != binding.export.inode
-    {
-        return Err(FsError::InvalidData);
-    }
     let session = record.active_session.as_mut().ok_or(FsError::StaleHandle)?;
     let sequence = session
         .committed_through_sequence
