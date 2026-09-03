@@ -10,10 +10,10 @@ use crate::fs::errors::FsError;
 use crate::fs::export_authority::{
     ExportAdmissionGuard, ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition,
     ExportMutationContext, ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict,
-    MutationIdentity, apply_transition, decode_record, encode_outcome, encode_record,
-    encode_reverse_binding, ensure_outcome, mutation_outcome_key, read_outcome_current,
-    read_record_current, read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
-    trusted_now_unix_millis, validate_mutation,
+    MutationIdentity, apply_transition, decode_record, decode_reverse_binding, encode_outcome,
+    encode_record, encode_reverse_binding, ensure_outcome, mutation_outcome_key,
+    read_outcome_current, read_record_current, read_reverse_binding_current, reverse_binding_for,
+    reverse_binding_keys, trusted_now_unix_millis, validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -171,8 +171,44 @@ struct WorkerContext {
     export_server_boot_id: Arc<str>,
     #[cfg(feature = "rhizome-export-authority-core")]
     authority_time_floor: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "rhizome-export-authority-core")]
+    export_binding_index: ExportBindingIndex,
     #[cfg(any(test, dst))]
     workspace_durable_test_hook: Arc<WorkspaceDurableTestHook>,
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+#[derive(Default)]
+struct ExportBindingIndex {
+    initialized: bool,
+    poisoned: bool,
+    inodes: HashSet<u64>,
+    entries: HashSet<(u64, bytes::Bytes)>,
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+impl ExportBindingIndex {
+    fn insert(&mut self, binding: &crate::fs::export_authority::ExportReverseBinding) {
+        self.inodes.insert(binding.export.inode);
+        self.inodes.insert(binding.export.nbd_directory_inode);
+        self.entries.insert((
+            binding.export.nbd_directory_inode,
+            bytes::Bytes::copy_from_slice(&binding.export.name),
+        ));
+        self.entries.insert((0, bytes::Bytes::from_static(b".nbd")));
+    }
+
+    fn protects(&self, candidate: &ExportBindingMetadataKey) -> bool {
+        match candidate {
+            ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
+                self.inodes.contains(inode)
+            }
+            ExportBindingMetadataKey::DirectoryEntry {
+                directory_inode,
+                name,
+            } => self.entries.contains(&(*directory_inode, name.clone())),
+        }
+    }
 }
 
 impl WriteCoordinator {
@@ -216,6 +252,8 @@ impl WriteCoordinator {
             export_server_boot_id: export_server_boot_id.clone(),
             #[cfg(feature = "rhizome-export-authority-core")]
             authority_time_floor: authority_time_floor.clone(),
+            #[cfg(feature = "rhizome-export-authority-core")]
+            export_binding_index: ExportBindingIndex::default(),
             #[cfg(any(test, dst))]
             workspace_durable_test_hook: workspace_durable_test_hook.clone(),
         };
@@ -858,6 +896,7 @@ async fn worker_loop(
             && let Err(error) = reject_bound_export_metadata_mutations(
                 &ctx.db,
                 &ctx.key_codec,
+                &mut ctx.export_binding_index,
                 &export_binding_metadata_keys,
             )
             .await
@@ -1067,6 +1106,7 @@ async fn worker_loop(
                     if let Err(error) = reject_bound_export_metadata_mutations(
                         &ctx.db,
                         &ctx.key_codec,
+                        &mut ctx.export_binding_index,
                         &export_binding_metadata_keys,
                     )
                     .await
@@ -1352,10 +1392,16 @@ async fn commit_export_authority_transition(
         (false, None, None) => {}
         (false, _, _) => return Err(ExportAuthorityError::Corrupt),
     }
-    permit
+    let write = permit
         .write_with_options(batch, &WriteOptions::default())
-        .await
-        .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
+        .await;
+    if write.is_err() {
+        ctx.export_binding_index.initialized = false;
+        return Err(ExportAuthorityError::CommitOutcomeUnknown);
+    }
+    if desired.binding_initialized && ctx.export_binding_index.initialized {
+        ctx.export_binding_index.insert(&binding);
+    }
     #[cfg(test)]
     let fail_injected = ctx
         .workspace_durable_test_hook
@@ -1535,31 +1581,18 @@ fn authority_now(floor: &std::sync::atomic::AtomicU64) -> u64 {
 async fn reject_bound_export_metadata_mutations(
     db: &Db,
     key_codec: &KeyCodec,
+    index: &mut ExportBindingIndex,
     keys: &[bytes::Bytes],
 ) -> Result<(), FsError> {
+    ensure_export_binding_index(db, key_codec, index).await?;
+    if index.poisoned {
+        return Err(FsError::InvalidData);
+    }
     for key in keys {
         let Some(candidate) = key_codec.parse_export_binding_metadata_key(key) else {
             continue;
         };
-        let is_bound = match &candidate {
-            ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
-                read_reverse_binding_current(db, &key_codec.export_reverse_inode_key(*inode))
-                    .await
-                    .map_err(|_| FsError::InvalidData)?
-                    .is_some()
-            }
-            ExportBindingMetadataKey::DirectoryEntry {
-                directory_inode,
-                name,
-            } => {
-                let exact = key_codec.export_reverse_name_key(*directory_inode, name);
-                read_reverse_binding_current(db, &exact)
-                    .await
-                    .map_err(|_| FsError::InvalidData)?
-                    .is_some()
-            }
-        };
-        if is_bound || forward_binding_matches(db, key_codec, &candidate).await? {
+        if index.protects(&candidate) {
             return Err(FsError::OperationNotPermitted);
         }
     }
@@ -1567,47 +1600,71 @@ async fn reject_bound_export_metadata_mutations(
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
-async fn forward_binding_matches(
+async fn ensure_export_binding_index(
     db: &Db,
     key_codec: &KeyCodec,
-    candidate: &ExportBindingMetadataKey,
-) -> Result<bool, FsError> {
-    let prefix = key_codec.export_authority_prefix();
-    let mut rows = db
-        .scan_prefix(prefix, None, 4 * 1024)
+    index: &mut ExportBindingIndex,
+) -> Result<(), FsError> {
+    if index.initialized {
+        return Ok(());
+    }
+    let mut rebuilt = ExportBindingIndex {
+        initialized: true,
+        ..ExportBindingIndex::default()
+    };
+    let mut forward = db
+        .scan_prefix(key_codec.export_authority_prefix(), None, 4 * 1024)
         .await
         .map_err(|_| FsError::IoError)?;
-    while let Some((key, value)) = rows
+    while let Some((key, value)) = forward
         .next()
         .await
         .transpose()
         .map_err(|_| FsError::IoError)?
     {
-        let workspace = key_codec
-            .parse_export_authority_workspace(&key)
-            .ok_or(FsError::InvalidData)?;
-        let record = decode_record(&value, workspace).map_err(|_| FsError::InvalidData)?;
-        if !record.binding_initialized {
-            continue;
-        }
-        let matches = match candidate {
-            ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
-                *inode == record.export.inode || *inode == record.export.nbd_directory_inode
-            }
-            ExportBindingMetadataKey::DirectoryEntry {
-                directory_inode,
-                name,
-            } => {
-                (*directory_inode == record.export.nbd_directory_inode
-                    && name.as_ref() == record.export.name.as_slice())
-                    || (*directory_inode == 0 && name.as_ref() == b".nbd")
+        let Some(workspace) = key_codec.parse_export_authority_workspace(&key) else {
+            rebuilt.poisoned = true;
+            *index = rebuilt;
+            return Err(FsError::InvalidData);
+        };
+        let record = match decode_record(&value, workspace) {
+            Ok(record) => record,
+            Err(_) => {
+                rebuilt.poisoned = true;
+                *index = rebuilt;
+                return Err(FsError::InvalidData);
             }
         };
-        if matches {
-            return Ok(true);
+        if record.binding_initialized {
+            rebuilt.insert(&reverse_binding_for(&record));
         }
     }
-    Ok(false)
+    for prefix in [
+        key_codec.export_reverse_name_prefix(),
+        key_codec.export_reverse_inode_prefix(),
+    ] {
+        let mut reverse = db
+            .scan_prefix(prefix, None, 4 * 1024)
+            .await
+            .map_err(|_| FsError::IoError)?;
+        while let Some((key, value)) = reverse
+            .next()
+            .await
+            .transpose()
+            .map_err(|_| FsError::IoError)?
+        {
+            match decode_reverse_binding(&value, &key) {
+                Ok(binding) => rebuilt.insert(&binding),
+                Err(_) => {
+                    rebuilt.poisoned = true;
+                    *index = rebuilt;
+                    return Err(FsError::InvalidData);
+                }
+            }
+        }
+    }
+    *index = rebuilt;
+    Ok(())
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]

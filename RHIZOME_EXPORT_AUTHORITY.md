@@ -98,6 +98,13 @@ protect the bound `.nbd` directory entry from replacement and define typed
 outcome retention/GC. Until those pieces and strict capability verification
 exist, the feature remains ineligible for an NBD or release profile.
 
+Ordinary-write protection uses a conservative derived deny index owned by the
+single coordinator. Its first use scans and strictly decodes the complete v2
+forward, reverse-name, and reverse-inode prefixes; corrupt initialization blocks
+writes. Successful first activation inserts the binding, while an uncertain
+authority apply invalidates the index for reconstruction. Steady-state final
+checks are constant-time per transaction candidate rather than Actor-count scans.
+
 Profile enablement itself is durable authority. A boot write or flush with an
 unknown outcome leaves the in-process profile disabled; authority and mutation
 methods remain unavailable until an exact retry durably commits the current

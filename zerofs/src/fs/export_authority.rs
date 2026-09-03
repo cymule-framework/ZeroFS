@@ -1653,7 +1653,7 @@ fn decode_outcome(
     Ok(outcome)
 }
 
-fn decode_reverse_binding(
+pub(crate) fn decode_reverse_binding(
     bytes: &[u8],
     key: &Bytes,
 ) -> Result<ExportReverseBinding, ExportAuthorityError> {
@@ -3731,6 +3731,65 @@ mod tests {
             if missing != 0 {
                 fs.db
                     .inject_reserved_authority_delete_for_test(inode_key.clone())
+                    .await
+                    .unwrap();
+            }
+            let protected = [
+                codec.inode_key(active.export.inode),
+                codec.extent_key(active.export.inode, 0),
+                codec.inode_key(active.export.nbd_directory_inode),
+                codec.dir_entry_key(active.export.nbd_directory_inode, &active.export.name),
+                codec.dir_entry_key(0, b".nbd"),
+            ];
+            for key in protected {
+                let original = fs
+                    .db
+                    .get_bytes(&key)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| Bytes::from_static(b"candidate"));
+                for value in [Some(original), None] {
+                    let mut transaction = Transaction::new();
+                    if let Some(value) = value {
+                        transaction.put_bytes(&key, value);
+                    } else {
+                        transaction.delete_bytes(&key);
+                    }
+                    assert_eq!(
+                        fs.write_coordinator.commit(transaction).await,
+                        Err(crate::fs::errors::FsError::OperationNotPermitted)
+                    );
+                }
+            }
+            assert_eq!(fs.export_authority.dst_prepared_mutations(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_reverse_rows_fence_raw_mutations_when_forward_is_missing() {
+        for retained in 0..3 {
+            let fs = new_export_fs().await;
+            let active = fs
+                .export_authority
+                .activate(activate_command(authority(3, 5)))
+                .await
+                .unwrap();
+            let codec = crate::fs::key_codec::KeyCodec::new();
+            let (name_key, inode_key) = reverse_binding_keys(&reverse_binding_for(&active));
+            fs.db
+                .inject_reserved_authority_delete_for_test(
+                    codec.export_authority_key(&active.workspace_id),
+                )
+                .await
+                .unwrap();
+            if retained == 0 {
+                fs.db
+                    .inject_reserved_authority_delete_for_test(inode_key)
+                    .await
+                    .unwrap();
+            } else if retained == 1 {
+                fs.db
+                    .inject_reserved_authority_delete_for_test(name_key)
                     .await
                     .unwrap();
             }

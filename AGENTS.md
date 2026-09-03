@@ -109,6 +109,11 @@ attribution intact.
   mutations must be rejected before replication ship and rechecked under the
   final local write permit. The authority profile itself remains unsupported in
   HA mode; never ship first and discover a binding violation only at local apply.
+- Raw-write fencing uses a conservative, rebuildable in-memory deny index. Its
+  first use scans and strictly decodes all v2 forward and both reverse prefixes;
+  initialization or any corrupt row fails closed. The single coordinator inserts
+  newly committed bindings, and uncertain writes invalidate the index. Final
+  admission is then bounded per candidate; never restore per-write full scans.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct

@@ -341,6 +341,26 @@ impl KeyCodec {
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_reverse_name_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 3);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_REVERSE_NAME_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_reverse_inode_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 3);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_REVERSE_INODE_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
     #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn parse_export_binding_metadata_key(
         &self,
