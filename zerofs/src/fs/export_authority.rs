@@ -3410,6 +3410,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_revalidates_single_link_after_activation() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        fs.link(
+            &crate::fs::types::AuthContext::default(),
+            active.export.inode,
+            active.export.nbd_directory_inode,
+            b"disk-hardlink",
+        )
+        .await
+        .unwrap();
+        let mutation = ExportMutationBuilder::build(
+            token(&active),
+            [0x73; SHA256_SIZE],
+            ExportMutationCommand::Flush,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority.commit_mutation(mutation).await,
+            Err(ExportAuthorityError::Invalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_first_activation_never_publishes_partial_reverse_bindings() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let fs = open_fs(object_store.clone()).await.unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        let command = activate_command(authority(3, 5));
+        let binding = ExportReverseBinding {
+            workspace_id: command.workspace_id.clone(),
+            actor: command.authority.actor.clone(),
+            actor_generation: command.authority.actor_generation,
+            export: command.export.clone(),
+        };
+        let (name_key, inode_key) = reverse_binding_keys(&binding);
+        fs.write_coordinator.dst_fail_next_workspace_durable_flush();
+        assert_eq!(
+            fs.export_authority.activate(command).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        let crash_snapshot = snapshot_object_store(&object_store).await;
+        fs.db.close().await.unwrap();
+        drop(fs);
+
+        let reopened = open_fs(crash_snapshot).await.unwrap();
+        assert!(
+            reopened
+                .export_authority
+                .get("workspace-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_reverse_binding_current(&reopened.db, &name_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_reverse_binding_current(&reopened.db, &inode_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn reverse_bindings_survive_restart_and_fail_closed_on_cross_key_copy() {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
