@@ -18,9 +18,10 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use thiserror::Error;
 
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 const AUTHORITY_RECORD_MAGIC: &[u8; 4] = b"RAUT";
 const MUTATION_OUTCOME_MAGIC: &[u8; 4] = b"RMUT";
+const REVERSE_BINDING_MAGIC: &[u8; 4] = b"RBND";
 const MAX_ID_BYTES: usize = 1024;
 const SHA256_SIZE: usize = 32;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -38,8 +39,10 @@ const DATA_CHECKSUM_DOMAIN: &[u8] = b"rhizome.export-mutation-data.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExportIdentity {
+    pub nbd_directory_inode: u64,
     pub name: Vec<u8>,
     pub inode: u64,
+    pub advertised_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +73,16 @@ pub(crate) struct ExportAuthorityRecord {
     pub export: ExportIdentity,
     pub authority: AuthorityVersion,
     pub rejected_through_placement_epoch: u64,
+    pub binding_initialized: bool,
     pub active_session: Option<ExportSessionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExportReverseBinding {
+    pub workspace_id: String,
+    pub actor: String,
+    pub actor_generation: u64,
+    pub export: ExportIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -840,7 +852,11 @@ impl ExportAuthorityStore {
             crate::fs::inode::Inode::File(file) => file,
             _ => return Err(ExportAuthorityError::Invalid),
         };
-        if file.name.as_deref() != Some(mutation.token.export.name.as_slice()) {
+        if file.parent != Some(mutation.token.export.nbd_directory_inode)
+            || file.name.as_deref() != Some(mutation.token.export.name.as_slice())
+            || file.nlink != 1
+            || file.size != mutation.token.export.advertised_size
+        {
             return Err(ExportAuthorityError::Invalid);
         }
         // Re-read durable process/writer authority at the physical staging
@@ -1260,6 +1276,40 @@ pub(crate) async fn read_outcome_current(
     decode_outcome(&bytes, expected).map(Some)
 }
 
+pub(crate) async fn read_reverse_binding_current(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<ExportReverseBinding>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_reverse_binding(&bytes, key).map(Some)
+}
+
+pub(crate) fn reverse_binding_for(record: &ExportAuthorityRecord) -> ExportReverseBinding {
+    ExportReverseBinding {
+        workspace_id: record.workspace_id.clone(),
+        actor: record.authority.actor.clone(),
+        actor_generation: record.authority.actor_generation,
+        export: record.export.clone(),
+    }
+}
+
+pub(crate) fn reverse_binding_keys(binding: &ExportReverseBinding) -> (Bytes, Bytes) {
+    let codec = KeyCodec::new();
+    (
+        codec.export_reverse_name_key(
+            binding.export.nbd_directory_inode,
+            binding.export.name.as_slice(),
+        ),
+        codec.export_reverse_inode_key(binding.export.inode),
+    )
+}
+
 pub(crate) fn mutation_outcome_key(expected: &ExportMutationExpectation) -> Bytes {
     KeyCodec::new().export_mutation_outcome_key(&ExportMutationKey {
         workspace_id: &expected.workspace_id,
@@ -1307,6 +1357,7 @@ pub(crate) fn apply_transition(
                 rejected_through_placement_epoch: existing
                     .as_ref()
                     .map_or(0, |r| r.rejected_through_placement_epoch),
+                binding_initialized: true,
                 active_session: Some(command.session),
             };
             if let Some(current) = existing {
@@ -1392,6 +1443,7 @@ pub(crate) fn apply_transition(
                     export: command.export,
                     authority: command.new_non_writable_authority,
                     rejected_through_placement_epoch: command.reject_through_placement_epoch,
+                    binding_initialized: false,
                     active_session: None,
                 }),
                 Some(mut current) => {
@@ -1495,6 +1547,21 @@ pub(crate) fn encode_outcome(
     encode_bound_record(MUTATION_OUTCOME_MAGIC, &key, &payload)
 }
 
+pub(crate) fn encode_reverse_binding(
+    binding: &ExportReverseBinding,
+    key: &Bytes,
+) -> Result<Bytes, ExportAuthorityError> {
+    validate_reverse_binding(binding)?;
+    let (name_key, inode_key) = reverse_binding_keys(binding);
+    if key != &name_key && key != &inode_key {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    let payload = codec()
+        .serialize(binding)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    encode_bound_record(REVERSE_BINDING_MAGIC, key, &payload)
+}
+
 fn decode_record(
     bytes: &[u8],
     expected_workspace_id: &str,
@@ -1528,6 +1595,22 @@ fn decode_outcome(
         return Err(ExportAuthorityError::Corrupt);
     }
     Ok(outcome)
+}
+
+fn decode_reverse_binding(
+    bytes: &[u8],
+    key: &Bytes,
+) -> Result<ExportReverseBinding, ExportAuthorityError> {
+    let payload = decode_bound_record(REVERSE_BINDING_MAGIC, key, bytes)?;
+    let binding: ExportReverseBinding = codec()
+        .deserialize(payload)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    validate_reverse_binding(&binding)?;
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    if key != &name_key && key != &inode_key {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(binding)
 }
 
 fn encode_bound_record(
@@ -1649,6 +1732,9 @@ fn validate_record(record: &ExportAuthorityRecord) -> Result<(), ExportAuthority
         return Err(ExportAuthorityError::Corrupt);
     }
     if let Some(session) = &record.active_session {
+        if !record.binding_initialized {
+            return Err(ExportAuthorityError::Corrupt);
+        }
         validate_session(session, 0)?;
         if record.authority.placement_epoch <= record.rejected_through_placement_epoch {
             return Err(ExportAuthorityError::Corrupt);
@@ -1661,8 +1747,19 @@ fn validate_export(export: &ExportIdentity) -> Result<(), ExportAuthorityError> 
     if export.name.is_empty()
         || export.name.len() > MAX_ID_BYTES
         || export.name.contains(&0)
+        || export.nbd_directory_inode == 0
         || export.inode == 0
     {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_reverse_binding(binding: &ExportReverseBinding) -> Result<(), ExportAuthorityError> {
+    validate_id(&binding.workspace_id)?;
+    validate_id(&binding.actor)?;
+    validate_export(&binding.export)?;
+    if binding.actor_generation == 0 {
         return Err(ExportAuthorityError::Invalid);
     }
     Ok(())
@@ -1752,8 +1849,10 @@ pub fn dst_export_authority_model(seed: u64) {
         ExportAuthorityTransition::Activate(ActivateExport {
             workspace_id: format!("workspace-{seed}"),
             export: ExportIdentity {
+                nbd_directory_inode: base.saturating_add(1),
                 name: format!("export-{seed}").into_bytes(),
                 inode: base,
+                advertised_size: base,
             },
             authority: version.clone(),
             session: ExportSessionState {
@@ -1826,8 +1925,19 @@ mod tests {
 
     fn export(inode: u64) -> ExportIdentity {
         ExportIdentity {
+            nbd_directory_inode: 1,
             name: b"disk-a".to_vec(),
             inode,
+            advertised_size: 4096,
+        }
+    }
+
+    fn export_with_size(directory_inode: u64, inode: u64, size: u64) -> ExportIdentity {
+        ExportIdentity {
+            nbd_directory_inode: directory_inode,
+            name: b"disk-a".to_vec(),
+            inode,
+            advertised_size: size,
         }
     }
 
@@ -1856,7 +1966,7 @@ mod tests {
     }
 
     fn activate_command(version: AuthorityVersion) -> ActivateExport {
-        activate_command_for(version, export(77))
+        activate_command_for(version, export(2))
     }
 
     fn activate_command_for(version: AuthorityVersion, export: ExportIdentity) -> ActivateExport {
@@ -1947,6 +2057,7 @@ mod tests {
         fs.export_authority
             .install_process_guard(ShardProcessGuard::for_test())?;
         fs.export_authority.enable_standalone_profile().await?;
+        ensure_test_export(&fs, 4096).await?;
         Ok(fs)
     }
 
@@ -1959,7 +2070,56 @@ mod tests {
             .enable_standalone_profile()
             .await
             .unwrap();
+        ensure_test_export(&fs, 4096).await.unwrap();
         fs
+    }
+
+    async fn ensure_test_export(
+        fs: &ZeroFS,
+        size: u64,
+    ) -> Result<ExportIdentity, crate::fs::errors::FsError> {
+        let creds = crate::fs::test_util::test_creds();
+        let directory_inode = match fs.lookup(&creds, 0, b".nbd").await {
+            Ok(inode) => inode,
+            Err(crate::fs::errors::FsError::NotFound) => {
+                fs.mkdir(
+                    &creds,
+                    0,
+                    b".nbd",
+                    &crate::fs::types::SetAttributes::default(),
+                )
+                .await?
+                .0
+            }
+            Err(error) => return Err(error),
+        };
+        let inode = match fs.lookup(&creds, directory_inode, b"disk-a").await {
+            Ok(inode) => inode,
+            Err(crate::fs::errors::FsError::NotFound) => {
+                let inode = fs
+                    .create(
+                        &creds,
+                        directory_inode,
+                        b"disk-a",
+                        &crate::fs::types::SetAttributes::default(),
+                    )
+                    .await?
+                    .0;
+                if size != 0 {
+                    fs.write(
+                        &crate::fs::types::AuthContext::default(),
+                        inode,
+                        size - 1,
+                        &Bytes::from_static(&[0]),
+                    )
+                    .await?;
+                }
+                inode
+            }
+            Err(error) => return Err(error),
+        };
+        let current = fs.inode_store.get(inode).await?;
+        Ok(export_with_size(directory_inode, inode, current.size()))
     }
 
     async fn snapshot_object_store(
@@ -2596,6 +2756,7 @@ mod tests {
             export: export(77),
             authority: authority(3, 5),
             rejected_through_placement_epoch: 0,
+            binding_initialized: true,
             active_session: Some(session("session-a", "capability-a", NOW)),
         };
         assert_eq!(

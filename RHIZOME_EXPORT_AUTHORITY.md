@@ -119,6 +119,13 @@ kills and joins the previous process and obtains the same inode lock. This is a
 same-host boundary; cross-host takeover remains fail-closed until external
 STONITH/Node fencing exists.
 
+The immutable export identity binds the `.nbd` directory inode, exact entry
+name, device inode, and advertised size. First activation validates the
+single-link file and exact directory entry, then commits the forward authority
+record plus key-bound reverse-name and reverse-inode rows in one coordinator
+batch. Refresh, deactivate, and fence retain these rows. Retirement and garbage
+collection are intentionally outside this core slice.
+
 Block mutation lengths are bounded to the NBD `u32` command width. Admission
 rejects any range whose mathematical final extent cannot be represented in
 `u64`, before ExtentStore performs extent arithmetic.

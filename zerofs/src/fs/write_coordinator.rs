@@ -10,9 +10,10 @@ use crate::fs::errors::FsError;
 use crate::fs::export_authority::{
     ExportAdmissionGuard, ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition,
     ExportMutationContext, ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict,
-    MutationIdentity, apply_transition, encode_outcome, encode_record, ensure_outcome,
-    mutation_outcome_key, read_outcome_current, read_record_current, trusted_now_unix_millis,
-    validate_mutation,
+    MutationIdentity, apply_transition, encode_outcome, encode_record, encode_reverse_binding,
+    ensure_outcome, mutation_outcome_key, read_outcome_current, read_record_current,
+    read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
+    trusted_now_unix_millis, validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
@@ -1046,6 +1047,8 @@ async fn worker_loop(
                         match validate_export_mutation_context(
                             &ctx.db,
                             &ctx.key_codec,
+                            &ctx.inode_store,
+                            &ctx.directory_store,
                             &ctx.authority_time_floor,
                             &ctx.export_server_boot_id,
                             context,
@@ -1223,6 +1226,7 @@ async fn commit_export_authority_transition(
     if ctx.replicator.is_some() {
         return Err(ExportAuthorityError::Storage);
     }
+    let is_activation = matches!(&transition, ExportAuthorityTransition::Activate(_));
     let workspace_id = transition.workspace_id().to_owned();
     let key = ctx.key_codec.export_authority_key(&workspace_id);
     let permit = ctx
@@ -1271,6 +1275,36 @@ async fn commit_export_authority_transition(
     let encoded = encode_record(&desired)?;
     let mut batch = WriteBatch::new();
     batch.put_bytes(key, encoded);
+    let binding = reverse_binding_for(&desired);
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    let name_binding = read_reverse_binding_current(&ctx.db, &name_key).await?;
+    let inode_binding = read_reverse_binding_current(&ctx.db, &inode_key).await?;
+    if name_binding
+        .as_ref()
+        .is_some_and(|current| current != &binding)
+        || inode_binding
+            .as_ref()
+            .is_some_and(|current| current != &binding)
+    {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    match (desired.binding_initialized, name_binding, inode_binding) {
+        (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {}
+        (true, None, None) if is_activation => {
+            validate_physical_export(ctx, &desired.export).await?;
+            batch.put_bytes(
+                name_key.clone(),
+                encode_reverse_binding(&binding, &name_key)?,
+            );
+            batch.put_bytes(
+                inode_key.clone(),
+                encode_reverse_binding(&binding, &inode_key)?,
+            );
+        }
+        (true, _, _) => return Err(ExportAuthorityError::Corrupt),
+        (false, None, None) => {}
+        (false, _, _) => return Err(ExportAuthorityError::Corrupt),
+    }
     permit
         .write_with_options(batch, &WriteOptions::default())
         .await
@@ -1289,6 +1323,35 @@ async fn commit_export_authority_transition(
     };
     flush_result.map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
     Ok(desired)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn validate_physical_export(
+    ctx: &WorkerContext,
+    export: &crate::fs::export_authority::ExportIdentity,
+) -> Result<(), ExportAuthorityError> {
+    let inode = ctx
+        .inode_store
+        .get(export.inode)
+        .await
+        .map_err(|_| ExportAuthorityError::Invalid)?;
+    let crate::fs::inode::Inode::File(file) = inode else {
+        return Err(ExportAuthorityError::Invalid);
+    };
+    let mapped_inode = ctx
+        .directory_store
+        .get(export.nbd_directory_inode, export.name.as_slice())
+        .await
+        .map_err(|_| ExportAuthorityError::Invalid)?;
+    if mapped_inode != export.inode
+        || file.parent != Some(export.nbd_directory_inode)
+        || file.name.as_deref() != Some(export.name.as_slice())
+        || file.nlink != 1
+        || file.size != export.advertised_size
+    {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1384,6 +1447,8 @@ fn authority_now(floor: &std::sync::atomic::AtomicU64) -> u64 {
 async fn validate_export_mutation_context(
     db: &Db,
     key_codec: &KeyCodec,
+    inode_store: &InodeStore,
+    directory_store: &DirectoryStore,
     authority_time_floor: &std::sync::atomic::AtomicU64,
     export_server_boot_id: &str,
     context: &ExportMutationContext,
@@ -1415,6 +1480,39 @@ async fn validate_export_mutation_context(
     let record = current.as_mut().ok_or(FsError::StaleHandle)?;
     if record.export != context.export {
         return Err(FsError::StaleHandle);
+    }
+    let binding = reverse_binding_for(record);
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    let name_binding = read_reverse_binding_current(db, &name_key)
+        .await
+        .map_err(|_| FsError::IoError)?;
+    let inode_binding = read_reverse_binding_current(db, &inode_key)
+        .await
+        .map_err(|_| FsError::IoError)?;
+    if name_binding.as_ref() != Some(&binding) || inode_binding.as_ref() != Some(&binding) {
+        return Err(FsError::InvalidData);
+    }
+    let inode = inode_store
+        .get(binding.export.inode)
+        .await
+        .map_err(|_| FsError::InvalidData)?;
+    let crate::fs::inode::Inode::File(file) = inode else {
+        return Err(FsError::InvalidData);
+    };
+    if file.parent != Some(binding.export.nbd_directory_inode)
+        || file.name.as_deref() != Some(binding.export.name.as_slice())
+        || file.nlink != 1
+        || file.size != binding.export.advertised_size
+        || directory_store
+            .get(
+                binding.export.nbd_directory_inode,
+                binding.export.name.as_slice(),
+            )
+            .await
+            .map_err(|_| FsError::InvalidData)?
+            != binding.export.inode
+    {
+        return Err(FsError::InvalidData);
     }
     let session = record.active_session.as_mut().ok_or(FsError::StaleHandle)?;
     let sequence = session
@@ -2186,8 +2284,10 @@ mod tests {
         lease.renew(std::time::Duration::from_secs(30));
         let (fs, raw_db) = make_leased_replicating_fs_with_raw(lease, replicator).await;
         let export = ExportIdentity {
+            nbd_directory_inode: 66,
             name: b"disk-a".to_vec(),
             inode: 77,
+            advertised_size: 4096,
         };
         let authority = AuthorityVersion {
             actor: "tenants/t/actors/a".into(),

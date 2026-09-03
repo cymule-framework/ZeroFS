@@ -48,11 +48,15 @@ const PREFIX_EXPORT_AUTHORITY: u8 = 0x0B;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 #[cfg(feature = "rhizome-export-authority-core")]
-const EXPORT_KEY_VERSION: u8 = 1;
+const EXPORT_KEY_VERSION: u8 = 2;
 #[cfg(feature = "rhizome-export-authority-core")]
 const EXPORT_AUTHORITY_SUBTYPE: u8 = 1;
 #[cfg(feature = "rhizome-export-authority-core")]
 const EXPORT_MUTATION_OUTCOME_SUBTYPE: u8 = 2;
+#[cfg(feature = "rhizome-export-authority-core")]
+const EXPORT_REVERSE_NAME_SUBTYPE: u8 = 3;
+#[cfg(feature = "rhizome-export-authority-core")]
+const EXPORT_REVERSE_INODE_SUBTYPE: u8 = 4;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -267,6 +271,31 @@ impl KeyCodec {
         key.extend_from_slice(&boot_len.to_be_bytes());
         key.extend_from_slice(boot);
         key.extend_from_slice(&identity.operation_id);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_reverse_name_key(&self, directory_inode: u64, name: &[u8]) -> Bytes {
+        let name_len = u16::try_from(name.len()).expect("validated export name fits u16");
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + U64_SIZE + 2 + name.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_REVERSE_NAME_SUBTYPE);
+        key.extend_from_slice(&directory_inode.to_be_bytes());
+        key.extend_from_slice(&name_len.to_be_bytes());
+        key.extend_from_slice(name);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_reverse_inode_key(&self, inode: u64) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + U64_SIZE);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_REVERSE_INODE_SUBTYPE);
+        key.extend_from_slice(&inode.to_be_bytes());
         Bytes::from(key)
     }
 

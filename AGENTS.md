@@ -89,6 +89,12 @@ attribution intact.
 - This guard is host-local. Cross-host automatic writer takeover remains
   unsupported and must fail closed without an external STONITH/Node fence
   receipt.
+- An export identity is the exact `.nbd` directory inode, entry name, device
+  inode, and advertised size. Its first successful activation validates the
+  single-link directory mapping and atomically installs immutable key-bound
+  reverse-name and reverse-inode rows with the forward authority record. Later
+  refresh, deactivate, and fence transitions retain both reverse rows; never
+  scan for or delete them outside a future typed retirement/GC protocol.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct
