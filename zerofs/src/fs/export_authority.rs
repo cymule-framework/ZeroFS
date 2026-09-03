@@ -2660,6 +2660,7 @@ mod tests {
             .enable_standalone_profile()
             .await
             .unwrap();
+        ensure_test_export(&fs, 4096).await.unwrap();
         fs.export_authority
             .activate(activate_command(authority(3, 5)))
             .await
@@ -2703,6 +2704,7 @@ mod tests {
             .enable_standalone_profile()
             .await
             .unwrap();
+        ensure_test_export(&fs, 4096).await.unwrap();
         fs.export_authority
             .activate(activate_command(authority(3, 5)))
             .await
@@ -2846,7 +2848,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let key = crate::fs::key_codec::KeyCodec::new().extent_key(77, index as u64);
+            let key =
+                crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, index as u64);
             let mut transaction = Transaction::new();
             transaction.put_bytes(&key, Bytes::from_static(b"accepted"));
             fs.export_authority
@@ -2882,7 +2885,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let key = crate::fs::key_codec::KeyCodec::new().extent_key(77, index as u64 + 100);
+            let key = crate::fs::key_codec::KeyCodec::new()
+                .extent_key(active.export.inode, index as u64 + 100);
             let mut transaction = Transaction::new();
             transaction.put_bytes(&key, Bytes::from_static(b"must-not-commit"));
             let error = fs
@@ -3273,9 +3277,13 @@ mod tests {
         let codec = crate::fs::key_codec::KeyCodec::new();
         let boot_key = codec.export_boot_key();
         let boot_before = fs.db.get_bytes(&boot_key).await.unwrap().unwrap();
+        let binding = reverse_binding_for(&active);
+        let (reverse_name_key, reverse_inode_key) = reverse_binding_keys(&binding);
         let keys = [
             codec.export_authority_key("workspace-a"),
             codec.export_authority_key("workspace-other"),
+            reverse_name_key,
+            reverse_inode_key,
             boot_key.clone(),
         ];
         for key in keys {
@@ -3307,6 +3315,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_workspaces_cannot_activate_the_same_export() {
+        let fs = Arc::new(new_export_fs().await);
+        let first = activate_command(authority(3, 5));
+        let mut second = first.clone();
+        second.workspace_id = "workspace-b".into();
+        second.session.session_id = "session-b".into();
+        second.session.capability_id = "capability-b".into();
+        let (left, right) = tokio::join!(
+            fs.export_authority.activate(first),
+            fs.export_authority.activate(second)
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert!(matches!(left, Ok(_) | Err(ExportAuthorityError::Conflict)));
+        assert!(matches!(right, Ok(_) | Err(ExportAuthorityError::Conflict)));
+    }
+
+    #[tokio::test]
+    async fn reverse_indexes_reject_name_and_inode_aliases() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+
+        let mut same_name = active.export.clone();
+        same_name.inode += 100;
+        let mut name_alias = activate_command_for(authority(3, 5), same_name);
+        name_alias.workspace_id = "workspace-name-alias".into();
+        assert_eq!(
+            fs.export_authority.activate(name_alias).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+
+        let mut same_inode = active.export.clone();
+        same_inode.name = b"disk-alias".to_vec();
+        let mut inode_alias = activate_command_for(authority(3, 5), same_inode);
+        inode_alias.workspace_id = "workspace-inode-alias".into();
+        assert_eq!(
+            fs.export_authority.activate(inode_alias).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_a_hardlinked_export() {
+        let fs = new_export_fs().await;
+        let export = ensure_test_export(&fs, 4096).await.unwrap();
+        fs.link(
+            &crate::fs::types::AuthContext::default(),
+            export.inode,
+            export.nbd_directory_inode,
+            b"disk-hardlink",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs.export_authority
+                .activate(activate_command_for(authority(3, 5), export))
+                .await,
+            Err(ExportAuthorityError::Invalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_bindings_survive_restart_and_fail_closed_on_cross_key_copy() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_fs(object_store.clone()).await.unwrap();
+        let active = first
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let binding = reverse_binding_for(&active);
+        let (name_key, inode_key) = reverse_binding_keys(&binding);
+        first.db.close().await.unwrap();
+        drop(first);
+
+        let reopened = open_fs(object_store).await.unwrap();
+        assert_eq!(
+            read_reverse_binding_current(&reopened.db, &name_key)
+                .await
+                .unwrap(),
+            Some(binding.clone())
+        );
+        assert_eq!(
+            read_reverse_binding_current(&reopened.db, &inode_key)
+                .await
+                .unwrap(),
+            Some(binding.clone())
+        );
+        let copied = reopened.db.get_bytes(&name_key).await.unwrap().unwrap();
+        reopened
+            .db
+            .inject_reserved_authority_value_for_test(inode_key, copied)
+            .await
+            .unwrap();
+        let replacement = ActivateExport {
+            workspace_id: active.workspace_id,
+            export: active.export,
+            authority: authority(4, 6),
+            session: session("session-next", "capability-next", u64::MAX),
+        };
+        assert_eq!(
+            reopened.export_authority.activate(replacement).await,
+            Err(ExportAuthorityError::Corrupt)
+        );
+    }
+
+    #[tokio::test]
     async fn ordered_queue_prevents_fence_mutation_toctou() {
         let fs = Arc::new(new_export_fs().await);
         let active = fs
@@ -3314,7 +3433,7 @@ mod tests {
             .activate(activate_command(authority(3, 5)))
             .await
             .unwrap();
-        let key = crate::fs::key_codec::KeyCodec::new().extent_key(77, 999);
+        let key = crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 999);
         let mut transaction = Transaction::new();
         transaction.put_bytes(&key, Bytes::from_static(b"before-fence"));
 
@@ -3444,7 +3563,7 @@ mod tests {
         let rejected_id = fs.inode_store.allocate();
         let active = fs
             .export_authority
-            .activate(activate_command_for(authority(3, 5), export(rejected_id)))
+            .activate(activate_command(authority(3, 5)))
             .await
             .unwrap();
         fs.export_authority
@@ -3459,9 +3578,10 @@ mod tests {
             .unwrap();
 
         let mut rejected = Transaction::new();
-        fs.inode_store
-            .save(&mut rejected, rejected_id, &test_file_inode(1))
-            .unwrap();
+        rejected.put_bytes(
+            &crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 47),
+            Bytes::from_static(b"rejected"),
+        );
         assert_eq!(
             fs.export_authority
                 .commit_mutation(mutation_for(
@@ -3827,7 +3947,7 @@ mod tests {
             ),
             Err(ExportAuthorityError::Conflict)
         );
-        assert_eq!(active.export, export(77));
+        assert_eq!(active.export, export(2));
     }
 
     #[test]
@@ -3890,18 +4010,10 @@ mod tests {
 
     async fn real_export_fs() -> (ZeroFS, ExportAuthorityRecord) {
         let fs = new_export_fs().await;
-        let (inode, _) = fs
-            .create(
-                &crate::fs::test_util::test_creds(),
-                0,
-                b"disk-a",
-                &crate::fs::types::SetAttributes::default(),
-            )
-            .await
-            .unwrap();
+        let export = ensure_test_export(&fs, 4096).await.unwrap();
         fs.write(
             &crate::fs::types::AuthContext::default(),
-            inode,
+            export.inode,
             0,
             &Bytes::from(vec![0x11; 4096]),
         )
@@ -3909,7 +4021,7 @@ mod tests {
         .unwrap();
         let active = fs
             .export_authority
-            .activate(activate_command_for(authority(3, 5), export(inode)))
+            .activate(activate_command_for(authority(3, 5), export))
             .await
             .unwrap();
         (fs, active)
@@ -3920,28 +4032,21 @@ mod tests {
         size: u64,
     ) -> (ZeroFS, ExportAuthorityRecord) {
         let fs = open_fs(object_store).await.unwrap();
-        let (inode_id, _) = fs
-            .create(
-                &crate::fs::test_util::test_creds(),
-                0,
-                b"disk-a",
-                &crate::fs::types::SetAttributes::default(),
-            )
-            .await
-            .unwrap();
-        let mut inode = fs.inode_store.get(inode_id).await.unwrap();
+        let mut export = ensure_test_export(&fs, 4096).await.unwrap();
+        let mut inode = fs.inode_store.get(export.inode).await.unwrap();
         let crate::fs::inode::Inode::File(file) = &mut inode else {
             panic!("created export must be a file");
         };
         file.size = size;
         let mut transaction = fs.db.new_transaction().unwrap();
         fs.inode_store
-            .save(&mut transaction, inode_id, &inode)
+            .save(&mut transaction, export.inode, &inode)
             .unwrap();
         fs.write_coordinator.commit(transaction).await.unwrap();
+        export.advertised_size = size;
         let active = fs
             .export_authority
-            .activate(activate_command_for(authority(3, 5), export(inode_id)))
+            .activate(activate_command_for(authority(3, 5), export))
             .await
             .unwrap();
         (fs, active)
