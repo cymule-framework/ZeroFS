@@ -2921,6 +2921,10 @@ mod tests {
             .activate(activate_command(authority(3, 5)))
             .await
             .unwrap();
+        let binding = reverse_binding_for(&first);
+        let (name_key, inode_key) = reverse_binding_keys(&binding);
+        let original_name = fs.db.get_bytes(&name_key).await.unwrap().unwrap();
+        let original_inode = fs.db.get_bytes(&inode_key).await.unwrap().unwrap();
         let refreshed = fs
             .export_authority
             .refresh(RefreshExport {
@@ -2954,10 +2958,36 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(
+            fs.db.get_bytes(&name_key).await.unwrap(),
+            Some(original_name.clone())
+        );
+        assert_eq!(
+            fs.db.get_bytes(&inode_key).await.unwrap(),
+            Some(original_inode.clone())
+        );
         assert!(deactivated.active_session.is_none());
         assert_eq!(
             deactivated.rejected_through_placement_epoch,
             refreshed.authority.placement_epoch
+        );
+        fs.export_authority
+            .advance_fence(AdvanceFence {
+                workspace_id: deactivated.workspace_id.clone(),
+                export: deactivated.export.clone(),
+                expected_authority: Some(deactivated.authority.clone()),
+                new_non_writable_authority: deactivated.authority,
+                reject_through_placement_epoch: deactivated.rejected_through_placement_epoch,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.db.get_bytes(&name_key).await.unwrap(),
+            Some(original_name)
+        );
+        assert_eq!(
+            fs.db.get_bytes(&inode_key).await.unwrap(),
+            Some(original_inode)
         );
     }
 
