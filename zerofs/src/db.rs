@@ -913,7 +913,7 @@ impl Db {
     /// Test-only corruption injector for an export's physical inode, extent,
     /// directory entry, or root `.nbd` mapping. Production writes remain on the
     /// coordinator path and are fenced by the reverse-binding deny index.
-    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    #[cfg(all(test, feature = "rhizome-workspace-genesis-core"))]
     pub(crate) async fn inject_export_binding_metadata_delete_for_test(
         &self,
         key: Bytes,
