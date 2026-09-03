@@ -47,12 +47,16 @@ cannot distinguish the crash window safely and therefore performs GET only. A
 future supervised installer-incarnation receipt is required to recover this
 liveness case without weakening the one-mutation invariant.
 
-Deterministic exact-object and pre-write physical conflicts return a typed
+Deterministic pre-write physical conflicts return a typed
 rejection proof. A separately sealed negative terminal can complete the same
 claimed 0x0A operation as FAILED only through the coordinator, which atomically
 rechecks the exact claim and refuses the negative if the matching 0x0C effect
 exists. UNKNOWN outcomes remain EffectDispatched; this path never fabricates a
 NOT_COMMITTED absence proof.
+
+Different bytes at the exact SHA-256 object key instead indicate storage
+namespace/integrity corruption. The operation remains claimed and the core
+returns Corrupt; it cannot be downgraded into an Actor-scoped FAILED receipt.
 
 After object convergence, the sole `WriteCoordinator` acquires the database
 write permit and either replays an exact existing genesis graph or atomically

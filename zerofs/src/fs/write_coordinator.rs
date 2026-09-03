@@ -1476,8 +1476,7 @@ async fn commit_workspace_genesis_rejection(
         }
     }
     match request.rejection.reason {
-        crate::fs::workspace_genesis::GenesisRejectionReason::ObjectConflict
-        | crate::fs::workspace_genesis::GenesisRejectionReason::PhysicalConflict => {}
+        crate::fs::workspace_genesis::GenesisRejectionReason::PhysicalConflict => {}
     }
     let operation_key = crate::fs::workspace_operation::storage_key(&request.rejection.operation)?;
     let terminal = crate::fs::workspace_operation::WorkspaceOperationRecord {

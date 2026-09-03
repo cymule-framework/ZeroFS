@@ -40,6 +40,7 @@ const MAX_OBJECT_KEY_BYTES: usize = 4096;
 const RECORD_CHECKSUM_DOMAIN: &[u8] = b"rhizome.workspace-genesis-record.v1\0";
 const ROOT_OBJECT_PREFIX: &str = "rhizome/workspace-genesis/sha256/";
 const EFFECT_CLAIM_DOMAIN: &[u8] = b"rhizome.workspace-genesis-object-create.v1\0";
+const PLAN_DIGEST_DOMAIN: &[u8] = b"rhizome.workspace-genesis-derived-plan.v1\0";
 
 #[async_trait::async_trait]
 trait GenesisObjectCreator: Send + Sync {
@@ -230,7 +231,6 @@ pub(crate) enum GenesisMaterializeResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GenesisRejectionReason {
-    ObjectConflict,
     PhysicalConflict,
 }
 
@@ -347,7 +347,7 @@ impl WorkspaceGenesisStore {
         let (claim_bytes, dispatch_create) = match operation.state {
             WorkspaceOperationState::Pending => {
                 let installer = uuid::Uuid::new_v4().to_string();
-                let candidate = effect_claim(plan.root_digest, &object_key, &installer);
+                let candidate = effect_claim(plan_digest(command, plan), &object_key, &installer);
                 match self
                     .operations
                     .claim_effect_dispatch(
@@ -420,14 +420,7 @@ impl WorkspaceGenesisStore {
         .await
         {
             if error == GenesisError::Conflict {
-                return Ok(GenesisMaterializeResult::Rejected(Box::new(
-                    GenesisRejection {
-                        operation: command.operation.clone(),
-                        request_digest: command.request_digest,
-                        effect_claim: claim_bytes,
-                        reason: GenesisRejectionReason::ObjectConflict,
-                    },
-                )));
+                return Err(GenesisError::Corrupt);
             }
             return Err(error);
         }
@@ -827,12 +820,46 @@ fn content_object_key(digest: ContentDigest) -> String {
     out
 }
 
-fn effect_claim(digest: ContentDigest, object_key: &str, installer: &str) -> Bytes {
+fn plan_digest(command: &GenesisCommand, plan: &GenesisMaterializationPlan) -> [u8; SHA256_SIZE] {
+    plan_digest_parts(
+        command.request_digest,
+        &plan.export_name,
+        command.virtual_size_bytes,
+        plan.root_digest,
+    )
+}
+
+fn plan_digest_parts(
+    request_digest: CanonicalRequestDigest,
+    export_name: &[u8],
+    virtual_size_bytes: u64,
+    root_digest: ContentDigest,
+) -> [u8; SHA256_SIZE] {
+    let mut digest = Sha256::new();
+    digest.update(PLAN_DIGEST_DOMAIN);
+    digest.update(request_digest.as_bytes());
+    digest.update((export_name.len() as u32).to_be_bytes());
+    digest.update(export_name);
+    digest.update(virtual_size_bytes.to_be_bytes());
+    digest.update(root_digest.as_bytes());
+    digest.finalize().into()
+}
+
+fn record_plan_digest(record: &GenesisDomainRecord) -> [u8; SHA256_SIZE] {
+    plan_digest_parts(
+        record.request_digest,
+        &record.export.name,
+        record.export.advertised_size,
+        record.root_digest,
+    )
+}
+
+fn effect_claim(plan_digest: [u8; SHA256_SIZE], object_key: &str, installer: &str) -> Bytes {
     let mut out = Vec::with_capacity(
         EFFECT_CLAIM_DOMAIN.len() + SHA256_SIZE + object_key.len() + installer.len() + 2,
     );
     out.extend_from_slice(EFFECT_CLAIM_DOMAIN);
-    out.extend_from_slice(digest.as_bytes());
+    out.extend_from_slice(&plan_digest);
     out.extend_from_slice(object_key.as_bytes());
     out.push(0);
     out.extend_from_slice(installer.as_bytes());
@@ -844,7 +871,7 @@ fn validate_effect_claim(record: &GenesisDomainRecord) -> Result<(), GenesisErro
         EFFECT_CLAIM_DOMAIN.len() + SHA256_SIZE + record.root_object_key.len() + 1,
     );
     prefix.extend_from_slice(EFFECT_CLAIM_DOMAIN);
-    prefix.extend_from_slice(record.root_digest.as_bytes());
+    prefix.extend_from_slice(&record_plan_digest(record));
     prefix.extend_from_slice(record.root_object_key.as_bytes());
     prefix.push(0);
     let Some(installer) = record.effect_claim.strip_prefix(prefix.as_slice()) else {
@@ -984,7 +1011,12 @@ pub fn dst_workspace_genesis_codec_model(seed: u64) {
         storage_shard_id: "shard-dst".into(),
         storage_routing_revision: 1,
         effect_claim: effect_claim(
-            ContentDigest::new(digest),
+            plan_digest_parts(
+                CanonicalRequestDigest::new(digest),
+                format!("disk-{seed}").as_bytes(),
+                4096,
+                ContentDigest::new(digest),
+            ),
             &content_object_key(ContentDigest::new(digest)),
             "00000000-0000-4000-8000-000000000001",
         ),
@@ -1396,7 +1428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_conflict_has_typed_failed_terminal_without_physical_effect() {
+    async fn object_hash_namespace_mismatch_poisons_the_operation() {
         let fs = new_fs().await;
         let inner = Arc::new(slatedb::object_store::memory::InMemory::new());
         let input = verified("workspace-a", "request-a", b"root-a");
@@ -1413,24 +1445,10 @@ mod tests {
             object_creator: Arc::new(DirectTestGenesisObjectCreator(creator)),
             local_storage_shard_id: "test-shard".into(),
         };
-        let GenesisMaterializeResult::Rejected(rejection) =
-            store.materialize(input.clone()).await.unwrap()
-        else {
-            panic!("wrong content at exact digest key must reject");
-        };
-        assert_eq!(rejection.reason, GenesisRejectionReason::ObjectConflict);
-        let failed = store
-            .complete_rejection(
-                &input,
-                VerifiedGenesisNegativeTerminal::for_test(
-                    (*rejection).clone(),
-                    Bytes::from_static(b"signed-object-conflict"),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(failed.state, WorkspaceOperationState::Failed(_)));
+        assert_eq!(
+            store.materialize(input.clone()).await,
+            Err(GenesisError::Corrupt)
+        );
         assert!(
             store
                 .lookup_record_durable("workspace-a")
@@ -1438,6 +1456,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(matches!(
+            store
+                .operations
+                .lookup(&input.command().operation, input.command().request_digest)
+                .await
+                .unwrap(),
+            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                state: WorkspaceOperationState::EffectDispatched(_),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1642,7 +1671,7 @@ mod tests {
                 storage_shard_id: "test-shard".into(),
                 storage_routing_revision: 1,
                 effect_claim: effect_claim(
-                    input.plan().root_digest,
+                    plan_digest(input.command(), input.plan()),
                     &content_object_key(input.plan().root_digest),
                     "00000000-0000-4000-8000-000000000002",
                 ),
@@ -1689,7 +1718,7 @@ mod tests {
                 &input.command().operation,
                 input.command().request_digest,
                 effect_claim(
-                    input.plan().root_digest,
+                    plan_digest(input.command(), input.plan()),
                     &content_object_key(input.plan().root_digest),
                     "installer-test",
                 ),
@@ -1833,7 +1862,12 @@ mod tests {
             storage_shard_id: "test-shard".into(),
             storage_routing_revision: 1,
             effect_claim: effect_claim(
-                ContentDigest::new([2; 32]),
+                plan_digest_parts(
+                    CanonicalRequestDigest::new([1; 32]),
+                    b"disk-a",
+                    4096,
+                    ContentDigest::new([2; 32]),
+                ),
                 &content_object_key(ContentDigest::new([2; 32])),
                 "00000000-0000-4000-8000-000000000003",
             ),

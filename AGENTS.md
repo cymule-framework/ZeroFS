@@ -184,6 +184,9 @@ attribution intact.
   immutable template/root-policy inputs. The current candidate has only a
   test constructor for that seal and must not accept caller-selected plan data
   in production.
+- The dispatch claim binds a versioned deterministic plan digest covering the
+  canonical request digest, export name, virtual size, and root digest, plus a
+  unique installer UUID. A replay under a different plan must not materialize.
 - The 0x0C row binds the complete operation key, authority creation baseline,
   tenant, immutable template/root-policy refs, source CreateActor digest,
   object lineage, storage shard/routing revision, root identity, and exact
@@ -195,8 +198,11 @@ attribution intact.
   invocation may GET only and cannot adopt or repeat the mutation. Closing that
   liveness gap requires a future supervised installer-incarnation receipt, not
   a retry heuristic.
-- Deterministic object/physical conflicts after dispatch use the typed genesis
+- Deterministic physical conflicts after dispatch use the typed genesis
   rejection request. The coordinator atomically rechecks the exact 0x0A claim
   and that no matching 0x0C result exists before writing signed FAILED bytes.
   It must never manufacture NOT_COMMITTED from absence or use this path for an
   unknown object/database outcome.
+- Different bytes at the expected SHA-256 object key are shard/storage
+  corruption, not a request conflict. Leave the operation claimed, return
+  Corrupt, and never turn that condition into an ordinary FAILED receipt.
