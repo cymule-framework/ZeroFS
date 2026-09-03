@@ -80,8 +80,12 @@ attribution intact.
   device, inode, regular-file type, and `nlink == 1` before taking the exclusive
   file lock. The root supervisor must create `root:zerofs 0750` directory and a
   `zerofs:zerofs 0600` immutable lock inode, then kill and join the prior process
-  before replacement. Profile enable is one-shot and retains the guard for the
-  Store lifetime. Do not accept an arbitrary caller file as a shard guard.
+  before replacement. The dedicated worker UID must be non-root and equal the
+  process effective UID; the configured GID must be effective or supplementary.
+  Install is synchronous and one-shot before any boot-initialization await, and
+  the Store retains the guard across cancellation or unknown boot commit so the
+  same Store can converge by retry. Do not accept an arbitrary caller file as a
+  shard guard.
 - This guard is host-local. Cross-host automatic writer takeover remains
   unsupported and must fail closed without an external STONITH/Node fence
   receipt.

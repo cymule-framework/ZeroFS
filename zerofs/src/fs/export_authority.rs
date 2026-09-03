@@ -172,6 +172,7 @@ pub(crate) struct ShardProcessGuard {
     _identity: ShardLockIdentity,
 }
 
+#[cfg(target_os = "linux")]
 struct ShardGuardValidation {
     identity: ShardLockIdentity,
     directory_uid: u32,
@@ -197,7 +198,15 @@ impl ShardProcessGuard {
     ) -> Result<Self, ExportAuthorityError> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        if !lock_root.is_absolute() {
+        if !lock_root.is_absolute()
+            || worker_uid == 0
+            || rustix::process::geteuid().as_raw() != worker_uid
+            || (rustix::process::getegid().as_raw() != worker_gid
+                && !rustix::process::getgroups()
+                    .map_err(|_| ExportAuthorityError::Storage)?
+                    .iter()
+                    .any(|gid| gid.as_raw() == worker_gid))
+        {
             return Err(ExportAuthorityError::Invalid);
         }
         let directory = std::fs::OpenOptions::new()
@@ -308,8 +317,23 @@ impl ShardProcessGuard {
         )
         .unwrap()
     }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    pub(super) fn for_test() -> Self {
+        Self {
+            _directory: tempfile::tempfile().unwrap(),
+            _lock: tempfile::tempfile().unwrap(),
+            _identity: ShardLockIdentity {
+                directory_device: 0,
+                directory_inode: 0,
+                lock_device: 0,
+                lock_inode: 0,
+            },
+        }
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn shard_lock_name(shard_id: &str) -> String {
     let digest = Sha256::digest(shard_id.as_bytes());
     let mut name = String::with_capacity("rhizome-shard-".len() + digest.len() * 2 + 5);
@@ -1035,16 +1059,34 @@ impl ExportAuthorityStore {
         not(test),
         expect(dead_code, reason = "feature-staged until verified adapter wiring")
     )]
-    pub(crate) async fn enable_standalone_profile(
+    pub(crate) fn install_process_guard(
         &self,
         process_guard: ShardProcessGuard,
     ) -> Result<(), ExportAuthorityError> {
-        let _enable = self.enable_lock.lock().await;
-        if self.process_guard.lock().unwrap().is_some() {
+        let mut installed = self.process_guard.lock().unwrap();
+        if installed.is_some() {
             return Err(ExportAuthorityError::Conflict);
         }
+        *installed = Some(process_guard);
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified adapter wiring")
+    )]
+    pub(crate) async fn enable_standalone_profile(&self) -> Result<(), ExportAuthorityError> {
+        let _enable = self.enable_lock.lock().await;
+        if self.process_guard.lock().unwrap().is_none() {
+            return Err(ExportAuthorityError::ProfileDisabled);
+        }
+        if self
+            .profile_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         self.coordinator.initialize_export_boot().await?;
-        *self.process_guard.lock().unwrap() = Some(process_guard);
         self.profile_enabled
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -1903,15 +1945,18 @@ mod tests {
         )
         .await?;
         fs.export_authority
-            .enable_standalone_profile(ShardProcessGuard::for_test())
-            .await?;
+            .install_process_guard(ShardProcessGuard::for_test())?;
+        fs.export_authority.enable_standalone_profile().await?;
         Ok(fs)
     }
 
     async fn new_export_fs() -> ZeroFS {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         fs.export_authority
-            .enable_standalone_profile(ShardProcessGuard::for_test())
+            .install_process_guard(ShardProcessGuard::for_test())
+            .unwrap();
+        fs.export_authority
+            .enable_standalone_profile()
             .await
             .unwrap();
         fs
@@ -2273,15 +2318,169 @@ mod tests {
         drop(first_store_guard);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_shard_guard_rejects_root_or_a_mismatched_worker_identity() {
+        let impossible = ShardLockIdentity {
+            directory_device: 0,
+            directory_inode: 0,
+            lock_device: 0,
+            lock_inode: 0,
+        };
+        assert!(matches!(
+            ShardProcessGuard::acquire_configured(
+                std::path::Path::new("/does/not/matter"),
+                "shard-a",
+                0,
+                0,
+                impossible,
+            ),
+            Err(ExportAuthorityError::Invalid)
+        ));
+        let mismatched_uid = rustix::process::geteuid().as_raw().wrapping_add(1).max(1);
+        assert!(matches!(
+            ShardProcessGuard::acquire_configured(
+                std::path::Path::new("/does/not/matter"),
+                "shard-a",
+                mismatched_uid,
+                rustix::process::getegid().as_raw(),
+                impossible,
+            ),
+            Err(ExportAuthorityError::Invalid)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_shard_guard_accepts_supervisor_provisioned_dedicated_uid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(root) = std::env::var("RHIZOME_TEST_SHARD_GUARD_ROOT") else {
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        let shard_id = "foundation-dedicated-worker";
+        let directory = std::fs::File::open(root).unwrap();
+        let directory_metadata = directory.metadata().unwrap();
+        let lock_metadata = std::fs::metadata(root.join(shard_lock_name(shard_id))).unwrap();
+        let guard = ShardProcessGuard::acquire_configured(
+            root,
+            shard_id,
+            rustix::process::geteuid().as_raw(),
+            directory_metadata.gid(),
+            ShardLockIdentity {
+                directory_device: directory_metadata.dev(),
+                directory_inode: directory_metadata.ino(),
+                lock_device: lock_metadata.dev(),
+                lock_inode: lock_metadata.ino(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ShardProcessGuard::acquire_configured(
+                root,
+                shard_id,
+                rustix::process::geteuid().as_raw(),
+                directory_metadata.gid(),
+                ShardLockIdentity {
+                    directory_device: directory_metadata.dev(),
+                    directory_inode: directory_metadata.ino(),
+                    lock_device: lock_metadata.dev(),
+                    lock_inode: lock_metadata.ino(),
+                },
+            ),
+            Err(ExportAuthorityError::Conflict)
+        ));
+        drop(guard);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shard_guard_conflicts_with_subprocess_until_holder_is_killed_and_joined() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shard_id = "subprocess-shard";
+        let lock_path = directory.path().join(shard_lock_name(shard_id));
+        let lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        let directory_file = std::fs::File::open(directory.path()).unwrap();
+        let directory_metadata = directory_file.metadata().unwrap();
+        let lock_metadata = lock.metadata().unwrap();
+        let validation = || ShardGuardValidation {
+            identity: ShardLockIdentity {
+                directory_device: directory_metadata.dev(),
+                directory_inode: directory_metadata.ino(),
+                lock_device: lock_metadata.dev(),
+                lock_inode: lock_metadata.ino(),
+            },
+            directory_uid: directory_metadata.uid(),
+            lock_uid: lock_metadata.uid(),
+            gid: directory_metadata.gid(),
+            directory_mode: 0o700,
+            lock_mode: 0o600,
+        };
+        drop(lock);
+        let mut holder = Command::new("sh")
+            .args([
+                "-c",
+                "exec 9<>\"$1\"; flock -x 9; exec sleep 30",
+                "shard-guard-holder",
+                lock_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ShardProcessGuard::acquire_at(
+                std::fs::File::open(directory.path()).unwrap(),
+                shard_id,
+                validation(),
+            ) {
+                Err(ExportAuthorityError::Conflict) => break,
+                Ok(guard) => drop(guard),
+                Err(error) => panic!("unexpected guard error: {error:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "subprocess never acquired lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        ShardProcessGuard::acquire_at(
+            std::fs::File::open(directory.path()).unwrap(),
+            shard_id,
+            validation(),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn boot_flush_unknown_keeps_the_profile_disabled_until_durable_retry() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.export_authority
+            .install_process_guard(ShardProcessGuard::for_test())
+            .unwrap();
         fs.write_coordinator.dst_fail_next_workspace_durable_flush();
         assert_eq!(
-            fs.export_authority
-                .enable_standalone_profile(ShardProcessGuard::for_test())
-                .await,
+            fs.export_authority.enable_standalone_profile().await,
             Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        assert_eq!(
+            fs.export_authority
+                .install_process_guard(ShardProcessGuard::for_test()),
+            Err(ExportAuthorityError::Conflict)
         );
         assert_eq!(
             fs.export_authority
@@ -2298,7 +2497,7 @@ mod tests {
         );
 
         fs.export_authority
-            .enable_standalone_profile(ShardProcessGuard::for_test())
+            .enable_standalone_profile()
             .await
             .unwrap();
         fs.export_authority
@@ -2314,14 +2513,40 @@ mod tests {
         let boot = fs.db.get_bytes_durable(&boot_key).await.unwrap().unwrap();
         assert_eq!(
             fs.export_authority
-                .enable_standalone_profile(ShardProcessGuard::for_test())
-                .await,
+                .install_process_guard(ShardProcessGuard::for_test()),
             Err(ExportAuthorityError::Conflict)
         );
         assert_eq!(
             fs.db.get_bytes_durable(&boot_key).await.unwrap(),
             Some(boot)
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_enable_retains_the_installed_guard_and_retry_converges() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.export_authority
+            .install_process_guard(ShardProcessGuard::for_test())
+            .unwrap();
+        let enable = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.export_authority.enable_standalone_profile().await }
+        });
+        enable.abort();
+        assert!(enable.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            fs.export_authority
+                .install_process_guard(ShardProcessGuard::for_test()),
+            Err(ExportAuthorityError::Conflict)
+        );
+        fs.export_authority
+            .enable_standalone_profile()
+            .await
+            .unwrap();
+        fs.export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

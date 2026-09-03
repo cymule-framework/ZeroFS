@@ -2199,12 +2199,11 @@ mod tests {
             assignment_revision: 1,
         };
 
+        fs.export_authority
+            .install_process_guard(crate::fs::export_authority::ShardProcessGuard::for_test())
+            .unwrap();
         assert_eq!(
-            fs.export_authority
-                .enable_standalone_profile(
-                    crate::fs::export_authority::ShardProcessGuard::for_test(),
-                )
-                .await,
+            fs.export_authority.enable_standalone_profile().await,
             Err(ExportAuthorityError::Storage)
         );
         assert_eq!(

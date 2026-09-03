@@ -109,8 +109,12 @@ supervisor must supply a process-lifetime guard for the exact configured shard.
 On Linux the guard resolves a SHA-256-derived lock name with rustix `openat`
 from an absolute root-controlled directory, verifies the configured directory
 and lock device/inode plus ownership, exact modes, regular-file type and single
-link, then takes an exclusive file lock. Profile enablement is one-shot and
-retains the guard. A replacement process may proceed only after the supervisor
+link, then takes an exclusive file lock. The worker is a dedicated non-root UID
+whose effective UID must match configuration; its configured GID must be an
+effective or supplementary group. Guard installation is synchronous and
+one-shot before boot initialization, and retains the guard across cancellation
+or an unknown boot write so retry converges within the same Store. A replacement
+process may proceed only after the supervisor
 kills and joins the previous process and obtains the same inode lock. This is a
 same-host boundary; cross-host takeover remains fail-closed until external
 STONITH/Node fencing exists.
