@@ -10,6 +10,7 @@ use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
+use crate::fs::workspace_operation::WorkspaceLedgerRequest;
 use crate::replication::ShipOutcome;
 use crate::replication::types::SlateDbSeqno;
 use crate::task::spawn_named;
@@ -33,7 +34,11 @@ type Reply = oneshot::Sender<Result<(), FsError>>;
 #[allow(clippy::large_enum_variant)]
 enum Request {
     Commit(Transaction, Reply),
-    DurableCommit(Transaction, Reply, tokio::sync::OwnedMutexGuard<()>),
+    WorkspaceLedger(
+        WorkspaceLedgerRequest,
+        Reply,
+        tokio::sync::OwnedMutexGuard<()>,
+    ),
     #[cfg(any(test, dst))]
     Barrier(Reply),
 }
@@ -126,6 +131,9 @@ impl WriteCoordinator {
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        if txn.touches_reserved_mutation_namespace() {
+            return Err(FsError::OperationNotPermitted);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::Commit(txn, reply_tx))
@@ -133,14 +141,14 @@ impl WriteCoordinator {
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
 
-    pub(crate) async fn commit_workspace_durable(
+    pub(super) async fn commit_workspace_durable(
         &self,
-        txn: Transaction,
+        request: WorkspaceLedgerRequest,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::DurableCommit(txn, reply_tx, guard))
+            .send(Request::WorkspaceLedger(request, reply_tx, guard))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::CommitOutcomeUnknown)?
     }
@@ -208,6 +216,9 @@ pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<Request>);
 
 impl WeakWriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        if txn.touches_reserved_mutation_namespace() {
+            return Err(FsError::OperationNotPermitted);
+        }
         let sender = self.0.upgrade().ok_or(FsError::IoError)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
@@ -329,7 +340,9 @@ async fn worker_loop(
         };
         let (txn, reply, mut require_durable, workspace_guard) = match first {
             Request::Commit(txn, reply) => (txn, reply, false, None),
-            Request::DurableCommit(txn, reply, guard) => (txn, reply, true, Some(guard)),
+            Request::WorkspaceLedger(request, reply, guard) => {
+                (request.into_transaction(), reply, true, Some(guard))
+            }
             #[cfg(any(test, dst))]
             Request::Barrier(reply) => {
                 let _ = reply.send(Ok(()));
@@ -342,9 +355,9 @@ async fn worker_loop(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Request::Commit(txn, reply) => batch.push((txn, reply, None)),
-                Request::DurableCommit(txn, reply, guard) => {
+                Request::WorkspaceLedger(request, reply, guard) => {
                     require_durable = true;
-                    batch.push((txn, reply, Some(guard)));
+                    batch.push((request.into_transaction(), reply, Some(guard)));
                 }
                 #[cfg(any(test, dst))]
                 Request::Barrier(reply) => {
@@ -715,6 +728,10 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::inode::{Inode, test_file_inode};
+    use crate::fs::workspace_operation::{
+        CanonicalRequestDigest, WorkspaceOperationKey, WorkspaceOperationLookup,
+        WorkspaceOperationState, WorkspaceTerminalOutcome,
+    };
     use bytes::Bytes;
 
     /// `DST_PANIC_ON_WRITE_ERROR` is process-global, so fatal-path unit tests
@@ -1328,6 +1345,56 @@ mod tests {
             Some(crate::dedup::DedupResult::Error { errno })
                 if errno == libc::EEXIST as u32
         ));
+    }
+
+    #[tokio::test]
+    async fn typed_workspace_ledger_request_uses_the_ha_replication_path() {
+        let receiver = ReplicationReceiver::new(
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            "workspace-ledger-standby".to_string(),
+        );
+        let receiver_control = receiver.control();
+        let endpoint = serve_receiver(receiver).await;
+        let (replicator, replication_control) = Replicator::new(endpoint.clone(), writer_epoch(7));
+        replication_control
+            .set_sender_for_tests(Some(connect_sender(&endpoint).await))
+            .await;
+        let lease = crate::replication::Lease::new();
+        lease.renew(std::time::Duration::from_secs(30));
+        let (fs, _) = make_leased_replicating_fs_with_raw(lease, replicator).await;
+        let key = WorkspaceOperationKey::new("workspace-a", 10, "request-a");
+        let digest = CanonicalRequestDigest::new([0x5a; 32]);
+
+        fs.workspace_operations.begin(&key, digest).await.unwrap();
+        let terminal = fs
+            .workspace_operations
+            .complete(
+                &key,
+                digest,
+                WorkspaceTerminalOutcome::Succeeded(Bytes::from_static(b"receipt")),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            terminal,
+            WorkspaceOperationLookup::Known(record)
+                if matches!(record.state, WorkspaceOperationState::Succeeded(_))
+        ));
+        let ledger_key = codec().workspace_operation_key(1, b"workspace-a", 10, b"request-a");
+        let shipped = receiver_control
+            .inspect_standby_for_tests(|tail, _| {
+                tail.batches_in_order()
+                    .flat_map(|(_, ops)| ops.iter())
+                    .filter(|op| matches!(op, ReplOp::Put(key, _) if key == &ledger_key))
+                    .count()
+            })
+            .await;
+        assert_eq!(
+            shipped, 2,
+            "both PENDING and terminal bytes must ship through the ordered HA path"
+        );
     }
 
     #[tokio::test]

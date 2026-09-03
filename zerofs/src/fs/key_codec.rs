@@ -73,6 +73,19 @@ pub const META_DOMAIN: &[u8] = b"meta";
 /// Domain prefix for bulk extent data.
 pub const EXTENT_DOMAIN: &[u8] = b"extent";
 
+/// Whether `key` belongs to metadata whose mutation is reserved to a typed
+/// authority path rather than the general filesystem transaction API.
+///
+/// Keep this check at the encoded-key boundary: a caller with a raw
+/// [`crate::db::Transaction`] must not be able to bypass a newer typed store by
+/// manufacturing its key bytes. Add future authority-owned prefixes here when
+/// their typed commit requests are introduced.
+pub(crate) fn is_reserved_mutation_key(key: &[u8]) -> bool {
+    key.len() > META_DOMAIN.len()
+        && key.starts_with(META_DOMAIN)
+        && key[META_DOMAIN.len()] == PREFIX_WORKSPACE_OPERATION
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPrefix {
     Inode,
@@ -668,6 +681,19 @@ impl KeyCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_mutation_namespace_matches_only_registered_encoded_prefixes() {
+        let codec = KeyCodec::new();
+        let ledger = codec.workspace_operation_key(1, b"workspace-a", 10, b"request-a");
+        assert!(is_reserved_mutation_key(&ledger));
+
+        assert!(!is_reserved_mutation_key(META_DOMAIN));
+        assert!(!is_reserved_mutation_key(b"met"));
+        assert!(!is_reserved_mutation_key(b"metadata\x0a"));
+        assert!(!is_reserved_mutation_key(&codec.inode_key(1)));
+        assert!(!is_reserved_mutation_key(&codec.extent_key(1, 0)));
+    }
 
     #[test]
     fn test_dir_scan_parsing() {

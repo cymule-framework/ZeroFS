@@ -246,6 +246,17 @@ impl Transaction {
         self.ops.is_empty()
     }
 
+    /// Reject general transaction ingress into authority-owned metadata.
+    /// Typed commit requests are converted only inside the commit worker and
+    /// therefore never pass through the public coordinator entry points.
+    pub(crate) fn touches_reserved_mutation_namespace(&self) -> bool {
+        self.ops.iter().any(|op| match op {
+            TxOp::Put(key, _) | TxOp::Delete(key) => {
+                crate::fs::key_codec::is_reserved_mutation_key(key)
+            }
+        })
+    }
+
     /// Replay this transaction's ops into `target`. SlateDB's `WriteBatch`
     /// already dedupes per key, so calling this on multiple transactions
     /// produces one merged batch with last-write-wins per key.
@@ -681,7 +692,7 @@ impl Db {
 
     /// Returns the committed batch's SlateDB seqnum, mapped to `durable_seq` to
     /// advance the standby's prune watermark.
-    pub async fn write_with_options(
+    pub(crate) async fn write_with_options(
         &self,
         batch: WriteBatch,
         options: &WriteOptions,
@@ -727,13 +738,16 @@ impl Db {
         Ok(Transaction::new())
     }
 
-    pub async fn put_with_options(
+    pub(crate) async fn put_with_options(
         &self,
         key: &Bytes,
         value: &[u8],
         put_options: &PutOptions,
         write_options: &WriteOptions,
     ) -> Result<()> {
+        if crate::fs::key_codec::is_reserved_mutation_key(key) {
+            return Err(FsError::OperationNotPermitted.into());
+        }
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }

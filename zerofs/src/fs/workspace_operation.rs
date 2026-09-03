@@ -135,6 +135,36 @@ pub struct WorkspaceOperationLedger {
     lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Unforgeable request carried by the coordinator's Workspace-ledger variant.
+///
+/// The fields and constructors are private to this module. Other crate modules
+/// can pass the type through the commit worker, but cannot manufacture an
+/// authorized raw transaction for the reserved keyspace.
+pub(super) struct WorkspaceLedgerRequest {
+    mutation: Option<(Bytes, Bytes)>,
+}
+
+impl WorkspaceLedgerRequest {
+    fn put(key: &Bytes, value: Bytes) -> Self {
+        debug_assert!(crate::fs::key_codec::is_reserved_mutation_key(key));
+        Self {
+            mutation: Some((key.clone(), value)),
+        }
+    }
+
+    fn durability_barrier() -> Self {
+        Self { mutation: None }
+    }
+
+    pub(super) fn into_transaction(self) -> Transaction {
+        let mut txn = Transaction::new();
+        if let Some((key, value)) = self.mutation {
+            txn.put_bytes(&key, value);
+        }
+        txn
+    }
+}
+
 impl WorkspaceOperationLedger {
     pub(crate) fn new(db: Arc<Db>, write_coordinator: WriteCoordinator) -> Self {
         Self {
@@ -274,10 +304,8 @@ impl WorkspaceOperationLedger {
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), WorkspaceOperationError> {
         let value = encode_record(key, record)?;
-        let mut txn = Transaction::new();
-        txn.put_bytes(key, value);
         self.write_coordinator
-            .commit_workspace_durable(txn, guard)
+            .commit_workspace_durable(WorkspaceLedgerRequest::put(key, value), guard)
             .await?;
         Ok(())
     }
@@ -299,7 +327,7 @@ impl WorkspaceOperationLedger {
                 return Ok((current, guard));
             }
             self.write_coordinator
-                .commit_workspace_durable(Transaction::new(), guard)
+                .commit_workspace_durable(WorkspaceLedgerRequest::durability_barrier(), guard)
                 .await?;
             // The queued request owned the guard through its durability barrier.
             // Reacquire and reread because another caller may have advanced the
@@ -483,6 +511,7 @@ mod tests {
     use crate::fs::ZeroFS;
     use slatedb::BlockTransformer;
     use slatedb::DbBuilder;
+    use slatedb::config::{PutOptions, WriteOptions};
     use slatedb::object_store::path::Path;
 
     async fn open_fs(
@@ -882,11 +911,12 @@ mod tests {
     async fn corrupt_record_fails_closed() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
-        let mut txn = Transaction::new();
-        txn.put_bytes(&encoded_key, Bytes::from_static(b"corrupt"));
         let guard = fs.write_coordinator.lock_workspace_ledger().await;
         fs.write_coordinator
-            .commit_workspace_durable(txn, guard)
+            .commit_workspace_durable(
+                WorkspaceLedgerRequest::put(&encoded_key, Bytes::from_static(b"corrupt")),
+                guard,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -896,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_copied_to_another_operation_key_fails_closed() {
+    async fn raw_copy_to_another_operation_key_is_rejected() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let source_key = fs.workspace_operations.encode_key(&key()).unwrap();
         let mut destination = key();
@@ -909,17 +939,192 @@ mod tests {
         let copied_value = encode_record(&source_key, &record).unwrap();
         let mut txn = Transaction::new();
         txn.put_bytes(&destination_key, copied_value);
+        assert_eq!(
+            fs.write_coordinator.commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.workspace_operations
+                .lookup(&destination, digest(1))
+                .await,
+            Ok(WorkspaceOperationLookup::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_path_still_rejects_record_bytes_copied_across_keys_on_readback() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let source_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let destination = WorkspaceOperationKey::new("workspace-b", 10, "request-a");
+        let destination_key = fs.workspace_operations.encode_key(&destination).unwrap();
+        let source_record = WorkspaceOperationRecord {
+            request_digest: digest(1),
+            state: WorkspaceOperationState::Pending,
+        };
+        let copied_source_bytes = encode_record(&source_key, &source_record).unwrap();
         let guard = fs.write_coordinator.lock_workspace_ledger().await;
         fs.write_coordinator
-            .commit_workspace_durable(txn, guard)
+            .commit_workspace_durable(
+                WorkspaceLedgerRequest::put(&destination_key, copied_source_bytes),
+                guard,
+            )
             .await
             .unwrap();
+
         assert!(matches!(
             fs.workspace_operations
                 .lookup(&destination, digest(1))
                 .await,
             Err(WorkspaceOperationError::CorruptRecord(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn raw_put_with_valid_current_key_checksum_cannot_advance_pending() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.workspace_operations
+            .begin(&key(), digest(1))
+            .await
+            .unwrap();
+        let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let forged_terminal = WorkspaceOperationRecord {
+            request_digest: digest(1),
+            state: WorkspaceOperationState::Succeeded(Bytes::from_static(b"forged-receipt")),
+        };
+        let mut txn = Transaction::new();
+        txn.put_bytes(
+            &encoded_key,
+            encode_record(&encoded_key, &forged_terminal).unwrap(),
+        );
+
+        assert_eq!(
+            fs.write_coordinator.commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.workspace_operations.lookup(&key(), digest(1)).await,
+            Ok(WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                request_digest: digest(1),
+                state: WorkspaceOperationState::Pending,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_delete_cannot_remove_current_record() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let expected = fs
+            .workspace_operations
+            .begin(&key(), digest(1))
+            .await
+            .unwrap();
+        let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let mut txn = Transaction::new();
+        txn.delete_bytes(&encoded_key);
+
+        assert_eq!(
+            fs.write_coordinator.commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.workspace_operations.lookup(&key(), digest(1)).await,
+            Ok(WorkspaceOperationLookup::Known(expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_cross_workspace_put_with_valid_target_checksum_is_rejected() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let destination = WorkspaceOperationKey::new("workspace-b", 10, "request-a");
+        let destination_key = fs.workspace_operations.encode_key(&destination).unwrap();
+        let forged = WorkspaceOperationRecord {
+            request_digest: digest(1),
+            state: WorkspaceOperationState::Pending,
+        };
+        let mut txn = Transaction::new();
+        txn.put_bytes(
+            &destination_key,
+            encode_record(&destination_key, &forged).unwrap(),
+        );
+
+        assert_eq!(
+            fs.write_coordinator.commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.workspace_operations
+                .lookup(&destination, digest(1))
+                .await,
+            Ok(WorkspaceOperationLookup::Unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_put_cannot_overwrite_terminal_record() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.workspace_operations
+            .begin(&key(), digest(1))
+            .await
+            .unwrap();
+        let expected = fs
+            .workspace_operations
+            .complete(
+                &key(),
+                digest(1),
+                WorkspaceTerminalOutcome::Succeeded(Bytes::from_static(b"real-receipt")),
+            )
+            .await
+            .unwrap();
+        let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let forged = WorkspaceOperationRecord {
+            request_digest: digest(1),
+            state: WorkspaceOperationState::Failed(Bytes::from_static(b"forged-negative")),
+        };
+        let mut txn = Transaction::new();
+        txn.put_bytes(&encoded_key, encode_record(&encoded_key, &forged).unwrap());
+
+        assert_eq!(
+            fs.write_coordinator.commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.workspace_operations.lookup(&key(), digest(1)).await,
+            Ok(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_general_commit_also_rejects_reserved_namespace() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let mut txn = Transaction::new();
+        txn.delete_bytes(&encoded_key);
+
+        assert_eq!(
+            fs.write_coordinator.downgrade().commit(txn).await,
+            Err(FsError::OperationNotPermitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_database_put_rejects_reserved_namespace() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let encoded_key = fs.workspace_operations.encode_key(&key()).unwrap();
+        let error = fs
+            .db
+            .put_with_options(
+                &encoded_key,
+                b"forged",
+                &PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            FsError::from_db_error(&error),
+            FsError::OperationNotPermitted
+        );
     }
 
     #[test]
