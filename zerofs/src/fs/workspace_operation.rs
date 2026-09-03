@@ -82,6 +82,7 @@ impl WorkspaceOperationState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "rhizome-workspace-genesis-core")]
 pub(crate) enum EffectDispatchClaim {
     Installed(WorkspaceOperationRecord),
     Existing(WorkspaceOperationRecord),
@@ -255,6 +256,7 @@ impl WorkspaceOperationLedger {
     /// Complete an externally claimed effect. The claim bytes are the durable
     /// handoff identity; only the typed domain owner may use this path after
     /// validating its effect receipt.
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
     pub(super) async fn complete_claimed_effect(
         &self,
         key: &WorkspaceOperationKey,
@@ -298,6 +300,7 @@ impl WorkspaceOperationLedger {
 
     /// Durably authorize exactly one external mutation attempt. Only the call
     /// that installs the claim may dispatch; replay may perform readback only.
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
     pub(crate) async fn claim_effect_dispatch(
         &self,
         key: &WorkspaceOperationKey,
@@ -618,6 +621,7 @@ pub(super) fn decode_record(
     Ok(record)
 }
 
+#[cfg(feature = "rhizome-workspace-genesis-core")]
 pub(super) fn storage_key(key: &WorkspaceOperationKey) -> Result<Bytes, WorkspaceOperationError> {
     validate_identity("workspace_id", &key.workspace_id)?;
     validate_identity("request_id", &key.request_id)?;
@@ -634,6 +638,7 @@ pub(super) fn storage_key(key: &WorkspaceOperationKey) -> Result<Bytes, Workspac
     ))
 }
 
+#[cfg(feature = "rhizome-workspace-genesis-core")]
 pub(crate) async fn read_operation_durable(
     db: &Db,
     key: &WorkspaceOperationKey,
