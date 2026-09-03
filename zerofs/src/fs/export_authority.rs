@@ -2178,8 +2178,14 @@ async fn read_nbd_install_graph_durable(
         .get_bytes_durable_snapshot(&[outcome_key.clone(), install_key.clone()])
         .await
         .map_err(|_| ExportAuthorityError::Storage)?;
-    let install_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
-    let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let install_bytes = values
+        .pop()
+        .ok_or(ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::Corrupt)?;
+    let outcome_bytes = values
+        .pop()
+        .ok_or(ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::Corrupt)?;
     match (outcome_bytes, install_bytes) {
         (None, None) => Ok(None),
         (Some(outcome), Some(install)) => {
