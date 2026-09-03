@@ -2211,7 +2211,11 @@ async fn commit_export_authority_transition(
         return Err(ExportAuthorityError::Conflict);
     }
     match (desired.binding_initialized, name_binding, inode_binding) {
-        (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {}
+        (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {
+            if is_activation {
+                validate_physical_export(&ctx.db, &ctx.key_codec, &desired.export).await?;
+            }
+        }
         (true, None, None) if is_activation && !binding_was_initialized => {
             validate_physical_export(&ctx.db, &ctx.key_codec, &desired.export).await?;
             batch.put_bytes(
