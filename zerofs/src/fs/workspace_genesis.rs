@@ -404,6 +404,9 @@ impl WorkspaceGenesisStore {
             WorkspaceOperationState::EffectDispatched(existing) => (existing, false),
             _ => return Ok(GenesisMaterializeResult::AlreadyTerminal(operation)),
         };
+        if !claim_matches_plan(&claim_bytes, plan_digest(command, plan), &object_key) {
+            return Err(GenesisError::Corrupt);
+        }
         if dispatch_create {
             let path = Path::from(object_key.as_str());
             let _ = self
@@ -867,22 +870,34 @@ fn effect_claim(plan_digest: [u8; SHA256_SIZE], object_key: &str, installer: &st
 }
 
 fn validate_effect_claim(record: &GenesisDomainRecord) -> Result<(), GenesisError> {
-    let mut prefix = Vec::with_capacity(
-        EFFECT_CLAIM_DOMAIN.len() + SHA256_SIZE + record.root_object_key.len() + 1,
-    );
-    prefix.extend_from_slice(EFFECT_CLAIM_DOMAIN);
-    prefix.extend_from_slice(&record_plan_digest(record));
-    prefix.extend_from_slice(record.root_object_key.as_bytes());
-    prefix.push(0);
-    let Some(installer) = record.effect_claim.strip_prefix(prefix.as_slice()) else {
-        return Err(GenesisError::Invalid);
-    };
-    let installer = std::str::from_utf8(installer).map_err(|_| GenesisError::Invalid)?;
-    let parsed = uuid::Uuid::parse_str(installer).map_err(|_| GenesisError::Invalid)?;
-    if parsed.to_string() != installer {
-        return Err(GenesisError::Invalid);
+    if claim_matches_plan(
+        &record.effect_claim,
+        record_plan_digest(record),
+        &record.root_object_key,
+    ) {
+        Ok(())
+    } else {
+        Err(GenesisError::Invalid)
     }
-    Ok(())
+}
+
+fn claim_matches_plan(claim: &Bytes, plan_digest: [u8; 32], object_key: &str) -> bool {
+    let mut prefix =
+        Vec::with_capacity(EFFECT_CLAIM_DOMAIN.len() + SHA256_SIZE + object_key.len() + 1);
+    prefix.extend_from_slice(EFFECT_CLAIM_DOMAIN);
+    prefix.extend_from_slice(&plan_digest);
+    prefix.extend_from_slice(object_key.as_bytes());
+    prefix.push(0);
+    let Some(installer) = claim.strip_prefix(prefix.as_slice()) else {
+        return false;
+    };
+    let Ok(installer) = std::str::from_utf8(installer) else {
+        return false;
+    };
+    let Ok(parsed) = uuid::Uuid::parse_str(installer) else {
+        return false;
+    };
+    parsed.to_string() == installer
 }
 
 async fn get_content_addressed_exact(
@@ -1395,6 +1410,49 @@ mod tests {
         ));
         assert_eq!(controls.put_count(), 1);
         assert_eq!(controls.get_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn replayed_claim_rejects_derived_plan_drift_before_readback() {
+        let fs = new_fs().await;
+        let inner: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (fault, controls) = crate::fault_store::FaultStore::new(inner);
+        controls.fail_gets(1);
+        let store = WorkspaceGenesisStore {
+            db: fs.workspace_genesis.db.clone(),
+            coordinator: fs.workspace_genesis.coordinator.clone(),
+            operations: fs.workspace_genesis.operations.clone(),
+            object_creator: Arc::new(DirectTestGenesisObjectCreator(fault)),
+            local_storage_shard_id: "test-shard".into(),
+        };
+        let input = verified("workspace-a", "request-a", b"root-a");
+        assert_eq!(
+            store.materialize(input.clone()).await,
+            Err(GenesisError::ObjectOutcomeUnknown)
+        );
+        let mut drifted = input.clone();
+        drifted.plan.export_name = b"different.img".to_vec();
+        assert_eq!(store.materialize(drifted).await, Err(GenesisError::Corrupt));
+        assert_eq!(controls.put_count(), 1);
+        assert_eq!(controls.get_count(), 1);
+        assert!(
+            store
+                .lookup_record_durable("workspace-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .operations
+                .lookup(&input.command().operation, input.command().request_digest)
+                .await
+                .unwrap(),
+            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                state: WorkspaceOperationState::EffectDispatched(_),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
