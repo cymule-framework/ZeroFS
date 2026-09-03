@@ -385,7 +385,7 @@ impl KeyCodec {
     pub(crate) fn nbd_connection_receipt_key(
         &self,
         identity: &NbdSessionKey<'_>,
-        connection_id: &[u8; 32],
+        connection_id: &[u8; 16],
     ) -> Bytes {
         self.nbd_session_scoped_key(
             NBD_CONNECTION_RECEIPT_SUBTYPE,
@@ -398,7 +398,7 @@ impl KeyCodec {
     pub(crate) fn nbd_session_install_outcome_key(
         &self,
         workspace_id: &str,
-        request_id: &[u8; 32],
+        request_id: &[u8; 16],
     ) -> Bytes {
         self.nbd_request_outcome_key(
             NBD_SESSION_INSTALL_OUTCOME_SUBTYPE,
@@ -412,7 +412,7 @@ impl KeyCodec {
         &self,
         subtype: u8,
         workspace_id: &str,
-        request_id: &[u8; 32],
+        request_id: &[u8; 16],
     ) -> Bytes {
         let workspace = workspace_id.as_bytes();
         let workspace_len =
@@ -435,7 +435,7 @@ impl KeyCodec {
         &self,
         subtype: u8,
         identity: &NbdSessionKey<'_>,
-        suffix: Option<&[u8; 32]>,
+        suffix: Option<&[u8; 16]>,
     ) -> Bytes {
         let workspace = identity.workspace_id.as_bytes();
         let actor = identity.actor.as_bytes();
@@ -446,7 +446,7 @@ impl KeyCodec {
         let actor_len = u16::try_from(actor.len()).expect("validated Actor id fits u16");
         let session_len = u16::try_from(session.len()).expect("validated session id fits u16");
         let boot_len = u16::try_from(boot.len()).expect("validated boot id fits u16");
-        let suffix_len = suffix.map_or(0, |_| 32);
+        let suffix_len = suffix.map_or(0, |_| 16);
         let mut key = Vec::with_capacity(
             META_DOMAIN.len()
                 + 3
@@ -1021,9 +1021,28 @@ mod tests {
         let ledger = codec.workspace_operation_key(1, b"workspace-a", 10, b"request-a");
         assert!(is_reserved_mutation_key(&ledger));
         #[cfg(feature = "rhizome-export-authority-core")]
-        assert!(is_reserved_mutation_key(
-            &codec.export_authority_key("workspace-a")
-        ));
+        {
+            assert!(is_reserved_mutation_key(
+                &codec.export_authority_key("workspace-a")
+            ));
+            let session = NbdSessionKey {
+                workspace_id: "workspace-a",
+                actor: "actor-a",
+                actor_generation: 1,
+                placement_epoch: 2,
+                session_id: "session-a",
+                server_boot_id: "boot-a",
+            };
+            assert!(is_reserved_mutation_key(
+                &codec.nbd_session_install_key(&session)
+            ));
+            assert!(is_reserved_mutation_key(
+                &codec.nbd_session_install_outcome_key("workspace-a", &[1; 16])
+            ));
+            assert!(is_reserved_mutation_key(
+                &codec.nbd_connection_receipt_key(&session, &[2; 16])
+            ));
+        }
         #[cfg(feature = "rhizome-export-authority-core")]
         assert!(is_reserved_mutation_key(&codec.export_boot_key()));
 
