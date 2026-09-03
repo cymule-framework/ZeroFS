@@ -19,9 +19,11 @@ use crate::fs::export_authority::{
     encode_nbd_session_install, encode_outcome, encode_record, encode_reverse_binding,
     ensure_nbd_connection_receipt, ensure_nbd_install_outcome, ensure_nbd_install_state,
     ensure_outcome, mutation_outcome_key, nbd_connection_receipt_key, nbd_install_outcome_key,
-    nbd_session_install_key, read_nbd_connection_receipt_current, read_nbd_install_outcome_current,
-    read_nbd_install_outcome_durable, read_nbd_session_install_current, read_outcome_current,
-    read_record_current, read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
+    nbd_session_install_key, read_nbd_connection_receipt_current,
+    read_nbd_connection_receipt_durable, read_nbd_install_outcome_current,
+    read_nbd_install_outcome_durable, read_nbd_session_install_current,
+    read_nbd_session_install_durable, read_outcome_current, read_record_current,
+    read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
     trusted_now_unix_millis, validate_mutation, validate_nbd_connection_expectation,
     validate_nbd_install_expectation,
 };
@@ -1885,8 +1887,13 @@ async fn commit_nbd_session_claim(
     let claim = apply_nbd_session_claim(&mut install, command)?;
     if was_claimed {
         drop(permit);
-        flush_nbd_session_commit(ctx).await?;
-        return Ok(claim);
+        let durable = read_nbd_session_install_durable(&ctx.db, &install_key)
+            .await?
+            .ok_or(ExportAuthorityError::CommitOutcomeUnknown)?;
+        if durable == install {
+            return Ok(claim);
+        }
+        return Err(ExportAuthorityError::CommitOutcomeUnknown);
     }
     validate_nbd_session_authority(ctx, &expected).await?;
     let mut batch = WriteBatch::new();
@@ -1978,8 +1985,13 @@ async fn commit_nbd_session_consume(
             return Err(ExportAuthorityError::Corrupt);
         }
         drop(permit);
-        flush_nbd_session_commit(ctx).await?;
-        return Ok(receipt);
+        let durable = read_nbd_connection_receipt_durable(&ctx.db, &receipt_key)
+            .await?
+            .ok_or(ExportAuthorityError::CommitOutcomeUnknown)?;
+        if durable == receipt {
+            return Ok(receipt);
+        }
+        return Err(ExportAuthorityError::CommitOutcomeUnknown);
     }
     validate_nbd_session_authority(ctx, &expected.install.expectation).await?;
 

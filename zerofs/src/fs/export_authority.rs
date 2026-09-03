@@ -2197,7 +2197,7 @@ pub(crate) async fn read_nbd_session_install_current(
     decode_nbd_session_install(&bytes, key).map(Some)
 }
 
-async fn read_nbd_session_install_durable(
+pub(crate) async fn read_nbd_session_install_durable(
     db: &Db,
     key: &Bytes,
 ) -> Result<Option<NbdSessionInstallRecord>, ExportAuthorityError> {
@@ -2255,7 +2255,7 @@ pub(crate) async fn read_nbd_connection_receipt_current(
     decode_nbd_connection_receipt(&bytes, key).map(Some)
 }
 
-async fn read_nbd_connection_receipt_durable(
+pub(crate) async fn read_nbd_connection_receipt_durable(
     db: &Db,
     key: &Bytes,
 ) -> Result<Option<NbdConnectionReceipt>, ExportAuthorityError> {
@@ -3623,6 +3623,48 @@ mod tests {
             nbd_uuid(ordinal.wrapping_add(1)),
         )
         .unwrap()
+    }
+
+    async fn nbd_install_and_complete(
+        fs: &ZeroFS,
+        record: &ExportAuthorityRecord,
+        ordinal: u8,
+    ) -> NbdSessionInstallReceipt {
+        let install = nbd_install(record, ordinal);
+        let expected = install.expectation();
+        assert_eq!(
+            fs.export_authority
+                .install_nbd_session(install)
+                .await
+                .unwrap(),
+            NbdSessionInstallOutcome::Pending(Box::new(expected.clone()))
+        );
+        fs.export_authority
+            .complete_nbd_session_install(
+                CompleteNbdSessionInstall::new(
+                    expected.clone(),
+                    nbd_socket(&expected.socket_target),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn nbd_install_complete_and_claim(
+        fs: &ZeroFS,
+        record: &ExportAuthorityRecord,
+        ordinal: u8,
+        stream_inode: u64,
+    ) -> NbdSessionClaim {
+        let installed = nbd_install_and_complete(fs, record, ordinal).await;
+        fs.export_authority
+            .claim_nbd_session(
+                ClaimNbdSession::new(installed, nbd_peer(record), nbd_stream(stream_inode))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     fn mutation_for(
