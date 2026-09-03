@@ -3848,7 +3848,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_gate_ignores_warm_metadata_caches_and_reads_current_db_rows() {
-        for candidate in 0..3 {
+        for candidate in 0..4 {
             let fs = new_export_fs().await;
             let active = fs
                 .export_authority
@@ -3877,17 +3877,35 @@ mod tests {
                         .dir_entry_key(active.export.nbd_directory_inode, &active.export.name),
                     crate::fs::key_codec::KeyCodec::encode_dir_entry(active.export.inode + 100, 3),
                 );
-            } else {
+            } else if candidate == 2 {
                 corrupt.put_bytes(
                     &crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 999),
                     Bytes::from_static(b"raw-extent-must-not-apply"),
                 );
+            } else {
+                corrupt.delete_bytes(
+                    &crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 0),
+                );
             }
+            let expected = mutation_for(
+                &active,
+                Transaction::new(),
+                MutationKind::Flush,
+                81 + candidate,
+            )
+            .expectation();
             assert_eq!(
                 fs.write_coordinator.commit(corrupt).await,
                 Err(crate::fs::errors::FsError::OperationNotPermitted)
             );
             assert_eq!(fs.export_authority.dst_prepared_mutations(), 0);
+            assert_eq!(
+                fs.export_authority
+                    .lookup_mutation_current(&expected)
+                    .await
+                    .unwrap(),
+                ExportMutationLookup::Unknown
+            );
             let inode = fs.inode_store.get(active.export.inode).await.unwrap();
             assert_eq!(inode.size(), active.export.advertised_size);
             assert_eq!(
@@ -3898,6 +3916,20 @@ mod tests {
                 active.export.inode
             );
         }
+
+        let fs = new_export_fs().await;
+        let unbound_key = crate::fs::key_codec::KeyCodec::new().extent_key(999, 0);
+        let mut put = Transaction::new();
+        put.put_bytes(&unbound_key, Bytes::from_static(b"unbound"));
+        fs.write_coordinator.commit(put).await.unwrap();
+        assert_eq!(
+            fs.db.get_bytes(&unbound_key).await.unwrap().as_deref(),
+            Some(&b"unbound"[..])
+        );
+        let mut delete = Transaction::new();
+        delete.delete_bytes(&unbound_key);
+        fs.write_coordinator.commit(delete).await.unwrap();
+        assert!(fs.db.get_bytes(&unbound_key).await.unwrap().is_none());
     }
 
     #[tokio::test]
