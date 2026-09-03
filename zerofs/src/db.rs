@@ -414,6 +414,10 @@ pub struct Db {
     flush_barrier: Arc<tokio::sync::RwLock<()>>,
     /// Rejects cache hits and writers once local close begins.
     closing: AtomicBool,
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    fail_next_scan_setup: AtomicBool,
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    fail_next_scan_midstream: AtomicBool,
 }
 
 /// Admission to one database write while holding the flush barrier's read side.
@@ -452,6 +456,10 @@ impl Db {
             status,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
+            #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+            fail_next_scan_setup: AtomicBool::new(false),
+            #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+            fail_next_scan_midstream: AtomicBool::new(false),
         }
     }
 
@@ -463,6 +471,10 @@ impl Db {
             status: None,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
+            #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+            fail_next_scan_setup: AtomicBool::new(false),
+            #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+            fail_next_scan_midstream: AtomicBool::new(false),
         }
     }
 
@@ -691,6 +703,10 @@ impl Db {
         seek_to: Option<Bytes>,
         read_ahead_bytes: usize,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send>>> {
+        #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+        if self.fail_next_scan_setup.swap(false, Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("injected scan setup failure"));
+        }
         self.check_lease()?;
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
@@ -731,6 +747,13 @@ impl Db {
             }
         };
 
+        #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+        if self.fail_next_scan_midstream.swap(false, Ordering::SeqCst) {
+            return Ok(Box::pin(futures::stream::once(async {
+                Err(anyhow::anyhow!("injected midstream scan failure"))
+            })));
+        }
+
         Ok(Box::pin(futures::stream::unfold(
             iter,
             |mut iter| async move {
@@ -741,6 +764,16 @@ impl Db {
                 }
             },
         )))
+    }
+
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    pub(crate) fn dst_fail_next_scan_setup(&self) {
+        self.fail_next_scan_setup.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    pub(crate) fn dst_fail_next_scan_midstream(&self) {
+        self.fail_next_scan_midstream.store(true, Ordering::SeqCst);
     }
 
     /// Returns the committed batch's SlateDB seqnum, mapped to `durable_seq` to

@@ -1635,43 +1635,36 @@ async fn ensure_export_binding_index(
     rebuilt
         .rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut legacy = db
+    let mut legacy = match db
         .scan_prefix(key_codec.legacy_export_v1_prefix(), None, 4 * 1024)
         .await
-        .map_err(|_| FsError::IoError)?;
-    if legacy
-        .next()
-        .await
-        .transpose()
-        .map_err(|_| FsError::IoError)?
-        .is_some()
     {
-        rebuilt.poisoned = true;
-        *index = rebuilt;
-        return Err(FsError::InvalidData);
+        Ok(scan) => scan,
+        Err(_) => return poison_export_binding_index(index, rebuilt),
+    };
+    match legacy.next().await {
+        Some(Ok(_)) => return poison_export_binding_index(index, rebuilt),
+        Some(Err(_)) => return poison_export_binding_index(index, rebuilt),
+        None => {}
     }
-    let mut forward = db
+    let mut forward = match db
         .scan_prefix(key_codec.export_authority_prefix(), None, 4 * 1024)
         .await
-        .map_err(|_| FsError::IoError)?;
-    while let Some((key, value)) = forward
-        .next()
-        .await
-        .transpose()
-        .map_err(|_| FsError::IoError)?
     {
+        Ok(scan) => scan,
+        Err(_) => return poison_export_binding_index(index, rebuilt),
+    };
+    while let Some(row) = forward.next().await {
+        let (key, value) = match row {
+            Ok(row) => row,
+            Err(_) => return poison_export_binding_index(index, rebuilt),
+        };
         let Some(workspace) = key_codec.parse_export_authority_workspace(&key) else {
-            rebuilt.poisoned = true;
-            *index = rebuilt;
-            return Err(FsError::InvalidData);
+            return poison_export_binding_index(index, rebuilt);
         };
         let record = match decode_record(&value, workspace) {
             Ok(record) => record,
-            Err(_) => {
-                rebuilt.poisoned = true;
-                *index = rebuilt;
-                return Err(FsError::InvalidData);
-            }
+            Err(_) => return poison_export_binding_index(index, rebuilt),
         };
         if record.binding_initialized {
             rebuilt.insert(&reverse_binding_for(&record));
@@ -1681,28 +1674,33 @@ async fn ensure_export_binding_index(
         key_codec.export_reverse_name_prefix(),
         key_codec.export_reverse_inode_prefix(),
     ] {
-        let mut reverse = db
-            .scan_prefix(prefix, None, 4 * 1024)
-            .await
-            .map_err(|_| FsError::IoError)?;
-        while let Some((key, value)) = reverse
-            .next()
-            .await
-            .transpose()
-            .map_err(|_| FsError::IoError)?
-        {
+        let mut reverse = match db.scan_prefix(prefix, None, 4 * 1024).await {
+            Ok(scan) => scan,
+            Err(_) => return poison_export_binding_index(index, rebuilt),
+        };
+        while let Some(row) = reverse.next().await {
+            let (key, value) = match row {
+                Ok(row) => row,
+                Err(_) => return poison_export_binding_index(index, rebuilt),
+            };
             match decode_reverse_binding(&value, &key) {
                 Ok(binding) => rebuilt.insert(&binding),
-                Err(_) => {
-                    rebuilt.poisoned = true;
-                    *index = rebuilt;
-                    return Err(FsError::InvalidData);
-                }
+                Err(_) => return poison_export_binding_index(index, rebuilt),
             }
         }
     }
     *index = rebuilt;
     Ok(())
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+fn poison_export_binding_index(
+    index: &mut ExportBindingIndex,
+    mut rebuilt: ExportBindingIndex,
+) -> Result<(), FsError> {
+    rebuilt.poisoned = true;
+    *index = rebuilt;
+    Err(FsError::InvalidData)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
