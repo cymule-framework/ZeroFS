@@ -61,6 +61,7 @@ strip = false
 default = ["vendored-protoc"]
 rhizome-export-authority-core = []
 rhizome-workspace-genesis-core = ["rhizome-export-authority-core"]
+rhizome-workspace-barrier-core = ["rhizome-workspace-genesis-core"]
 tokio-console = ["dep:console-subscriber"]
 failpoints = ["dep:fail"]
 vendored-protoc = ["dep:protobuf-src"]

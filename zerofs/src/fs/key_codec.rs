@@ -33,6 +33,7 @@ use bytes::Bytes;
 //   0x0A WORKSPACE_OP   Rhizome Workspace operation ledger, versioned composite key
 //   0x0B EXPORT_AUTHORITY Rhizome per-export authority/session state
 //   0x0C WORKSPACE_GENESIS Rhizome immutable Workspace genesis domain record
+//   0x0D WORKSPACE_BARRIER Rhizome current head and immutable barrier cuts
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -47,6 +48,7 @@ const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_WORKSPACE_OPERATION: u8 = 0x0A;
 const PREFIX_EXPORT_AUTHORITY: u8 = 0x0B;
 const PREFIX_WORKSPACE_GENESIS: u8 = 0x0C;
+const PREFIX_WORKSPACE_BARRIER: u8 = 0x0D;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -67,6 +69,11 @@ const NBD_SESSION_INSTALL_OUTCOME_SUBTYPE: u8 = 6;
 const NBD_CONNECTION_RECEIPT_SUBTYPE: u8 = 7;
 #[cfg(feature = "rhizome-export-authority-core")]
 const NBD_CONNECTION_RESERVATION_SUBTYPE: u8 = 8;
+
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+const WORKSPACE_HEAD_SUBTYPE: u8 = 1;
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+const WORKSPACE_BARRIER_SUBTYPE: u8 = 2;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -112,6 +119,7 @@ pub(crate) fn is_reserved_mutation_key(key: &[u8]) -> bool {
     kind == PREFIX_WORKSPACE_OPERATION
         || kind == PREFIX_EXPORT_AUTHORITY
         || kind == PREFIX_WORKSPACE_GENESIS
+        || kind == PREFIX_WORKSPACE_BARRIER
         || (kind == PREFIX_SYSTEM
             && key.get(META_DOMAIN.len() + 1) == Some(&SYSTEM_EXPORT_BOOT_SUBTYPE))
 }
@@ -238,6 +246,46 @@ pub(crate) enum ExportBindingMetadataKey {
 }
 
 impl KeyCodec {
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    pub(crate) fn workspace_head_key(&self, workspace_id: &str) -> Bytes {
+        self.workspace_barrier_key(WORKSPACE_HEAD_SUBTYPE, workspace_id, None)
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    pub(crate) fn workspace_barrier_record_key(
+        &self,
+        workspace_id: &str,
+        request_id: &str,
+    ) -> Bytes {
+        self.workspace_barrier_key(WORKSPACE_BARRIER_SUBTYPE, workspace_id, Some(request_id))
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    fn workspace_barrier_key(
+        &self,
+        subtype: u8,
+        workspace_id: &str,
+        request_id: Option<&str>,
+    ) -> Bytes {
+        let workspace = workspace_id.as_bytes();
+        let workspace_len =
+            u16::try_from(workspace.len()).expect("validated Workspace id fits u16");
+        let request = request_id.unwrap_or_default().as_bytes();
+        let request_len = u16::try_from(request.len()).expect("validated request id fits u16");
+        let mut key = Vec::with_capacity(
+            META_DOMAIN.len() + 1 + 1 + 1 + 2 + workspace.len() + 2 + request.len(),
+        );
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_BARRIER);
+        key.push(1);
+        key.push(subtype);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace);
+        key.extend_from_slice(&request_len.to_be_bytes());
+        key.extend_from_slice(request);
+        Bytes::from(key)
+    }
+
     pub fn new() -> Self {
         Self
     }

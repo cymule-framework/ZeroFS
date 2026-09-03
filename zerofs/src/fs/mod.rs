@@ -16,6 +16,11 @@ pub mod stats;
 pub mod store;
 pub mod tracing;
 pub mod types;
+#[cfg(all(feature = "rhizome-workspace-barrier-core", not(dst)))]
+pub(crate) mod workspace_barrier;
+#[cfg(all(feature = "rhizome-workspace-barrier-core", dst))]
+#[doc(hidden)]
+pub mod workspace_barrier;
 #[cfg(all(feature = "rhizome-workspace-genesis-core", not(dst)))]
 pub(crate) mod workspace_genesis;
 #[cfg(all(feature = "rhizome-workspace-genesis-core", dst))]
@@ -38,6 +43,8 @@ use self::metrics::FileSystemStats;
 use self::stats::FileSystemGlobalStats;
 use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use self::tracing::AccessTracer;
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+use self::workspace_barrier::WorkspaceBarrierStore;
 #[cfg(feature = "rhizome-workspace-genesis-core")]
 use self::workspace_genesis::WorkspaceGenesisStore;
 use self::workspace_operation::WorkspaceOperationLedger;
@@ -149,6 +156,17 @@ pub struct ZeroFS {
         )
     )]
     pub(crate) workspace_genesis: WorkspaceGenesisStore,
+    /// Non-default per-export durability barrier mechanics. The production
+    /// verifier and receipt signer intentionally have no constructor yet.
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "feature-staged until verified control-plane wiring"
+        )
+    )]
+    pub(crate) workspace_barriers: WorkspaceBarrierStore,
     /// Durable per-export Rhizome authority and session state. Transitions and
     /// fenced mutations are serialized by the single WriteCoordinator.
     #[cfg(feature = "rhizome-export-authority-core")]

@@ -231,3 +231,27 @@ attribution intact.
 - Different bytes at the expected SHA-256 object key are shard/storage
   corruption, not a request conflict. Leave the operation claimed, return
   Corrupt, and never turn that condition into an ordinary FAILED receipt.
+
+- `fs::workspace_barrier` is the non-default
+  `rhizome-workspace-barrier-core` mechanics candidate. Read
+  `RHIZOME_WORKSPACE_BARRIER.md` before changing its 0x0A claim, 0x0D head/cut,
+  manifest snapshot, or unknown-outcome protocol.
+- A barrier must publish PENDING and a unique durable effect-dispatch claim
+  before its one seal+manifest flush. After that claim, an absent barrier record
+  is UNKNOWN and no process may flush the same operation again.
+- Keep barrier authority, physical-export validation, data flush, coherent
+  writer/manifest/durable-sequence snapshot, and atomic head+cut publication
+  under the shared per-Workspace export admission guard and sole
+  WriteCoordinator. Never add a second head writer or assemble the cut from
+  separate status reads.
+- `meta + 0x0D` stores only the current Workspace head and immutable barrier
+  materialization records. It is reserved from every general/raw write path and
+  is not another operation lifecycle; signed terminal bytes remain in 0x0A.
+- The successor head must bind the complete prior head digest, canonical
+  barrier command, coordinator-assigned included export sequence, writer epoch,
+  exact SlateDB manifest ID, and remote-durable sequence. A later barrier is
+  blocked until the prior head's 0x0A operation is terminal SUCCEEDED.
+- The production verified-input and signed-terminal constructors remain absent
+  until ADR-0005 registers the barrier command/receipt and official Go/Rust
+  fixtures. Do not expose RPCs, protobuf codecs, unsigned authority, or claim
+  NBD FLUSH/RustFS/S3 conformance from this mechanics slice.

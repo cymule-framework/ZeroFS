@@ -1121,6 +1121,7 @@ impl ExportAuthorityStore {
         inode_store: InodeStore,
         extent_store: ExtentStore,
         lock_manager: Arc<crate::fs::lock_manager::KeyedLockManager<u64>>,
+        admission_locks: Arc<crate::fs::lock_manager::KeyedLockManager<String>>,
     ) -> Self {
         let server_boot_id = coordinator.export_server_boot_id().to_owned();
         Self {
@@ -1130,7 +1131,7 @@ impl ExportAuthorityStore {
             extent_store,
             lock_manager,
             server_boot_id,
-            admission_locks: Arc::new(crate::fs::lock_manager::KeyedLockManager::new()),
+            admission_locks,
             profile_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             process_guard: Arc::new(std::sync::Mutex::new(None)),
             enable_lock: Arc::new(tokio::sync::Mutex::new(())),

@@ -14,6 +14,16 @@ pub const WORKSPACE_OPERATION_AFTER_COMMIT_BEFORE_REPLY: &str =
 pub const WORKSPACE_GENESIS_AFTER_COMMIT_BEFORE_REPLY: &str =
     "workspace_genesis_after_commit_before_reply";
 
+/// The export data/manifest cut is durable, but no immutable barrier record
+/// has been published. The claimed operation must never flush again.
+pub const WORKSPACE_BARRIER_AFTER_DATA_CUT_BEFORE_PUBLISH: &str =
+    "workspace_barrier_after_data_cut_before_publish";
+
+/// The immutable barrier record and current head are durable, but the caller
+/// did not observe the materialization response.
+pub const WORKSPACE_BARRIER_AFTER_PUBLISH_BEFORE_REPLY: &str =
+    "workspace_barrier_after_publish_before_reply";
+
 pub const FALLOCATE_AFTER_EXTENTS: &str = "fallocate_after_extents";
 pub const FALLOCATE_AFTER_INODE: &str = "fallocate_after_inode";
 pub const FALLOCATE_AFTER_COMMIT: &str = "fallocate_after_commit";

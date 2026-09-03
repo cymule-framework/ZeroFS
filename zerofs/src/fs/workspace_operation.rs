@@ -669,6 +669,25 @@ pub(crate) async fn read_operation_durable(
     Ok(WorkspaceOperationLookup::Known(record))
 }
 
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+pub(crate) async fn read_operation_current(
+    db: &Db,
+    key: &WorkspaceOperationKey,
+    request_digest: CanonicalRequestDigest,
+) -> Result<WorkspaceOperationLookup, WorkspaceOperationError> {
+    let encoded = storage_key(key)?;
+    let Some(bytes) = db
+        .get_bytes(&encoded)
+        .await
+        .map_err(|error| FsError::from_db_error(&error))?
+    else {
+        return Ok(WorkspaceOperationLookup::Unknown);
+    };
+    let record = decode_record(&encoded, &bytes)?;
+    ensure_digest(&record, request_digest)?;
+    Ok(WorkspaceOperationLookup::Known(record))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

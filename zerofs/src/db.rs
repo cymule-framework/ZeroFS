@@ -513,6 +513,17 @@ impl Db {
         ))
     }
 
+    /// Coherent post-flush identity of the object-store-visible manifest cut.
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    pub(crate) fn rhizome_barrier_durability_snapshot(&self) -> Option<(u64, u64, u64)> {
+        let snapshot = self.status.as_ref()?.borrow();
+        Some((
+            snapshot.current_manifest.writer_epoch(),
+            snapshot.current_manifest.id(),
+            snapshot.durable_seq,
+        ))
+    }
+
     /// Attach the HA leader lease; reads/writes are then refused while it is
     /// invalid. Single-node `Db`s have no lease and are never gated.
     pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {

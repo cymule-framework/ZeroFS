@@ -219,12 +219,22 @@ impl ZeroFS {
             db.clone(),
             write_coordinator.clone(),
         );
+        #[cfg(feature = "rhizome-export-authority-core")]
+        let export_admission_locks =
+            Arc::new(crate::fs::lock_manager::KeyedLockManager::<String>::new());
         #[cfg(feature = "rhizome-workspace-genesis-core")]
         let workspace_genesis = crate::fs::workspace_genesis::WorkspaceGenesisStore::new(
             db.clone(),
             write_coordinator.clone(),
             workspace_operations.clone(),
             object_store.clone(),
+        );
+        #[cfg(feature = "rhizome-workspace-barrier-core")]
+        let workspace_barriers = crate::fs::workspace_barrier::WorkspaceBarrierStore::new(
+            db.clone(),
+            write_coordinator.clone(),
+            workspace_operations.clone(),
+            export_admission_locks.clone(),
         );
         #[cfg(feature = "rhizome-export-authority-core")]
         let export_authority = crate::fs::export_authority::ExportAuthorityStore::new(
@@ -233,6 +243,7 @@ impl ZeroFS {
             inode_store.clone(),
             extent_store.clone(),
             lock_manager.clone(),
+            export_admission_locks,
         );
 
         // Route the data plane's GC/compaction seg-count txns through the single
@@ -262,6 +273,8 @@ impl ZeroFS {
             workspace_operations,
             #[cfg(feature = "rhizome-workspace-genesis-core")]
             workspace_genesis,
+            #[cfg(feature = "rhizome-workspace-barrier-core")]
+            workspace_barriers,
             #[cfg(feature = "rhizome-export-authority-core")]
             export_authority,
             ignore_fsync,

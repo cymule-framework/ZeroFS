@@ -34,6 +34,13 @@ use crate::fs::key_codec::ExportBindingMetadataKey;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+use crate::fs::workspace_barrier::{
+    BarrierDurabilityReceipt, BarrierError, WorkspaceBarrierRequest, authority_matches,
+    claim_matches, decode_barrier_record, decode_head_record, encode_barrier_record,
+    encode_head_record, genesis_matches, head_digest, initial_head, next_head, receipt_digest,
+    validate_command, validate_receipt,
+};
 #[cfg(feature = "rhizome-workspace-genesis-core")]
 use crate::fs::workspace_genesis::{
     GenesisDomainRecord, GenesisDurabilityReceipt, GenesisError, WorkspaceGenesisRejectionRequest,
@@ -110,6 +117,12 @@ enum Request {
         oneshot::Sender<
             Result<crate::fs::workspace_operation::WorkspaceOperationRecord, GenesisError>,
         >,
+    ),
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    WorkspaceBarrier(
+        WorkspaceBarrierRequest,
+        ExportAdmissionGuard,
+        oneshot::Sender<Result<BarrierDurabilityReceipt, BarrierError>>,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
     #[cfg_attr(
@@ -206,6 +219,10 @@ struct WorkspaceDurableTestHook {
     drop_next_reply: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
     fail_next_genesis_before_write: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    fail_next_barrier_before_publish: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    drop_next_barrier_reply: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
     pause_export_after_permit: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
@@ -421,6 +438,21 @@ impl WriteCoordinator {
         reply_rx
             .await
             .map_err(|_| GenesisError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    pub(super) async fn materialize_workspace_barrier(
+        &self,
+        request: WorkspaceBarrierRequest,
+        guard: ExportAdmissionGuard,
+    ) -> Result<BarrierDurabilityReceipt, BarrierError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::WorkspaceBarrier(request, guard, reply_tx))
+            .map_err(|_| BarrierError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| BarrierError::CommitOutcomeUnknown)?
     }
 
     #[cfg(feature = "rhizome-workspace-genesis-core")]
@@ -771,6 +803,20 @@ impl WriteCoordinator {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    pub(crate) fn dst_fail_next_barrier_before_publish(&self) {
+        self.workspace_durable_test_hook
+            .fail_next_barrier_before_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    pub(crate) fn dst_drop_next_barrier_reply(&self) {
+        self.workspace_durable_test_hook
+            .drop_next_barrier_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Wait until every commit submitted before this call has finished,
     /// including publication of its in-memory statistics.
     #[cfg(any(test, dst))]
@@ -942,6 +988,21 @@ async fn worker_loop(
             let _ = reply.send(result);
             continue;
         }
+        #[cfg(feature = "rhizome-workspace-barrier-core")]
+        if let Request::WorkspaceBarrier(request, _guard, reply) = first {
+            let result = commit_workspace_barrier(&mut ctx, request).await;
+            #[cfg(test)]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_barrier_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
         #[cfg(feature = "rhizome-export-authority-core")]
         if let Request::ExportAuthority(transition, _guard, reply) = first {
             let result = commit_export_authority_transition(&mut ctx, transition).await;
@@ -1066,6 +1127,8 @@ async fn worker_loop(
             Request::WorkspaceGenesis(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-workspace-genesis-core")]
             Request::WorkspaceGenesisRejection(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-workspace-barrier-core")]
+            Request::WorkspaceBarrier(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::ExportMutation(txn, context, reply) => {
                 let durable = context.kind.requires_durability();
@@ -1135,6 +1198,11 @@ async fn worker_loop(
                 #[cfg(feature = "rhizome-workspace-genesis-core")]
                 Request::WorkspaceGenesisRejection(request, reply) => {
                     pending = Some(Request::WorkspaceGenesisRejection(request, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-workspace-barrier-core")]
+                Request::WorkspaceBarrier(request, guard, reply) => {
+                    pending = Some(Request::WorkspaceBarrier(request, guard, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1701,6 +1769,282 @@ async fn worker_loop(
             let _ = reply.send(result);
         }
     }
+}
+
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+async fn commit_workspace_barrier(
+    ctx: &mut WorkerContext,
+    request: WorkspaceBarrierRequest,
+) -> Result<BarrierDurabilityReceipt, BarrierError> {
+    use crate::fs::workspace_operation::{
+        WorkspaceOperationKey, WorkspaceOperationLookup, WorkspaceOperationState,
+    };
+
+    if ctx.replicator.is_some() {
+        return Err(BarrierError::Storage);
+    }
+    validate_command(&request.command)?;
+    let operation = &request.command.operation;
+    if !claim_matches(&request.effect_claim, &request.command, &request.barrier_id) {
+        return Err(BarrierError::Invalid);
+    }
+
+    let durable_operation = crate::fs::workspace_operation::read_operation_durable(
+        &ctx.db,
+        operation,
+        request.command.request_digest,
+    )
+    .await
+    .map_err(BarrierError::from)?;
+    let WorkspaceOperationLookup::Known(durable_operation) = durable_operation else {
+        return Err(BarrierError::CommitOutcomeUnknown);
+    };
+    if durable_operation.state
+        != WorkspaceOperationState::EffectDispatched(request.effect_claim.clone())
+    {
+        return Err(BarrierError::Conflict);
+    }
+
+    let codec = KeyCodec::new();
+    let barrier_key =
+        codec.workspace_barrier_record_key(&operation.workspace_id, &operation.request_id);
+    if let Some(bytes) = ctx
+        .db
+        .get_bytes_durable(&barrier_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+    {
+        let receipt = decode_barrier_record(&barrier_key, &bytes)?;
+        crate::fs::workspace_barrier::ensure_receipt_matches_command(&receipt, &request.command)?;
+        if receipt.effect_claim != request.effect_claim || receipt.barrier_id != request.barrier_id
+        {
+            return Err(BarrierError::Conflict);
+        }
+        return Ok(receipt);
+    }
+
+    let guarded_shard = ctx
+        .export_storage_shard_id
+        .get()
+        .ok_or(BarrierError::Storage)?;
+    if guarded_shard.as_ref() != request.command.storage_shard_id {
+        return Err(BarrierError::Conflict);
+    }
+    let authority_key = codec.export_authority_key(&operation.workspace_id);
+    let authority = read_record_current(&ctx.db, &authority_key, &operation.workspace_id)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Conflict)?;
+    let included_write_sequence = authority_matches(
+        &authority,
+        &request.command,
+        &ctx.export_server_boot_id,
+        authority_now(&ctx.authority_time_floor),
+    )?;
+    validate_physical_export(&ctx.db, &codec, &request.command.token.export)
+        .await
+        .map_err(|_| BarrierError::Corrupt)?;
+    let genesis =
+        crate::fs::workspace_genesis::read_record_current(&ctx.db, &operation.workspace_id)
+            .await
+            .map_err(|_| BarrierError::Storage)?
+            .ok_or(BarrierError::Corrupt)?;
+    genesis_matches(&genesis, &request.command)?;
+
+    let head_key = codec.workspace_head_key(&operation.workspace_id);
+    let previous_bytes = ctx
+        .db
+        .get_bytes_durable(&head_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?;
+    let previous = match previous_bytes.as_deref() {
+        Some(bytes) => decode_head_record(&head_key, bytes)?,
+        None => initial_head(&genesis),
+    };
+    if head_digest(&previous.head) != request.command.expected_head_digest {
+        return Err(BarrierError::Conflict);
+    }
+    if let (Some(request_id), Some(request_digest)) = (
+        previous.last_barrier_request_id.as_ref(),
+        previous.last_barrier_request_digest,
+    ) {
+        let prior = crate::fs::workspace_operation::read_operation_durable(
+            &ctx.db,
+            &WorkspaceOperationKey::new(
+                operation.workspace_id.clone(),
+                crate::fs::workspace_barrier::CREATE_BARRIER_KIND,
+                request_id.clone(),
+            ),
+            crate::fs::workspace_operation::CanonicalRequestDigest::new(request_digest),
+        )
+        .await
+        .map_err(BarrierError::from)?;
+        let WorkspaceOperationLookup::Known(prior) = prior else {
+            return Err(BarrierError::Corrupt);
+        };
+        if !matches!(prior.state, WorkspaceOperationState::Succeeded(_)) {
+            return Err(BarrierError::Conflict);
+        }
+    }
+
+    // This is the single data cut. Segment sealing finishes before the
+    // manifest PUT, and the returned status snapshot names that exact durable
+    // manifest. No retry is permitted after the durable dispatch claim.
+    ctx.flush_coordinator
+        .flush()
+        .await
+        .map_err(|_| BarrierError::CommitOutcomeUnknown)?;
+    let (writer_epoch, manifest_id, durable_sequence) = ctx
+        .db
+        .rhizome_barrier_durability_snapshot()
+        .ok_or(BarrierError::Storage)?;
+    if writer_epoch == 0 || manifest_id == 0 || durable_sequence == 0 {
+        return Err(BarrierError::CommitOutcomeUnknown);
+    }
+    #[cfg(feature = "failpoints")]
+    crate::failpoints::fail_point!(
+        crate::failpoints::WORKSPACE_BARRIER_AFTER_DATA_CUT_BEFORE_PUBLISH,
+        |_| Err(BarrierError::CommitOutcomeUnknown)
+    );
+    #[cfg(test)]
+    if ctx
+        .workspace_durable_test_hook
+        .fail_next_barrier_before_publish
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(BarrierError::CommitOutcomeUnknown);
+    }
+
+    // The per-Workspace admission guard is still held by this coordinator
+    // request, so no authority transition or mutation can move the cut.
+    let current_authority = read_record_current(&ctx.db, &authority_key, &operation.workspace_id)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Conflict)?;
+    let current_sequence = authority_matches(
+        &current_authority,
+        &request.command,
+        &ctx.export_server_boot_id,
+        authority_now(&ctx.authority_time_floor),
+    )?;
+    if current_sequence != included_write_sequence || current_authority != authority {
+        return Err(BarrierError::Conflict);
+    }
+    let next = next_head(
+        &previous,
+        &request.command,
+        included_write_sequence,
+        writer_epoch,
+        manifest_id,
+        durable_sequence,
+    )?;
+    let (committed_at_unix_seconds, committed_at_nanos) = crate::fs::get_current_time();
+    let mut receipt = BarrierDurabilityReceipt {
+        workspace_id: operation.workspace_id.clone(),
+        request_id: operation.request_id.clone(),
+        request_digest: *request.command.request_digest.as_bytes(),
+        effect_claim: request.effect_claim,
+        token: request.command.token.clone(),
+        expected_head_digest: request.command.expected_head_digest,
+        head: next.head.clone(),
+        barrier_id: request.barrier_id,
+        included_write_sequence,
+        zerofs_writer_epoch: writer_epoch,
+        zerofs_manifest_id: manifest_id,
+        zerofs_durable_sequence: durable_sequence,
+        storage_shard_id: request.command.storage_shard_id.clone(),
+        storage_routing_revision: request.command.storage_routing_revision,
+        committed_at_unix_seconds,
+        committed_at_nanos,
+        receipt_digest: [0; 32],
+    };
+    receipt.receipt_digest = receipt_digest(&receipt);
+    validate_receipt(&receipt)?;
+
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| BarrierError::Storage)?;
+    let current_operation = crate::fs::workspace_operation::read_operation_current(
+        &ctx.db,
+        operation,
+        request.command.request_digest,
+    )
+    .await
+    .map_err(BarrierError::from)?;
+    let WorkspaceOperationLookup::Known(current_operation) = current_operation else {
+        return Err(BarrierError::Corrupt);
+    };
+    if current_operation != durable_operation {
+        return Err(BarrierError::Conflict);
+    }
+    let current_head_bytes = ctx
+        .db
+        .get_bytes(&head_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?;
+    match (current_head_bytes.as_deref(), previous_bytes.as_deref()) {
+        (None, None) => {}
+        (Some(current), Some(durable)) if current == durable => {}
+        _ => return Err(BarrierError::Conflict),
+    }
+    let current_authority = read_record_current(&ctx.db, &authority_key, &operation.workspace_id)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Conflict)?;
+    if authority_matches(
+        &current_authority,
+        &request.command,
+        &ctx.export_server_boot_id,
+        authority_now(&ctx.authority_time_floor),
+    )? != included_write_sequence
+        || current_authority != authority
+    {
+        return Err(BarrierError::Conflict);
+    }
+    validate_physical_export(&ctx.db, &codec, &request.command.token.export)
+        .await
+        .map_err(|_| BarrierError::Corrupt)?;
+
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(head_key.clone(), encode_head_record(&head_key, &next)?);
+    batch.put_bytes(
+        barrier_key.clone(),
+        encode_barrier_record(&barrier_key, &receipt)?,
+    );
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| BarrierError::CommitOutcomeUnknown)?;
+    ctx.flush_coordinator
+        .flush()
+        .await
+        .map_err(|_| BarrierError::CommitOutcomeUnknown)?;
+
+    let durable_receipt = ctx
+        .db
+        .get_bytes_durable(&barrier_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::CommitOutcomeUnknown)
+        .and_then(|bytes| decode_barrier_record(&barrier_key, &bytes))?;
+    let durable_head = ctx
+        .db
+        .get_bytes_durable(&head_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::CommitOutcomeUnknown)
+        .and_then(|bytes| decode_head_record(&head_key, &bytes))?;
+    if durable_receipt != receipt || durable_head != next {
+        return Err(BarrierError::Corrupt);
+    }
+    #[cfg(feature = "failpoints")]
+    crate::failpoints::fail_point!(
+        crate::failpoints::WORKSPACE_BARRIER_AFTER_PUBLISH_BEFORE_REPLY,
+        |_| Err(BarrierError::CommitOutcomeUnknown)
+    );
+    Ok(receipt)
 }
 
 #[cfg(feature = "rhizome-workspace-genesis-core")]

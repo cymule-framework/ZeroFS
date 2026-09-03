@@ -32,6 +32,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p zerofs --features rhizome-export-authority-core --all-targets -- -D warnings
       - run: cargo clippy -p zerofs --features rhizome-workspace-genesis-core --all-targets -- -D warnings
+      - run: cargo clippy -p zerofs --features rhizome-workspace-barrier-core --all-targets -- -D warnings
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy --test dst -- -D warnings
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy -p zerofs --features rhizome-export-authority-core --test dst -- -D warnings
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy -p zerofs --features rhizome-workspace-genesis-core --test dst -- -D warnings
@@ -53,6 +54,7 @@ jobs:
       - run: cargo test -p zerofs --features rhizome-workspace-genesis-core --lib fs::export_authority::tests::genesis_activation_and_nbd_claim_share_one_guarded_authority_graph
       - run: cargo test -p zerofs --features rhizome-workspace-genesis-core --lib fs::key_codec::tests::genesis_namespace_is_disjoint_from_every_nbd_authority_subtype
       - run: cargo test -p zerofs --features 'rhizome-workspace-genesis-core failpoints' --lib fs::workspace_genesis
+      - run: cargo test -p zerofs --features 'rhizome-workspace-barrier-core failpoints' --lib fs::workspace_barrier
       - run: cargo test -p zerofs-client --all-features
       - run: cargo test -p zerofs --features failpoints --lib workspace_operation
       - run: cargo test --features failpoints --test failpoints
