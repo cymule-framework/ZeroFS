@@ -1518,7 +1518,7 @@ async fn reject_bound_export_metadata_mutations(
             continue;
         };
         let is_bound = match candidate {
-            ExportBindingMetadataKey::Inode(inode) => {
+            ExportBindingMetadataKey::Inode(inode) | ExportBindingMetadataKey::Extent(inode) => {
                 if read_reverse_binding_current(db, &key_codec.export_reverse_inode_key(inode))
                     .await
                     .map_err(|_| FsError::InvalidData)?

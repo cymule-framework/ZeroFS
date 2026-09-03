@@ -212,6 +212,7 @@ pub(crate) struct ExportMutationKey<'a> {
 #[cfg(feature = "rhizome-export-authority-core")]
 pub(crate) enum ExportBindingMetadataKey {
     Inode(u64),
+    Extent(u64),
     DirectoryEntry { directory_inode: u64, name: Bytes },
 }
 
@@ -332,6 +333,9 @@ impl KeyCodec {
         &self,
         key: &Bytes,
     ) -> Option<ExportBindingMetadataKey> {
+        if let Some((inode, _)) = self.parse_extent_key_full(key) {
+            return Some(ExportBindingMetadataKey::Extent(inode));
+        }
         let kind_offset = META_DOMAIN.len();
         let id_offset = kind_offset + 1;
         if !key.starts_with(META_DOMAIN) || key.len() < id_offset + U64_SIZE {

@@ -702,8 +702,8 @@ impl ExportAuthorityStore {
         &self,
         command: ActivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
-        self.require_enabled()?;
         self.ensure_current_schema().await?;
+        self.require_enabled()?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -721,8 +721,8 @@ impl ExportAuthorityStore {
         &self,
         command: RefreshExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
-        self.require_enabled()?;
         self.ensure_current_schema().await?;
+        self.require_enabled()?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -740,8 +740,8 @@ impl ExportAuthorityStore {
         &self,
         command: DeactivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
-        self.require_enabled()?;
         self.ensure_current_schema().await?;
+        self.require_enabled()?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -759,8 +759,8 @@ impl ExportAuthorityStore {
         &self,
         command: AdvanceFence,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
-        self.require_enabled()?;
         self.ensure_current_schema().await?;
+        self.require_enabled()?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -778,6 +778,7 @@ impl ExportAuthorityStore {
         &self,
         mut mutation: ExportMutation,
     ) -> Result<ExportMutationOutcome, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
         self.require_enabled()?;
         let guard = self
             .admission_locks
@@ -3752,6 +3753,61 @@ mod tests {
                 fs.export_authority.lookup_mutation_durable(&expected).await,
                 Err(ExportAuthorityError::MigrationRequired)
             );
+            assert_eq!(
+                fs.export_authority
+                    .activate(activate_command(authority(3, 5)))
+                    .await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority
+                    .refresh(RefreshExport {
+                        workspace_id: model.workspace_id.clone(),
+                        expected_export: model.export.clone(),
+                        expected_authority: model.authority.clone(),
+                        session_id: "session-a".into(),
+                        expected_capability_id: "capability-a".into(),
+                        replacement_authority: authority(3, 6),
+                        replacement_capability_id: "capability-b".into(),
+                        replacement_expires_at_unix_millis: u64::MAX,
+                    })
+                    .await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority
+                    .deactivate(DeactivateExport {
+                        workspace_id: model.workspace_id.clone(),
+                        expected_export: model.export.clone(),
+                        expected_authority: model.authority.clone(),
+                        session_id: "session-a".into(),
+                    })
+                    .await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority
+                    .advance_fence(AdvanceFence {
+                        workspace_id: model.workspace_id.clone(),
+                        export: model.export.clone(),
+                        expected_authority: Some(model.authority.clone()),
+                        new_non_writable_authority: model.authority.clone(),
+                        reject_through_placement_epoch: model.authority.placement_epoch,
+                    })
+                    .await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority
+                    .commit_mutation(mutation_for(
+                        &model,
+                        Transaction::new(),
+                        MutationKind::Flush,
+                        80,
+                    ))
+                    .await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
         }
     }
 
@@ -3792,7 +3848,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_gate_ignores_warm_metadata_caches_and_reads_current_db_rows() {
-        for corrupt_inode in [true, false] {
+        for candidate in 0..3 {
             let fs = new_export_fs().await;
             let active = fs
                 .export_authority
@@ -3805,7 +3861,7 @@ mod tests {
                 .await
                 .unwrap();
             let mut corrupt = Transaction::new();
-            if corrupt_inode {
+            if candidate == 0 {
                 let mut inode = fs.inode_store.get(active.export.inode).await.unwrap();
                 let crate::fs::inode::Inode::File(file) = &mut inode else {
                     panic!("export must remain a file");
@@ -3815,11 +3871,16 @@ mod tests {
                     &crate::fs::key_codec::KeyCodec::new().inode_key(active.export.inode),
                     bincode::serialize(&inode).unwrap().into(),
                 );
-            } else {
+            } else if candidate == 1 {
                 corrupt.put_bytes(
                     &crate::fs::key_codec::KeyCodec::new()
                         .dir_entry_key(active.export.nbd_directory_inode, &active.export.name),
                     crate::fs::key_codec::KeyCodec::encode_dir_entry(active.export.inode + 100, 3),
+                );
+            } else {
+                corrupt.put_bytes(
+                    &crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 999),
+                    Bytes::from_static(b"raw-extent-must-not-apply"),
                 );
             }
             assert_eq!(
