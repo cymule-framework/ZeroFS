@@ -215,6 +215,11 @@ impl ZeroFS {
             db.clone(),
             write_coordinator.clone(),
         );
+        #[cfg(feature = "rhizome-export-authority-core")]
+        let export_authority = crate::fs::export_authority::ExportAuthorityStore::new(
+            db.clone(),
+            write_coordinator.clone(),
+        );
 
         // Route the data plane's GC/compaction seg-count txns through the single
         // commit worker (its sole writer). Weak, so it can't keep the worker alive.
@@ -241,6 +246,8 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             workspace_operations,
+            #[cfg(feature = "rhizome-export-authority-core")]
+            export_authority,
             ignore_fsync,
             lineage_token,
             serving_writer_epoch,

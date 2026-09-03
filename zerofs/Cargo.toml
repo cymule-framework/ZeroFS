@@ -59,6 +59,7 @@ strip = false
 
 [features]
 default = ["vendored-protoc"]
+rhizome-export-authority-core = []
 tokio-console = ["dep:console-subscriber"]
 failpoints = ["dep:fail"]
 vendored-protoc = ["dep:protobuf-src"]

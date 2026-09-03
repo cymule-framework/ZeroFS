@@ -1,4 +1,9 @@
 pub mod errors;
+#[cfg(all(feature = "rhizome-export-authority-core", not(dst)))]
+pub(crate) mod export_authority;
+#[cfg(all(feature = "rhizome-export-authority-core", dst))]
+#[doc(hidden)]
+pub mod export_authority;
 pub mod filter_policy;
 pub mod flush_coordinator;
 pub mod gc;
@@ -20,6 +25,8 @@ mod ops;
 #[cfg(test)]
 mod test_util;
 
+#[cfg(feature = "rhizome-export-authority-core")]
+use self::export_authority::ExportAuthorityStore;
 use self::flush_coordinator::FlushCoordinator;
 use self::lock_manager::KeyedLockManager;
 use self::metrics::FileSystemStats;
@@ -124,6 +131,14 @@ pub struct ZeroFS {
     /// Durable Rhizome Workspace operation intent/outcome ledger. This is an
     /// internal storage primitive; it does not execute or sign operations.
     pub workspace_operations: WorkspaceOperationLedger,
+    /// Durable per-export Rhizome authority and session state. Transitions and
+    /// fenced mutations are serialized by the single WriteCoordinator.
+    #[cfg(feature = "rhizome-export-authority-core")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified adapter wiring")
+    )]
+    pub(crate) export_authority: ExportAuthorityStore,
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
     pub ignore_fsync: bool,

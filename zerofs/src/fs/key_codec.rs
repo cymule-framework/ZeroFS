@@ -31,6 +31,7 @@ use bytes::Bytes;
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
 //   0x0A WORKSPACE_OP   Rhizome Workspace operation ledger, versioned composite key
+//   0x0B EXPORT_AUTHORITY Rhizome per-export authority/session state
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -43,7 +44,15 @@ const PREFIX_TOMBSTONE: u8 = 0x07;
 const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_WORKSPACE_OPERATION: u8 = 0x0A;
+const PREFIX_EXPORT_AUTHORITY: u8 = 0x0B;
 const PREFIX_EXTENT: u8 = 0xFE;
+
+#[cfg(feature = "rhizome-export-authority-core")]
+const EXPORT_KEY_VERSION: u8 = 1;
+#[cfg(feature = "rhizome-export-authority-core")]
+const EXPORT_AUTHORITY_SUBTYPE: u8 = 1;
+#[cfg(feature = "rhizome-export-authority-core")]
+const EXPORT_MUTATION_OUTCOME_SUBTYPE: u8 = 2;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -65,6 +74,7 @@ const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
 // orphan sweep. Persisted (not process-uptime) so the daily sweep cadence holds
 // across restarts (see gc.rs maybe_sweep_orphans).
 const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
+const SYSTEM_EXPORT_BOOT_SUBTYPE: u8 = 0x06;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -81,9 +91,14 @@ pub const EXTENT_DOMAIN: &[u8] = b"extent";
 /// manufacturing its key bytes. Add future authority-owned prefixes here when
 /// their typed commit requests are introduced.
 pub(crate) fn is_reserved_mutation_key(key: &[u8]) -> bool {
-    key.len() > META_DOMAIN.len()
-        && key.starts_with(META_DOMAIN)
-        && key[META_DOMAIN.len()] == PREFIX_WORKSPACE_OPERATION
+    if key.len() <= META_DOMAIN.len() || !key.starts_with(META_DOMAIN) {
+        return false;
+    }
+    let kind = key[META_DOMAIN.len()];
+    kind == PREFIX_WORKSPACE_OPERATION
+        || kind == PREFIX_EXPORT_AUTHORITY
+        || (kind == PREFIX_SYSTEM
+            && key.get(META_DOMAIN.len() + 1) == Some(&SYSTEM_EXPORT_BOOT_SUBTYPE))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,6 +197,63 @@ pub struct KeyCodec;
 impl KeyCodec {
     pub fn new() -> Self {
         Self
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_authority_key(&self, workspace_id: &str) -> Bytes {
+        let bytes = workspace_id.as_bytes();
+        let len = u16::try_from(bytes.len()).expect("validated Workspace id fits u16");
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + 2 + bytes.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_AUTHORITY_SUBTYPE);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(bytes);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_mutation_outcome_key(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        operation_id: [u8; 32],
+    ) -> Bytes {
+        let workspace = workspace_id.as_bytes();
+        let session = session_id.as_bytes();
+        let workspace_len =
+            u16::try_from(workspace.len()).expect("validated Workspace id fits u16");
+        let session_len = u16::try_from(session.len()).expect("validated session id fits u16");
+        let mut key = Vec::with_capacity(
+            META_DOMAIN.len()
+                + 1
+                + 1
+                + 1
+                + 2
+                + workspace.len()
+                + 2
+                + session.len()
+                + operation_id.len(),
+        );
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_MUTATION_OUTCOME_SUBTYPE);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace);
+        key.extend_from_slice(&session_len.to_be_bytes());
+        key.extend_from_slice(session);
+        key.extend_from_slice(&operation_id);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_boot_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_EXPORT_BOOT_SUBTYPE);
+        Bytes::from(key)
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
@@ -687,11 +759,18 @@ mod tests {
         let codec = KeyCodec::new();
         let ledger = codec.workspace_operation_key(1, b"workspace-a", 10, b"request-a");
         assert!(is_reserved_mutation_key(&ledger));
+        #[cfg(feature = "rhizome-export-authority-core")]
+        assert!(is_reserved_mutation_key(
+            &codec.export_authority_key("workspace-a")
+        ));
+        #[cfg(feature = "rhizome-export-authority-core")]
+        assert!(is_reserved_mutation_key(&codec.export_boot_key()));
 
         assert!(!is_reserved_mutation_key(META_DOMAIN));
         assert!(!is_reserved_mutation_key(b"met"));
         assert!(!is_reserved_mutation_key(b"metadata\x0a"));
         assert!(!is_reserved_mutation_key(&codec.inode_key(1)));
+        assert!(!is_reserved_mutation_key(&codec.system_counter_key()));
         assert!(!is_reserved_mutation_key(&codec.extent_key(1, 0)));
     }
 

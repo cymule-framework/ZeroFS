@@ -291,3 +291,11 @@ fn same_seed_same_digest() {
         );
     }
 }
+
+#[cfg(feature = "rhizome-export-authority-core")]
+#[test]
+fn export_authority_transition_model() {
+    for seed in [1, 3, 17, 101, 65_537, u32::MAX as u64] {
+        zerofs::fs::export_authority::dst_export_authority_model(seed);
+    }
+}

@@ -185,6 +185,43 @@ impl Transaction {
         self.dedup_entry.take()
     }
 
+    #[cfg(feature = "rhizome-export-authority-core")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) fn validate_export_scope(
+        &self,
+        export_inode: u64,
+    ) -> Result<(), crate::fs::export_authority::ExportAuthorityError> {
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let inode_key = codec.inode_key(export_inode);
+        let is_export_extent = |key: &[u8]| {
+            codec
+                .parse_extent_key_full(key)
+                .is_some_and(|(inode, _)| inode == export_inode)
+        };
+        let keys_are_scoped = self.ops.iter().all(|operation| match operation {
+            TxOp::Put(key, _) => key == &inode_key || is_export_extent(key),
+            TxOp::Delete(key) => is_export_extent(key),
+        });
+        let metadata_is_scoped = self
+            .inode_cache_invalidations
+            .iter()
+            .all(|inode| *inode == export_inode)
+            && self.directory_entry_cache_invalidations.is_empty()
+            && self
+                .stats_deltas
+                .iter()
+                .all(|delta| delta.inode_id == export_inode)
+            && self.dedup_entry.is_none();
+        if keys_are_scoped && metadata_is_scoped {
+            Ok(())
+        } else {
+            Err(crate::fs::export_authority::ExportAuthorityError::Invalid)
+        }
+    }
+
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
         self.ops.push(TxOp::Put(key.clone(), value));
     }
@@ -736,6 +773,23 @@ impl Db {
             return Err(FsError::ReadOnlyFilesystem);
         }
         Ok(Transaction::new())
+    }
+
+    /// Test-only simulation of another writer superseding a reserved authority
+    /// key while the current coordinator is paused after admission.
+    #[cfg(all(test, feature = "rhizome-export-authority-core"))]
+    pub(crate) async fn inject_reserved_authority_value_for_test(
+        &self,
+        key: Bytes,
+        value: Bytes,
+    ) -> Result<u64> {
+        assert!(crate::fs::key_codec::is_reserved_mutation_key(&key));
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(key, value);
+        self.acquire_write_permit()
+            .await?
+            .write_with_options(batch, &WriteOptions::default())
+            .await
     }
 
     pub(crate) async fn put_with_options(
