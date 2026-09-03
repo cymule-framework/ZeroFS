@@ -262,3 +262,8 @@ attribution intact.
   until ADR-0005 registers the barrier command/receipt and official Go/Rust
   fixtures. Do not expose RPCs, protobuf codecs, unsigned authority, or claim
   NBD FLUSH/RustFS/S3 conformance from this mechanics slice.
+- The ignored Foundation RustFS barrier test is a clean-close/cold-reopen smoke
+  only. It must use a fresh empty `rhizome/zerofs-barrier/` prefix, standard AWS
+  credential environment, process-scoped TLS trust, exact-prefix cleanup, and
+  an empty final inventory. Never cite it as SIGKILL, response-loss, NBD,
+  Firecracker, production signer, or external-S3 qualification.

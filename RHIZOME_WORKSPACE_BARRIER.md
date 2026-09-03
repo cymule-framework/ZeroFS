@@ -118,3 +118,24 @@ qualified long-term scale shape. Before enabling the feature in production,
 replace it with an immutable verified-summary/checkpoint scheme that preserves
 the same corruption and fork detection; do not weaken closure or impose a
 product-visible barrier-count limit as a shortcut.
+
+## Explicit real-S3 smoke entrypoint
+
+The ignored unit test
+`fs::workspace_barrier::tests::foundation_rustfs_clean_reopen_smoke` is the
+only real-S3 entrypoint in this candidate. It requires a fresh empty prefix in
+`RHIZOME_BARRIER_S3_PREFIX` under `rhizome/zerofs-barrier/`, a bucket in
+`RHIZOME_BARRIER_S3_BUCKET`, and endpoint/region/credentials through the
+object_store standard `AWS_*` environment. TLS trust remains process-scoped.
+
+The test prefixes every SlateDB, segment, and Genesis object, refuses a nonempty
+prefix, runs Genesis -> Activate -> Barrier -> signed-test-terminal -> clean
+close/cold reopen/exact readback, emits only non-secret cut identities, deletes
+only the objects visible through that exact prefix wrapper, and requires the
+post-run listing to be empty. It is deliberately ignored in ordinary CI and
+must be invoked only by an operator-controlled conformance run.
+
+Even when it passes against RustFS, this test proves only a clean-close/cold-
+reopen integration smoke for that exact endpoint and prefix. It contains no
+SIGKILL, power-loss, response-loss, NBD, Firecracker, production capability, or
+signed receipt evidence and must not be cited for those properties.

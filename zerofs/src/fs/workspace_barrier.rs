@@ -1104,7 +1104,8 @@ mod tests {
         block_transformer::ZeroFsBlockTransformer, config::CompressionConfig, db::SlateDbHandle,
         frame_codec::FrameCodec,
     };
-    use slatedb::object_store::{ObjectStore, path::Path};
+    use futures::TryStreamExt;
+    use slatedb::object_store::{ObjectStore, ObjectStoreExt, path::Path};
     use slatedb::{BlockTransformer, DbBuilder};
 
     async fn active_workspace() -> (ZeroFS, MutationFenceToken, GenesisDomainRecord) {
@@ -1700,6 +1701,102 @@ mod tests {
         assert_eq!(
             fs.workspace_barriers.lookup_materialized(&command).await,
             Err(BarrierError::Corrupt)
+        );
+    }
+
+    fn validate_conformance_prefix(prefix: &str) {
+        assert!(prefix.starts_with("rhizome/zerofs-barrier/"));
+        assert!(!prefix.ends_with('/'));
+        assert!(!prefix.contains(".."));
+        assert!(prefix.len() <= 200);
+        assert!(prefix.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'/' | b'-')
+        }));
+    }
+
+    async fn listed_objects(store: &Arc<dyn ObjectStore>) -> Vec<Path> {
+        store
+            .list(None)
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    /// Explicitly invoked against the retained Foundation RustFS endpoint.
+    /// This is a clean-close/cold-reopen smoke, not a SIGKILL or response-loss
+    /// qualification. Credentials remain in the object_store standard AWS
+    /// environment chain and are never printed.
+    #[ignore = "requires an explicitly configured isolated S3/RustFS prefix"]
+    #[tokio::test]
+    async fn foundation_rustfs_clean_reopen_smoke() {
+        let bucket = std::env::var("RHIZOME_BARRIER_S3_BUCKET").unwrap();
+        let prefix = std::env::var("RHIZOME_BARRIER_S3_PREFIX").unwrap();
+        validate_conformance_prefix(&prefix);
+        let raw = slatedb::object_store::aws::AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_virtual_hosted_style_request(false)
+            .build()
+            .unwrap();
+        let prefixed: Arc<dyn ObjectStore> = Arc::new(
+            slatedb::object_store::prefix::PrefixStore::new(raw, Path::from(prefix.clone())),
+        );
+        assert!(
+            listed_objects(&prefixed).await.is_empty(),
+            "conformance prefix must be empty before the run"
+        );
+
+        let fs = open_persistent(prefixed.clone()).await;
+        let (fs, token, genesis) = initialize_active(fs).await;
+        let command = command(
+            "barrier-foundation-rustfs",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let receipt = materialize(&fs, command.clone()).await;
+        complete_barrier(&fs, command.clone(), receipt.clone()).await;
+        fs.flush_coordinator.close().await.unwrap();
+        drop(fs);
+
+        let reopened = open_persistent(prefixed.clone()).await;
+        assert_eq!(
+            reopened
+                .workspace_barriers
+                .lookup_materialized(&command)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        reopened.flush_coordinator.close().await.unwrap();
+        drop(reopened);
+
+        println!(
+            "RHIZOME_BARRIER_SMOKE prefix={} writer_epoch={} manifest_id={} durable_sequence={} included_write_sequence={} workspace_version={} head_digest={} receipt_digest={}",
+            prefix,
+            receipt.zerofs_writer_epoch,
+            receipt.zerofs_manifest_id,
+            receipt.zerofs_durable_sequence,
+            receipt.included_write_sequence,
+            receipt.head.workspace_version,
+            lower_hex(&head_digest(&receipt.head).0),
+            lower_hex(&receipt.receipt_digest),
+        );
+
+        for object in listed_objects(&prefixed).await {
+            prefixed.delete(&object).await.unwrap();
+        }
+        assert!(
+            listed_objects(&prefixed).await.is_empty(),
+            "conformance prefix must be empty after exact cleanup"
         );
     }
 
