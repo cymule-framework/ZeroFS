@@ -307,3 +307,11 @@ fn workspace_genesis_codec_model() {
         zerofs::fs::workspace_genesis::dst_workspace_genesis_codec_model(seed);
     }
 }
+
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+#[test]
+fn workspace_barrier_codec_model() {
+    for seed in 0..128 {
+        zerofs::fs::workspace_barrier::dst_workspace_barrier_codec_model(seed);
+    }
+}

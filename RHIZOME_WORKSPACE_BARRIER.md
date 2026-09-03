@@ -38,11 +38,16 @@ flush again and never manufacture a different cut. This deliberately accepts a
 fail-closed liveness gap rather than making two possible barrier effects share
 one operation identity.
 
+Genesis atomically publishes the version-1 current head plus its immutable
+version row. A missing initial/current/version row is corruption; barrier code
+never falls back to rebuilding a new chain from Genesis.
+
 After the data cut, the same per-Workspace admission guard still excludes every
 authority transition and export mutation. The sole WriteCoordinator atomically
 publishes:
 
-- one immutable barrier record keyed by Workspace plus request ID; and
+- one immutable barrier record keyed by Workspace plus request ID;
+- the successor immutable versioned head; and
 - the successor current Workspace head.
 
 Both live under the reserved `meta + 0x0D` namespace. General transactions,
@@ -60,7 +65,10 @@ coordinator-assigned included write sequence, SlateDB writer epoch, manifest ID,
 remote-durable sequence, guarded storage shard, routing revision, and commit
 time. A domain-separated digest covers all of those fields.
 
-The initial head is derived only from the immutable Genesis record. Each
+The initial head is derived only from the immutable Genesis record. Readback
+walks the durable version chain and requires every versioned head, predecessor
+receipt, and 0x0A terminal/claim relationship to close exactly. Head-only,
+receipt-only, missing-predecessor, or forked version graphs fail closed. Each
 successor tail-chain digest commits to the complete prior head digest, canonical
 barrier command, included export sequence, writer epoch, manifest ID, and
 durable sequence. A later barrier is rejected until the prior head's 0x0A
@@ -78,8 +86,10 @@ authority chain.
 - Cold reopen can read the immutable materialized cut without adopting the old
   server boot or authorizing a mutation.
 - A stale placement epoch, different session/process boot, replaced physical
-  export, different shard/routing revision, or wrong expected head fails before
-  0x0D publication.
+  export, missing/mismatched reverse binding, different shard/routing revision,
+  or wrong expected head fails before 0x0D publication. The durable guarded
+  process boot, both reverse bindings, physical export, immutable Genesis, and
+  complete authority/session are re-read at the final write permit.
 - The authority profile remains unsupported with ZeroFS HA because ordered
   standby application/readback for these authority records is not implemented.
 
@@ -87,10 +97,12 @@ authority chain.
 
 The feature suite exercises exact manifest/cut publication, coordinator export
 sequence inclusion, two successive heads, stale-epoch rejection, response-loss
-readback, no-repeat behavior after an unknown post-flush outcome, cold SlateDB
-reopen, full-record corruption/key-binding checks, and reserved-namespace
+readback, no-repeat behavior after an unknown post-flush outcome, clean cold
+SlateDB reopen, process-boot replacement at the final permit, reverse-binding
+loss, closed head/receipt/predecessor graphs, caller cancellation with guard
+retention, full-record corruption/key-binding checks, and reserved-namespace
 firewalls. Dedicated process-isolated failpoints cover both sides of 0x0D
-publication.
+publication. Clean close/reopen is not SIGKILL evidence.
 
 This candidate does **not** expose `CreateExportBarrier`, verify a capability,
 sign or verify COSE, emit protobuf, implement a production S3 credential path,

@@ -244,13 +244,20 @@ attribution intact.
   under the shared per-Workspace export admission guard and sole
   WriteCoordinator. Never add a second head writer or assemble the cut from
   separate status reads.
-- `meta + 0x0D` stores only the current Workspace head and immutable barrier
-  materialization records. It is reserved from every general/raw write path and
-  is not another operation lifecycle; signed terminal bytes remain in 0x0A.
+- `meta + 0x0D` stores only the current Workspace head, immutable versioned
+  heads, and immutable barrier materialization records. Genesis must atomically
+  publish version 1. Every read/extension must close the durable
+  current/version/receipt/0x0A chain; never reconstruct a missing head from
+  Genesis. The namespace is reserved from every general/raw write path and is
+  not another operation lifecycle; signed terminal bytes remain in 0x0A.
 - The successor head must bind the complete prior head digest, canonical
   barrier command, coordinator-assigned included export sequence, writer epoch,
   exact SlateDB manifest ID, and remote-durable sequence. A later barrier is
   blocked until the prior head's 0x0A operation is terminal SUCCEEDED.
+- Revalidate the durable process boot, complete authority/session, both reverse
+  bindings, physical export, and immutable Genesis shard/routing at the final
+  write permit. An in-memory server boot comparison or attach-time check is not
+  sufficient fencing.
 - The production verified-input and signed-terminal constructors remain absent
   until ADR-0005 registers the barrier command/receipt and official Go/Rust
   fixtures. Do not expose RPCs, protobuf codecs, unsigned authority, or claim

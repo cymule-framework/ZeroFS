@@ -74,6 +74,8 @@ const NBD_CONNECTION_RESERVATION_SUBTYPE: u8 = 8;
 const WORKSPACE_HEAD_SUBTYPE: u8 = 1;
 #[cfg(feature = "rhizome-workspace-barrier-core")]
 const WORKSPACE_BARRIER_SUBTYPE: u8 = 2;
+#[cfg(feature = "rhizome-workspace-barrier-core")]
+const WORKSPACE_HEAD_VERSION_SUBTYPE: u8 = 3;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -258,6 +260,26 @@ impl KeyCodec {
         request_id: &str,
     ) -> Bytes {
         self.workspace_barrier_key(WORKSPACE_BARRIER_SUBTYPE, workspace_id, Some(request_id))
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    pub(crate) fn workspace_head_version_key(
+        &self,
+        workspace_id: &str,
+        workspace_version: u64,
+    ) -> Bytes {
+        let workspace = workspace_id.as_bytes();
+        let workspace_len =
+            u16::try_from(workspace.len()).expect("validated Workspace id fits u16");
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + 2 + workspace.len() + 8);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_BARRIER);
+        key.push(1);
+        key.push(WORKSPACE_HEAD_VERSION_SUBTYPE);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace);
+        key.extend_from_slice(&workspace_version.to_be_bytes());
+        Bytes::from(key)
     }
 
     #[cfg(feature = "rhizome-workspace-barrier-core")]

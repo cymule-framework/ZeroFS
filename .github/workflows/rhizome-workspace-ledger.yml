@@ -36,6 +36,7 @@ jobs:
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy --test dst -- -D warnings
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy -p zerofs --features rhizome-export-authority-core --test dst -- -D warnings
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy -p zerofs --features rhizome-workspace-genesis-core --test dst -- -D warnings
+      - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy -p zerofs --features rhizome-workspace-barrier-core --test dst -- -D warnings
 
   tests:
     name: Rust 1.98 full and failpoint tests
@@ -73,4 +74,5 @@ jobs:
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test --test dst
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test -p zerofs --features rhizome-export-authority-core --test dst export_authority_transition_model
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test -p zerofs --features rhizome-workspace-genesis-core --test dst workspace_genesis_codec_model
+      - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test -p zerofs --features rhizome-workspace-barrier-core --test dst workspace_barrier_codec_model
       - run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test --features failpoints --test dst crash_points

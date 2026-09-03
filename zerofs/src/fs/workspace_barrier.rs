@@ -328,27 +328,40 @@ impl WorkspaceBarrierStore {
             .await
             .map_err(|_| BarrierError::Storage)?
         else {
-            return Ok(None);
+            let genesis = read_durable_genesis(&self.db, &command.operation.workspace_id).await?;
+            read_closed_head_graph(&self.db, &genesis, true).await?;
+            return match self
+                .operations
+                .lookup(&command.operation, command.request_digest)
+                .await?
+            {
+                WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                    state: WorkspaceOperationState::Succeeded(_),
+                    ..
+                }) => Err(BarrierError::Corrupt),
+                _ => Ok(None),
+            };
         };
         let receipt = decode_barrier_record(&key, &bytes)?;
         ensure_receipt_matches_command(&receipt, command)?;
-        let operation = self
-            .operations
-            .lookup(&command.operation, command.request_digest)
-            .await?;
-        match operation {
-            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
-                state: WorkspaceOperationState::EffectDispatched(claim),
-                ..
-            }) if claim == receipt.effect_claim => {}
-            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
-                state: WorkspaceOperationState::Succeeded(_),
-                ..
-            }) => {}
-            _ => return Err(BarrierError::Corrupt),
-        }
+        let genesis = read_durable_genesis(&self.db, &command.operation.workspace_id).await?;
+        let current = read_closed_head_graph(&self.db, &genesis, true).await?;
+        validate_receipt_in_head_graph(&self.db, &receipt, &current).await?;
         Ok(Some(receipt))
     }
+}
+
+async fn read_durable_genesis(
+    db: &Db,
+    workspace_id: &str,
+) -> Result<GenesisDomainRecord, BarrierError> {
+    let key = KeyCodec::new().workspace_genesis_key(workspace_id);
+    let bytes = db
+        .get_bytes_durable(&key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Corrupt)?;
+    crate::fs::workspace_genesis::decode_record(&key, &bytes).map_err(|_| BarrierError::Corrupt)
 }
 
 pub(crate) fn validate_command(command: &BarrierCommand) -> Result<(), BarrierError> {
@@ -512,6 +525,129 @@ pub(crate) fn initial_head(genesis: &GenesisDomainRecord) -> WorkspaceHeadRecord
         last_barrier_request_id: None,
         last_barrier_request_digest: None,
     }
+}
+
+pub(crate) async fn read_closed_head_graph(
+    db: &Db,
+    genesis: &GenesisDomainRecord,
+    allow_latest_effect_dispatched: bool,
+) -> Result<WorkspaceHeadRecord, BarrierError> {
+    let codec = KeyCodec::new();
+    let current_key = codec.workspace_head_key(&genesis.workspace_id);
+    let current_bytes = db
+        .get_bytes_durable(&current_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Corrupt)?;
+    let current = decode_head_record(&current_key, &current_bytes)?;
+    let mut cursor = current.clone();
+    loop {
+        let version_key =
+            codec.workspace_head_version_key(&genesis.workspace_id, cursor.head.workspace_version);
+        let version_bytes = db
+            .get_bytes_durable(&version_key)
+            .await
+            .map_err(|_| BarrierError::Storage)?
+            .ok_or(BarrierError::Corrupt)?;
+        if decode_head_record(&version_key, &version_bytes)? != cursor {
+            return Err(BarrierError::Corrupt);
+        }
+        if cursor.head.workspace_version == 1 {
+            if cursor != initial_head(genesis) {
+                return Err(BarrierError::Corrupt);
+            }
+            break;
+        }
+        let (Some(request_id), Some(request_digest)) = (
+            cursor.last_barrier_request_id.as_ref(),
+            cursor.last_barrier_request_digest,
+        ) else {
+            return Err(BarrierError::Corrupt);
+        };
+        let receipt_key = codec.workspace_barrier_record_key(&genesis.workspace_id, request_id);
+        let receipt_bytes = db
+            .get_bytes_durable(&receipt_key)
+            .await
+            .map_err(|_| BarrierError::Storage)?
+            .ok_or(BarrierError::Corrupt)?;
+        let receipt = decode_barrier_record(&receipt_key, &receipt_bytes)?;
+        if receipt.head != cursor.head
+            || receipt.request_id != *request_id
+            || receipt.request_digest != request_digest
+        {
+            return Err(BarrierError::Corrupt);
+        }
+        let operation = WorkspaceOperationKey::new(
+            genesis.workspace_id.clone(),
+            CREATE_BARRIER_KIND,
+            request_id.clone(),
+        );
+        let outcome = crate::fs::workspace_operation::read_operation_durable(
+            db,
+            &operation,
+            CanonicalRequestDigest::new(request_digest),
+        )
+        .await?;
+        let is_latest = cursor.head.workspace_version == current.head.workspace_version;
+        match outcome {
+            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                state: WorkspaceOperationState::Succeeded(_),
+                ..
+            }) => {}
+            WorkspaceOperationLookup::Known(WorkspaceOperationRecord {
+                state: WorkspaceOperationState::EffectDispatched(claim),
+                ..
+            }) if is_latest && allow_latest_effect_dispatched && claim == receipt.effect_claim => {}
+            _ => return Err(BarrierError::Corrupt),
+        }
+        let previous_version = cursor
+            .head
+            .workspace_version
+            .checked_sub(1)
+            .ok_or(BarrierError::Corrupt)?;
+        let previous_key =
+            codec.workspace_head_version_key(&genesis.workspace_id, previous_version);
+        let previous_bytes = db
+            .get_bytes_durable(&previous_key)
+            .await
+            .map_err(|_| BarrierError::Storage)?
+            .ok_or(BarrierError::Corrupt)?;
+        let previous = decode_head_record(&previous_key, &previous_bytes)?;
+        if head_digest(&previous.head) != receipt.expected_head_digest {
+            return Err(BarrierError::Corrupt);
+        }
+        cursor = previous;
+    }
+    Ok(current)
+}
+
+pub(crate) async fn validate_receipt_in_head_graph(
+    db: &Db,
+    receipt: &BarrierDurabilityReceipt,
+    current: &WorkspaceHeadRecord,
+) -> Result<(), BarrierError> {
+    if receipt.head.workspace_version == 0
+        || receipt.head.workspace_version > current.head.workspace_version
+        || receipt.workspace_id != current.head.workspace_id
+    {
+        return Err(BarrierError::Corrupt);
+    }
+    let codec = KeyCodec::new();
+    let version_key =
+        codec.workspace_head_version_key(&receipt.workspace_id, receipt.head.workspace_version);
+    let version_bytes = db
+        .get_bytes_durable(&version_key)
+        .await
+        .map_err(|_| BarrierError::Storage)?
+        .ok_or(BarrierError::Corrupt)?;
+    let version = decode_head_record(&version_key, &version_bytes)?;
+    if version.head != receipt.head
+        || version.last_barrier_request_id.as_deref() != Some(receipt.request_id.as_str())
+        || version.last_barrier_request_digest != Some(receipt.request_digest)
+    {
+        return Err(BarrierError::Corrupt);
+    }
+    Ok(())
 }
 
 pub(crate) fn next_head(
@@ -810,13 +946,126 @@ pub(crate) fn genesis_matches(
     Ok(())
 }
 
+/// Deterministic head/receipt codec model used by the repository DST binary.
+/// It constructs no verified production command or signed receipt.
+#[cfg(dst)]
+#[doc(hidden)]
+pub fn dst_workspace_barrier_codec_model(seed: u64) {
+    use crate::fs::export_authority::ExportIdentity;
+    use crate::fs::workspace_genesis::ContentDigest;
+
+    let seed = seed.saturating_add(1);
+    let workspace_id = format!("workspace-{seed}");
+    let request_id = format!("barrier-{seed}");
+    let digest: [u8; 32] = Sha256::digest(seed.to_be_bytes()).into();
+    let export = ExportIdentity {
+        nbd_directory_inode: seed.saturating_add(10),
+        name: format!("disk-{seed}").into_bytes(),
+        inode: seed.saturating_add(20),
+        advertised_size: 4096,
+    };
+    let authority = AuthorityVersion {
+        actor: format!("actor-{seed}"),
+        actor_generation: seed,
+        home_cell: "cells/dst".into(),
+        home_revision: 1,
+        authority_epoch: 1,
+        placement_epoch: 1,
+        assignment_revision: 1,
+    };
+    let genesis = GenesisDomainRecord {
+        workspace_id: workspace_id.clone(),
+        operation_kind: 10,
+        request_id: format!("genesis-{seed}"),
+        actor: authority.actor.clone(),
+        actor_generation: authority.actor_generation,
+        home_cell: authority.home_cell.clone(),
+        home_revision: authority.home_revision,
+        authority_epoch: authority.authority_epoch,
+        tenant: "tenants/dst".into(),
+        template: "templates/dst@sha256:01".into(),
+        root_policy: "policies/dst@1".into(),
+        source_create_actor_request_digest: ContentDigest::new(digest),
+        object_lineage: format!("lineage-{seed}"),
+        storage_shard_id: "shard-dst".into(),
+        storage_routing_revision: 1,
+        effect_claim: Bytes::from_static(b"genesis-claim"),
+        request_digest: CanonicalRequestDigest::new(digest),
+        root_digest: ContentDigest::new(digest),
+        root_object_key: format!("root-{seed}"),
+        export: export.clone(),
+    };
+    let initial = initial_head(&genesis);
+    let token = MutationFenceToken {
+        workspace_id: workspace_id.clone(),
+        export,
+        authority,
+        session_id: format!("session-{seed}"),
+        capability_id: format!("capability-{seed}"),
+        expires_at_unix_millis: u64::MAX,
+        node_incarnation_id: format!("node-{seed}"),
+        runtime_id: format!("runtime-{seed}"),
+        server_boot_id: "00000000-0000-4000-8000-000000000001".into(),
+    };
+    let command = BarrierCommand {
+        operation: WorkspaceOperationKey::new(
+            workspace_id.clone(),
+            CREATE_BARRIER_KIND,
+            request_id.clone(),
+        ),
+        request_digest: CanonicalRequestDigest::new(digest),
+        token,
+        expected_head_digest: head_digest(&initial.head),
+        storage_shard_id: "shard-dst".into(),
+        storage_routing_revision: 1,
+    };
+    let barrier_id = "00000000-0000-4000-8000-000000000002";
+    let claim = effect_claim(&command, barrier_id, "00000000-0000-4000-8000-000000000003");
+    let next = next_head(&initial, &command, 1, 1, 2, 3).unwrap();
+    let mut receipt = BarrierDurabilityReceipt {
+        workspace_id: workspace_id.clone(),
+        request_id: request_id.clone(),
+        request_digest: digest,
+        effect_claim: claim,
+        token: command.token.clone(),
+        expected_head_digest: command.expected_head_digest,
+        head: next.head.clone(),
+        barrier_id: barrier_id.into(),
+        included_write_sequence: 1,
+        zerofs_writer_epoch: 1,
+        zerofs_manifest_id: 2,
+        zerofs_durable_sequence: 3,
+        storage_shard_id: "shard-dst".into(),
+        storage_routing_revision: 1,
+        committed_at_unix_seconds: seed,
+        committed_at_nanos: 0,
+        receipt_digest: [0; 32],
+    };
+    receipt.receipt_digest = receipt_digest(&receipt);
+    let codec = KeyCodec::new();
+    let head_key = codec.workspace_head_version_key(&workspace_id, 2);
+    let encoded_head = encode_head_record(&head_key, &next).unwrap();
+    assert_eq!(decode_head_record(&head_key, &encoded_head).unwrap(), next);
+    let receipt_key = codec.workspace_barrier_record_key(&workspace_id, &request_id);
+    let encoded_receipt = encode_barrier_record(&receipt_key, &receipt).unwrap();
+    assert_eq!(
+        decode_barrier_record(&receipt_key, &encoded_receipt).unwrap(),
+        receipt
+    );
+    let wrong_key = codec.workspace_barrier_record_key(&workspace_id, "other");
+    assert_eq!(
+        decode_barrier_record(&wrong_key, &encoded_receipt),
+        Err(BarrierError::Corrupt)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::export_authority::{
-        ActivateExport, ExportMutationBuilder, ExportMutationCommand, ExportSessionState,
-        ShardProcessGuard,
+        ActivateExport, DeactivateExport, ExportMutationBuilder, ExportMutationCommand,
+        ExportReverseBinding, ExportSessionState, ShardProcessGuard, reverse_binding_keys,
     };
     use crate::fs::workspace_genesis::{
         ContentDigest, GenesisCommand, GenesisMaterializationPlan, GenesisMaterializeResult,
@@ -1002,6 +1251,25 @@ mod tests {
             BarrierMaterializeResult::Materialized(receipt) => *receipt,
             other => panic!("unexpected barrier result: {other:?}"),
         }
+    }
+
+    async fn complete_barrier(
+        fs: &ZeroFS,
+        command: BarrierCommand,
+        receipt: BarrierDurabilityReceipt,
+    ) {
+        let verified = VerifiedBarrierInput::for_test(command).unwrap();
+        fs.workspace_barriers
+            .complete(
+                &verified,
+                VerifiedBarrierTerminal::for_test(
+                    receipt,
+                    Bytes::from_static(b"signed-barrier-receipt"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1200,6 +1468,7 @@ mod tests {
         for key in [
             KeyCodec::new().workspace_head_key("workspace-a"),
             KeyCodec::new().workspace_barrier_record_key("workspace-a", "request-a"),
+            KeyCodec::new().workspace_head_version_key("workspace-a", 1),
         ] {
             let mut transaction = crate::db::Transaction::new();
             transaction.put_bytes(&key, Bytes::from_static(b"forged"));
@@ -1208,6 +1477,194 @@ mod tests {
                 Err(crate::fs::errors::FsError::OperationNotPermitted)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn missing_current_head_or_predecessor_receipt_is_corruption() {
+        let (fs, token, genesis) = active_workspace().await;
+        let first_command = command(
+            "barrier-closed-head",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let first = materialize(&fs, first_command.clone()).await;
+        complete_barrier(&fs, first_command.clone(), first.clone()).await;
+        fs.db
+            .inject_reserved_authority_delete_for_test(
+                KeyCodec::new().workspace_head_key(&token.workspace_id),
+            )
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.workspace_barriers
+                .lookup_materialized(&first_command)
+                .await,
+            Err(BarrierError::Corrupt)
+        );
+
+        let (fs, token, genesis) = active_workspace().await;
+        let first_command = command(
+            "barrier-missing-receipt",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let first = materialize(&fs, first_command.clone()).await;
+        complete_barrier(&fs, first_command.clone(), first.clone()).await;
+        fs.db
+            .inject_reserved_authority_delete_for_test(
+                KeyCodec::new().workspace_barrier_record_key(
+                    &first_command.operation.workspace_id,
+                    &first_command.operation.request_id,
+                ),
+            )
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.workspace_barriers
+                .lookup_materialized(&first_command)
+                .await,
+            Err(BarrierError::Corrupt)
+        );
+        assert_eq!(
+            fs.workspace_barriers
+                .materialize(
+                    VerifiedBarrierInput::for_test(command(
+                        "barrier-after-corrupt",
+                        &token,
+                        head_digest(&first.head),
+                    ))
+                    .unwrap(),
+                )
+                .await,
+            Err(BarrierError::Corrupt)
+        );
+
+        let (fs, token, genesis) = active_workspace().await;
+        let first_command = command(
+            "barrier-missing-predecessor",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let first = materialize(&fs, first_command.clone()).await;
+        fs.db
+            .inject_reserved_authority_delete_for_test(
+                KeyCodec::new().workspace_head_version_key(&token.workspace_id, 1),
+            )
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.workspace_barriers
+                .lookup_materialized(&first_command)
+                .await,
+            Err(BarrierError::Corrupt)
+        );
+        assert_eq!(first.head.workspace_version, 2);
+    }
+
+    #[tokio::test]
+    async fn final_permit_rejects_a_superseding_process_boot() {
+        let (fs, token, genesis) = active_workspace().await;
+        let command = command(
+            "barrier-boot-race",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        fs.write_coordinator.dst_pause_next_barrier_after_cut();
+        let worker_fs = fs.clone();
+        let task = tokio::spawn(async move {
+            worker_fs
+                .workspace_barriers
+                .materialize(VerifiedBarrierInput::for_test(command).unwrap())
+                .await
+        });
+        fs.write_coordinator.dst_wait_barrier_after_cut().await;
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                KeyCodec::new().export_boot_key(),
+                Bytes::from_static(b"superseding-process-boot"),
+            )
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        fs.write_coordinator.dst_release_barrier_after_cut();
+        assert_eq!(task.await.unwrap(), Err(BarrierError::Conflict));
+    }
+
+    #[tokio::test]
+    async fn missing_reverse_binding_blocks_barrier_publication() {
+        let (fs, token, genesis) = active_workspace().await;
+        let binding = ExportReverseBinding {
+            workspace_id: token.workspace_id.clone(),
+            actor: token.authority.actor.clone(),
+            actor_generation: token.authority.actor_generation,
+            export: token.export.clone(),
+        };
+        let (name_key, _) = reverse_binding_keys(&binding);
+        fs.db
+            .inject_reserved_authority_delete_for_test(name_key)
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.workspace_barriers
+                .materialize(
+                    VerifiedBarrierInput::for_test(command(
+                        "barrier-missing-reverse",
+                        &token,
+                        head_digest(&initial_head(&genesis).head),
+                    ))
+                    .unwrap(),
+                )
+                .await,
+            Err(BarrierError::Corrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_release_barrier_admission_early() {
+        let (fs, token, genesis) = active_workspace().await;
+        let command = command(
+            "barrier-cancelled-caller",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        fs.write_coordinator.dst_pause_next_barrier_after_cut();
+        let barrier_fs = fs.clone();
+        let barrier = tokio::spawn(async move {
+            barrier_fs
+                .workspace_barriers
+                .materialize(VerifiedBarrierInput::for_test(command).unwrap())
+                .await
+        });
+        fs.write_coordinator.dst_wait_barrier_after_cut().await;
+        barrier.abort();
+        assert!(barrier.await.unwrap_err().is_cancelled());
+
+        let deactivate_fs = fs.clone();
+        let deactivate_token = token.clone();
+        let mut deactivate = tokio::spawn(async move {
+            deactivate_fs
+                .export_authority
+                .deactivate(DeactivateExport {
+                    workspace_id: deactivate_token.workspace_id,
+                    expected_export: deactivate_token.export,
+                    expected_authority: deactivate_token.authority,
+                    session_id: deactivate_token.session_id,
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut deactivate)
+                .await
+                .is_err(),
+            "deactivate must wait for the coordinator-owned barrier guard"
+        );
+        fs.write_coordinator.dst_release_barrier_after_cut();
+        let deactivated = deactivate.await.unwrap().unwrap();
+        assert!(deactivated.active_session.is_none());
     }
 
     #[cfg(feature = "failpoints")]
