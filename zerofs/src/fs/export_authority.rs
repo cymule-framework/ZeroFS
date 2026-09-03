@@ -6,7 +6,7 @@
 //! [`WriteCoordinator`], which is the only ordering authority.
 
 use crate::db::{Db, Transaction};
-use crate::fs::key_codec::{ExportMutationKey, KeyCodec};
+use crate::fs::key_codec::{ExportMutationKey, KeyCodec, NbdSessionKey};
 use crate::fs::lock_manager::KeyedLockGuard;
 use crate::fs::store::extent::TailUpdate;
 use crate::fs::store::{ExtentStore, InodeStore};
@@ -23,6 +23,9 @@ const RECORD_VERSION: u8 = 2;
 const AUTHORITY_RECORD_MAGIC: &[u8; 4] = b"RAUT";
 const MUTATION_OUTCOME_MAGIC: &[u8; 4] = b"RMUT";
 const REVERSE_BINDING_MAGIC: &[u8; 4] = b"RBND";
+const NBD_SESSION_INSTALL_MAGIC: &[u8; 4] = b"RNBI";
+const NBD_SESSION_INSTALL_OUTCOME_MAGIC: &[u8; 4] = b"RNBO";
+const NBD_CONNECTION_RECEIPT_MAGIC: &[u8; 4] = b"RNBC";
 const MAX_ID_BYTES: usize = 1024;
 const SHA256_SIZE: usize = 32;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -37,6 +40,8 @@ const COMMAND_DIGEST_DOMAIN: &[u8] = b"rhizome.export-mutation-command.v2\0";
     expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
 )]
 const DATA_CHECKSUM_DOMAIN: &[u8] = b"rhizome.export-mutation-data.v1\0";
+const NBD_INSTALL_DIGEST_DOMAIN: &[u8] = b"rhizome.nbd-session-install.v1\0";
+const NBD_CONNECTION_DIGEST_DOMAIN: &[u8] = b"rhizome.nbd-connection-consume.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExportIdentity {
@@ -92,6 +97,296 @@ pub(crate) struct ActivateExport {
     pub export: ExportIdentity,
     pub authority: AuthorityVersion,
     pub session: ExportSessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NbdTransportProfile {
+    HostLocalUnixSocket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdProtocolProfile {
+    pub transport: NbdTransportProfile,
+    pub fixed_newstyle: bool,
+    pub allow_list: bool,
+    pub allow_info: bool,
+    pub allow_go: bool,
+    pub allow_export_name: bool,
+    pub send_flush: bool,
+    pub send_fua: bool,
+    pub send_trim: bool,
+    pub send_write_zeroes: bool,
+    pub can_multi_conn: bool,
+    pub can_fast_zero: bool,
+    pub max_connections: u8,
+}
+
+impl NbdProtocolProfile {
+    pub(crate) fn rhizome_p0_p1() -> Self {
+        Self {
+            transport: NbdTransportProfile::HostLocalUnixSocket,
+            fixed_newstyle: true,
+            allow_list: false,
+            allow_info: true,
+            allow_go: true,
+            allow_export_name: false,
+            send_flush: true,
+            send_fua: true,
+            send_trim: true,
+            send_write_zeroes: false,
+            can_multi_conn: false,
+            can_fast_zero: false,
+            max_connections: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdConnectorIdentity {
+    pub boot_id: String,
+    pub process_id: u32,
+    pub process_start_time_ticks: u64,
+    pub node_incarnation_id: String,
+    pub runtime_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdSocketTarget {
+    pub parent_path: Vec<u8>,
+    pub parent_device: u64,
+    pub parent_inode: u64,
+    pub name: Vec<u8>,
+    pub required_parent_user_id: u32,
+    pub required_parent_group_id: u32,
+    pub required_parent_mode: u32,
+    pub required_socket_user_id: u32,
+    pub required_socket_group_id: u32,
+    pub required_socket_mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdSocketIdentity {
+    pub target: NbdSocketTarget,
+    pub socket_device: u64,
+    pub socket_inode: u64,
+    pub socket_user_id: u32,
+    pub socket_group_id: u32,
+    pub socket_mode: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdRequestId(pub(crate) [u8; SHA256_SIZE]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdRequestDigest(pub(crate) [u8; SHA256_SIZE]);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdSessionInstallExpectation {
+    pub token: MutationFenceToken,
+    pub reverse_binding: ExportReverseBinding,
+    pub connector: NbdConnectorIdentity,
+    pub socket_target: NbdSocketTarget,
+    pub profile: NbdProtocolProfile,
+    pub expires_at_unix_millis: u64,
+    pub request_id: NbdRequestId,
+    pub request_digest: NbdRequestDigest,
+    pub expected_connection_id: NbdRequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstallNbdSession {
+    expectation: NbdSessionInstallExpectation,
+}
+
+impl InstallNbdSession {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) fn new(
+        token: MutationFenceToken,
+        connector: NbdConnectorIdentity,
+        socket_target: NbdSocketTarget,
+        profile: NbdProtocolProfile,
+        expires_at_unix_millis: u64,
+        request_id: [u8; SHA256_SIZE],
+        expected_connection_id: [u8; SHA256_SIZE],
+    ) -> Result<Self, ExportAuthorityError> {
+        let reverse_binding = ExportReverseBinding {
+            workspace_id: token.workspace_id.clone(),
+            actor: token.authority.actor.clone(),
+            actor_generation: token.authority.actor_generation,
+            export: token.export.clone(),
+        };
+        let mut expectation = NbdSessionInstallExpectation {
+            token,
+            reverse_binding,
+            connector,
+            socket_target,
+            profile,
+            expires_at_unix_millis,
+            request_id: NbdRequestId(request_id),
+            request_digest: NbdRequestDigest([0; SHA256_SIZE]),
+            expected_connection_id: NbdRequestId(expected_connection_id),
+        };
+        validate_nbd_install_expectation(&expectation, false)?;
+        expectation.request_digest = NbdRequestDigest(nbd_install_digest(&expectation));
+        Ok(Self { expectation })
+    }
+
+    pub(crate) fn expectation(&self) -> NbdSessionInstallExpectation {
+        self.expectation.clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NbdConnectionNegotiation {
+    SuccessfulGo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdPeerCredentials {
+    pub process_id: u32,
+    pub user_id: u32,
+    pub group_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NbdSessionInstallState {
+    Pending,
+    Installed {
+        socket: NbdSocketIdentity,
+    },
+    Consumed {
+        socket: NbdSocketIdentity,
+        connection_id: NbdRequestId,
+        request_digest: NbdRequestDigest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdSessionInstallRecord {
+    pub expectation: NbdSessionInstallExpectation,
+    pub state: NbdSessionInstallState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdSessionInstallReceipt {
+    pub expectation: NbdSessionInstallExpectation,
+    pub socket: NbdSocketIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NbdSessionInstallOutcome {
+    Pending(NbdSessionInstallExpectation),
+    Installed(NbdSessionInstallReceipt),
+}
+
+impl NbdSessionInstallOutcome {
+    fn expectation(&self) -> &NbdSessionInstallExpectation {
+        match self {
+            Self::Pending(expectation) => expectation,
+            Self::Installed(receipt) => &receipt.expectation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NbdSessionInstallLookup {
+    Unknown,
+    Pending(NbdSessionInstallExpectation),
+    Installed(Box<NbdSessionInstallReceipt>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompleteNbdSessionInstall {
+    expectation: NbdSessionInstallExpectation,
+    socket: NbdSocketIdentity,
+}
+
+impl CompleteNbdSessionInstall {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) fn new(
+        expectation: NbdSessionInstallExpectation,
+        socket: NbdSocketIdentity,
+    ) -> Result<Self, ExportAuthorityError> {
+        validate_nbd_install_expectation(&expectation, true)?;
+        validate_nbd_socket_identity(&socket)?;
+        if socket.target != expectation.socket_target {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        Ok(Self {
+            expectation,
+            socket,
+        })
+    }
+
+    pub(crate) fn expectation(&self) -> &NbdSessionInstallExpectation {
+        &self.expectation
+    }
+
+    pub(crate) fn socket(&self) -> &NbdSocketIdentity {
+        &self.socket
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdConnectionExpectation {
+    pub install: NbdSessionInstallReceipt,
+    pub negotiation: NbdConnectionNegotiation,
+    pub connection_id: NbdRequestId,
+    pub peer: NbdPeerCredentials,
+    pub negotiated_profile: NbdProtocolProfile,
+    pub request_digest: NbdRequestDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConsumeNbdSession {
+    expectation: NbdConnectionExpectation,
+}
+
+impl ConsumeNbdSession {
+    /// Construct the only state-changing negotiation result. INFO and failed
+    /// handshakes have no constructor into the coordinator and cannot consume.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) fn successful_go(
+        install: NbdSessionInstallReceipt,
+        peer: NbdPeerCredentials,
+        negotiated_profile: NbdProtocolProfile,
+    ) -> Result<Self, ExportAuthorityError> {
+        let mut expectation = NbdConnectionExpectation {
+            connection_id: install.expectation.expected_connection_id,
+            install,
+            negotiation: NbdConnectionNegotiation::SuccessfulGo,
+            peer,
+            negotiated_profile,
+            request_digest: NbdRequestDigest([0; SHA256_SIZE]),
+        };
+        validate_nbd_connection_expectation(&expectation, false)?;
+        expectation.request_digest = NbdRequestDigest(nbd_connection_digest(&expectation));
+        Ok(Self { expectation })
+    }
+
+    pub(crate) fn expectation(&self) -> NbdConnectionExpectation {
+        self.expectation.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NbdConnectionReceipt {
+    pub expectation: NbdConnectionExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NbdConnectionLookup {
+    Unknown,
+    Connected(Box<NbdConnectionReceipt>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,7 +706,7 @@ impl MutationKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MutationFenceToken {
     pub workspace_id: String,
     pub export: ExportIdentity,
@@ -768,6 +1063,163 @@ impl ExportAuthorityStore {
         self.coordinator
             .transition_export_authority(ExportAuthorityTransition::AdvanceFence(command), guard)
             .await
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) async fn install_nbd_session(
+        &self,
+        command: InstallNbdSession,
+    ) -> Result<NbdSessionInstallOutcome, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
+        self.require_enabled()?;
+        validate_nbd_install_expectation(&command.expectation, true)?;
+        let expected = command.expectation();
+        let outcome_key = nbd_install_outcome_key(&expected);
+        if let Some(outcome) =
+            read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected).await?
+        {
+            ensure_nbd_install_outcome(&outcome, &expected)?;
+            let install_key = nbd_session_install_key(&expected);
+            let install = read_nbd_session_install_durable(&self.db, &install_key)
+                .await?
+                .ok_or(ExportAuthorityError::Corrupt)?;
+            ensure_nbd_install_state(&install, &outcome, &expected)?;
+            return Ok(outcome);
+        }
+        let guard = self
+            .admission_locks
+            .acquire(expected.token.workspace_id.clone())
+            .await;
+        self.coordinator.install_nbd_session(command, guard).await?;
+        let outcome = read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        ensure_nbd_install_outcome(&outcome, &expected)?;
+        Ok(outcome)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) async fn lookup_nbd_session_install(
+        &self,
+        expected: &NbdSessionInstallExpectation,
+    ) -> Result<NbdSessionInstallLookup, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
+        validate_nbd_install_expectation(expected, true)?;
+        let key = nbd_install_outcome_key(expected);
+        match read_nbd_install_outcome_durable(&self.db, &key, expected).await? {
+            Some(outcome) => {
+                ensure_nbd_install_outcome(&outcome, expected)?;
+                let install_key = nbd_session_install_key(expected);
+                let install = read_nbd_session_install_durable(&self.db, &install_key)
+                    .await?
+                    .ok_or(ExportAuthorityError::Corrupt)?;
+                ensure_nbd_install_state(&install, &outcome, expected)?;
+                match outcome {
+                    NbdSessionInstallOutcome::Pending(pending) => {
+                        Ok(NbdSessionInstallLookup::Pending(pending))
+                    }
+                    NbdSessionInstallOutcome::Installed(receipt) => {
+                        Ok(NbdSessionInstallLookup::Installed(Box::new(receipt)))
+                    }
+                }
+            }
+            None => Ok(NbdSessionInstallLookup::Unknown),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) async fn complete_nbd_session_install(
+        &self,
+        command: CompleteNbdSessionInstall,
+    ) -> Result<NbdSessionInstallReceipt, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
+        self.require_enabled()?;
+        let expected = command.expectation().clone();
+        let outcome_key = nbd_install_outcome_key(&expected);
+        if let Some(outcome) =
+            read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected).await?
+        {
+            ensure_nbd_install_outcome(&outcome, &expected)?;
+            if let NbdSessionInstallOutcome::Installed(receipt) = outcome {
+                if receipt.socket != command.socket {
+                    return Err(ExportAuthorityError::Conflict);
+                }
+                return Ok(receipt);
+            }
+        }
+        let guard = self
+            .admission_locks
+            .acquire(expected.token.workspace_id.clone())
+            .await;
+        self.coordinator
+            .complete_nbd_session_install(command, guard)
+            .await?;
+        let outcome = read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        ensure_nbd_install_outcome(&outcome, &expected)?;
+        match outcome {
+            NbdSessionInstallOutcome::Installed(receipt) => Ok(receipt),
+            NbdSessionInstallOutcome::Pending(_) => Err(ExportAuthorityError::Corrupt),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) async fn consume_nbd_session(
+        &self,
+        command: ConsumeNbdSession,
+    ) -> Result<NbdConnectionReceipt, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
+        self.require_enabled()?;
+        validate_nbd_connection_expectation(&command.expectation, true)?;
+        let expected = command.expectation();
+        let receipt_key = nbd_connection_receipt_key(&expected);
+        if let Some(receipt) = read_nbd_connection_receipt_durable(&self.db, &receipt_key).await? {
+            ensure_nbd_connection_receipt(&receipt, &expected)?;
+            return Ok(receipt);
+        }
+        let guard = self
+            .admission_locks
+            .acquire(expected.install.expectation.token.workspace_id.clone())
+            .await;
+        self.coordinator.consume_nbd_session(command, guard).await?;
+        let receipt = read_nbd_connection_receipt_durable(&self.db, &receipt_key)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        ensure_nbd_connection_receipt(&receipt, &expected)?;
+        Ok(receipt)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+    )]
+    pub(crate) async fn lookup_nbd_connection(
+        &self,
+        expected: &NbdConnectionExpectation,
+    ) -> Result<NbdConnectionLookup, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
+        validate_nbd_connection_expectation(expected, true)?;
+        let key = nbd_connection_receipt_key(expected);
+        match read_nbd_connection_receipt_durable(&self.db, &key).await? {
+            Some(receipt) => {
+                ensure_nbd_connection_receipt(&receipt, expected)?;
+                Ok(NbdConnectionLookup::Connected(Box::new(receipt)))
+            }
+            None => Ok(NbdConnectionLookup::Unknown),
+        }
     }
 
     #[cfg_attr(
@@ -1178,10 +1630,6 @@ fn validate_extent_span(offset: u64, length: u32) -> Result<u64, ExportAuthority
     Ok(end)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
-)]
 fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; SHA256_SIZE] {
     let mut hash = Sha256::new();
     hash.update(domain);
@@ -1376,6 +1824,119 @@ pub(crate) fn mutation_outcome_key(expected: &ExportMutationExpectation) -> Byte
         server_boot_id: &expected.server_boot_id,
         operation_id: expected.mutation.operation_id.0,
     })
+}
+
+fn nbd_session_key_identity(expected: &NbdSessionInstallExpectation) -> NbdSessionKey<'_> {
+    NbdSessionKey {
+        workspace_id: &expected.token.workspace_id,
+        actor: &expected.token.authority.actor,
+        actor_generation: expected.token.authority.actor_generation,
+        placement_epoch: expected.token.authority.placement_epoch,
+        session_id: &expected.token.session_id,
+        server_boot_id: &expected.token.server_boot_id,
+    }
+}
+
+pub(crate) fn nbd_session_install_key(expected: &NbdSessionInstallExpectation) -> Bytes {
+    KeyCodec::new().nbd_session_install_key(&nbd_session_key_identity(expected))
+}
+
+pub(crate) fn nbd_install_outcome_key(expected: &NbdSessionInstallExpectation) -> Bytes {
+    KeyCodec::new()
+        .nbd_session_install_outcome_key(&expected.token.workspace_id, &expected.request_id.0)
+}
+
+pub(crate) fn nbd_connection_receipt_key(expected: &NbdConnectionExpectation) -> Bytes {
+    KeyCodec::new().nbd_connection_receipt_key(
+        &nbd_session_key_identity(&expected.install.expectation),
+        &expected.connection_id.0,
+    )
+}
+
+pub(crate) async fn read_nbd_session_install_current(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<NbdSessionInstallRecord>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_session_install(&bytes, key).map(Some)
+}
+
+async fn read_nbd_session_install_durable(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<NbdSessionInstallRecord>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes_durable(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_session_install(&bytes, key).map(Some)
+}
+
+pub(crate) async fn read_nbd_install_outcome_current(
+    db: &Db,
+    key: &Bytes,
+    expected: &NbdSessionInstallExpectation,
+) -> Result<Option<NbdSessionInstallOutcome>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_install_outcome(&bytes, key, expected).map(Some)
+}
+
+async fn read_nbd_install_outcome_durable(
+    db: &Db,
+    key: &Bytes,
+    expected: &NbdSessionInstallExpectation,
+) -> Result<Option<NbdSessionInstallOutcome>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes_durable(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_install_outcome(&bytes, key, expected).map(Some)
+}
+
+pub(crate) async fn read_nbd_connection_receipt_current(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<NbdConnectionReceipt>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_connection_receipt(&bytes, key).map(Some)
+}
+
+async fn read_nbd_connection_receipt_durable(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<NbdConnectionReceipt>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes_durable(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_connection_receipt(&bytes, key).map(Some)
 }
 
 async fn read_outcome_durable(
@@ -1618,6 +2179,45 @@ pub(crate) fn encode_reverse_binding(
     encode_bound_record(REVERSE_BINDING_MAGIC, key, &payload)
 }
 
+pub(crate) fn encode_nbd_session_install(
+    record: &NbdSessionInstallRecord,
+) -> Result<Bytes, ExportAuthorityError> {
+    validate_nbd_session_install_record(record)?;
+    let key = nbd_session_install_key(&record.expectation);
+    let payload = codec()
+        .serialize(record)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    encode_bound_record(NBD_SESSION_INSTALL_MAGIC, &key, &payload)
+}
+
+pub(crate) fn encode_nbd_install_outcome(
+    outcome: &NbdSessionInstallOutcome,
+) -> Result<Bytes, ExportAuthorityError> {
+    validate_nbd_install_expectation(outcome.expectation(), true)?;
+    if let NbdSessionInstallOutcome::Installed(receipt) = outcome {
+        validate_nbd_socket_identity(&receipt.socket)?;
+        if receipt.socket.target != receipt.expectation.socket_target {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+    }
+    let key = nbd_install_outcome_key(outcome.expectation());
+    let payload = codec()
+        .serialize(outcome)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    encode_bound_record(NBD_SESSION_INSTALL_OUTCOME_MAGIC, &key, &payload)
+}
+
+pub(crate) fn encode_nbd_connection_receipt(
+    receipt: &NbdConnectionReceipt,
+) -> Result<Bytes, ExportAuthorityError> {
+    validate_nbd_connection_expectation(&receipt.expectation, true)?;
+    let key = nbd_connection_receipt_key(&receipt.expectation);
+    let payload = codec()
+        .serialize(receipt)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    encode_bound_record(NBD_CONNECTION_RECEIPT_MAGIC, &key, &payload)
+}
+
 fn decode_record(
     bytes: &[u8],
     expected_workspace_id: &str,
@@ -1667,6 +2267,60 @@ fn decode_reverse_binding(
         return Err(ExportAuthorityError::Corrupt);
     }
     Ok(binding)
+}
+
+fn decode_nbd_session_install(
+    bytes: &[u8],
+    key: &Bytes,
+) -> Result<NbdSessionInstallRecord, ExportAuthorityError> {
+    let payload = decode_bound_record(NBD_SESSION_INSTALL_MAGIC, key, bytes)?;
+    let record: NbdSessionInstallRecord = codec()
+        .deserialize(payload)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    validate_nbd_session_install_record(&record)?;
+    if nbd_session_install_key(&record.expectation) != *key {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(record)
+}
+
+fn decode_nbd_install_outcome(
+    bytes: &[u8],
+    key: &Bytes,
+    expected: &NbdSessionInstallExpectation,
+) -> Result<NbdSessionInstallOutcome, ExportAuthorityError> {
+    let payload = decode_bound_record(NBD_SESSION_INSTALL_OUTCOME_MAGIC, key, bytes)?;
+    let outcome: NbdSessionInstallOutcome = codec()
+        .deserialize(payload)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    validate_nbd_install_expectation(outcome.expectation(), true)?;
+    if let NbdSessionInstallOutcome::Installed(receipt) = &outcome {
+        validate_nbd_socket_identity(&receipt.socket).map_err(|_| ExportAuthorityError::Corrupt)?;
+        if receipt.socket.target != receipt.expectation.socket_target {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+    }
+    if nbd_install_outcome_key(outcome.expectation()) != *key
+        || nbd_install_outcome_key(expected) != *key
+    {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(outcome)
+}
+
+fn decode_nbd_connection_receipt(
+    bytes: &[u8],
+    key: &Bytes,
+) -> Result<NbdConnectionReceipt, ExportAuthorityError> {
+    let payload = decode_bound_record(NBD_CONNECTION_RECEIPT_MAGIC, key, bytes)?;
+    let receipt: NbdConnectionReceipt = codec()
+        .deserialize(payload)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    validate_nbd_connection_expectation(&receipt.expectation, true)?;
+    if nbd_connection_receipt_key(&receipt.expectation) != *key {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(receipt)
 }
 
 fn encode_bound_record(
@@ -1776,6 +2430,257 @@ pub(crate) fn ensure_outcome(
     } else {
         Err(ExportAuthorityError::Conflict)
     }
+}
+
+pub(crate) fn ensure_nbd_install_outcome(
+    outcome: &NbdSessionInstallOutcome,
+    expected: &NbdSessionInstallExpectation,
+) -> Result<(), ExportAuthorityError> {
+    validate_nbd_install_expectation(expected, true)?;
+    validate_nbd_install_expectation(outcome.expectation(), true)?;
+    if outcome.expectation() == expected {
+        Ok(())
+    } else {
+        Err(ExportAuthorityError::Conflict)
+    }
+}
+
+pub(crate) fn ensure_nbd_install_state(
+    record: &NbdSessionInstallRecord,
+    outcome: &NbdSessionInstallOutcome,
+    expected: &NbdSessionInstallExpectation,
+) -> Result<(), ExportAuthorityError> {
+    if &record.expectation != expected || outcome.expectation() != expected {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    match (outcome, &record.state) {
+        (NbdSessionInstallOutcome::Pending(_), NbdSessionInstallState::Pending) => Ok(()),
+        (
+            NbdSessionInstallOutcome::Installed(receipt),
+            NbdSessionInstallState::Installed { socket }
+            | NbdSessionInstallState::Consumed { socket, .. },
+        ) if socket == &receipt.socket => Ok(()),
+        _ => Err(ExportAuthorityError::Corrupt),
+    }
+}
+
+pub(crate) fn ensure_nbd_connection_receipt(
+    receipt: &NbdConnectionReceipt,
+    expected: &NbdConnectionExpectation,
+) -> Result<(), ExportAuthorityError> {
+    validate_nbd_connection_expectation(expected, true)?;
+    validate_nbd_connection_expectation(&receipt.expectation, true)?;
+    if &receipt.expectation == expected {
+        Ok(())
+    } else {
+        Err(ExportAuthorityError::Conflict)
+    }
+}
+
+pub(crate) fn apply_nbd_connection_consume(
+    install: &mut NbdSessionInstallRecord,
+    expected: NbdConnectionExpectation,
+) -> Result<NbdConnectionReceipt, ExportAuthorityError> {
+    validate_nbd_session_install_record(install)?;
+    validate_nbd_connection_expectation(&expected, true)?;
+    let socket = match &install.state {
+        NbdSessionInstallState::Installed { socket } if socket == &expected.install.socket => {
+            socket.clone()
+        }
+        _ => return Err(ExportAuthorityError::Conflict),
+    };
+    if install.expectation != expected.install.expectation {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    install.state = NbdSessionInstallState::Consumed {
+        socket,
+        connection_id: expected.connection_id,
+        request_digest: expected.request_digest,
+    };
+    Ok(NbdConnectionReceipt {
+        expectation: expected,
+    })
+}
+
+fn validate_nbd_session_install_record(
+    record: &NbdSessionInstallRecord,
+) -> Result<(), ExportAuthorityError> {
+    validate_nbd_install_expectation(&record.expectation, true)?;
+    match &record.state {
+        NbdSessionInstallState::Pending => {}
+        NbdSessionInstallState::Installed { socket } => {
+            validate_nbd_socket_identity(socket)?;
+            if socket.target != record.expectation.socket_target {
+                return Err(ExportAuthorityError::Corrupt);
+            }
+        }
+        NbdSessionInstallState::Consumed {
+            socket,
+            connection_id,
+            request_digest,
+        } => {
+            validate_nbd_socket_identity(socket)?;
+            if socket.target != record.expectation.socket_target
+                || connection_id != &record.expectation.expected_connection_id
+                || request_digest.0 == [0; SHA256_SIZE]
+            {
+                return Err(ExportAuthorityError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_nbd_install_expectation(
+    expected: &NbdSessionInstallExpectation,
+    require_digest: bool,
+) -> Result<(), ExportAuthorityError> {
+    validate_mutation_token_shape(&expected.token)?;
+    let derived_reverse = ExportReverseBinding {
+        workspace_id: expected.token.workspace_id.clone(),
+        actor: expected.token.authority.actor.clone(),
+        actor_generation: expected.token.authority.actor_generation,
+        export: expected.token.export.clone(),
+    };
+    validate_reverse_binding(&expected.reverse_binding)?;
+    validate_id(&expected.connector.boot_id)?;
+    validate_id(&expected.connector.node_incarnation_id)?;
+    validate_id(&expected.connector.runtime_id)?;
+    validate_nbd_socket_target(&expected.socket_target)?;
+    if expected.connector.process_id == 0
+        || expected.connector.process_start_time_ticks == 0
+        || expected.reverse_binding != derived_reverse
+        || expected.connector.node_incarnation_id != expected.token.node_incarnation_id
+        || expected.connector.runtime_id != expected.token.runtime_id
+        || expected.profile != NbdProtocolProfile::rhizome_p0_p1()
+        || expected.expires_at_unix_millis == 0
+        || expected.expires_at_unix_millis > expected.token.expires_at_unix_millis
+        || expected.request_id.0 == [0; SHA256_SIZE]
+        || expected.expected_connection_id.0 == [0; SHA256_SIZE]
+    {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    let digest = nbd_install_digest(expected);
+    if require_digest {
+        if expected.request_digest.0 != digest {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+    } else if expected.request_digest.0 != [0; SHA256_SIZE] {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_nbd_connection_expectation(
+    expected: &NbdConnectionExpectation,
+    require_digest: bool,
+) -> Result<(), ExportAuthorityError> {
+    validate_nbd_install_receipt(&expected.install)?;
+    if expected.connection_id != expected.install.expectation.expected_connection_id
+        || expected.peer.process_id == 0
+        || expected.peer.process_id != expected.install.expectation.connector.process_id
+        || expected.peer.user_id != 0
+        || expected.negotiated_profile != expected.install.expectation.profile
+    {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    let digest = nbd_connection_digest(expected);
+    if require_digest {
+        if expected.request_digest.0 != digest {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+    } else if expected.request_digest.0 != [0; SHA256_SIZE] {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_nbd_install_receipt(
+    receipt: &NbdSessionInstallReceipt,
+) -> Result<(), ExportAuthorityError> {
+    validate_nbd_install_expectation(&receipt.expectation, true)?;
+    validate_nbd_socket_identity(&receipt.socket)?;
+    if receipt.socket.target != receipt.expectation.socket_target {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_nbd_socket_target(target: &NbdSocketTarget) -> Result<(), ExportAuthorityError> {
+    let full_len = target
+        .parent_path
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(target.name.len()))
+        .ok_or(ExportAuthorityError::Invalid)?;
+    if target.parent_path.first() != Some(&b'/')
+        || target.parent_path.len() > 4096
+        || target.parent_path.contains(&0)
+        || target.parent_path.last() == Some(&b'/')
+        || target.parent_device == 0
+        || target.parent_inode == 0
+        || target.name.is_empty()
+        || target.name.len() > crate::fs::NAME_MAX
+        || target.name.contains(&0)
+        || target.name.contains(&b'/')
+        || target.name.as_slice() == b"."
+        || target.name.as_slice() == b".."
+        || full_len > 107
+        || target.required_parent_user_id == 0
+        || target.required_parent_user_id != target.required_socket_user_id
+        || target.required_parent_group_id != target.required_socket_group_id
+        || target.required_parent_mode != 0o700
+        || target.required_socket_mode != 0o600
+    {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_nbd_socket_identity(identity: &NbdSocketIdentity) -> Result<(), ExportAuthorityError> {
+    validate_nbd_socket_target(&identity.target)?;
+    if identity.socket_device == 0
+        || identity.socket_inode == 0
+        || identity.socket_user_id != identity.target.required_socket_user_id
+        || identity.socket_group_id != identity.target.required_socket_group_id
+        || identity.socket_mode != identity.target.required_socket_mode
+    {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_mutation_token_shape(token: &MutationFenceToken) -> Result<(), ExportAuthorityError> {
+    validate_id(&token.workspace_id)?;
+    validate_export(&token.export)?;
+    validate_authority(&token.authority)?;
+    validate_id(&token.session_id)?;
+    validate_id(&token.capability_id)?;
+    validate_id(&token.node_incarnation_id)?;
+    validate_id(&token.runtime_id)?;
+    validate_id(&token.server_boot_id)?;
+    if token.expires_at_unix_millis == 0 {
+        return Err(ExportAuthorityError::Invalid);
+    }
+    Ok(())
+}
+
+fn nbd_install_digest(expected: &NbdSessionInstallExpectation) -> [u8; SHA256_SIZE] {
+    let mut unsigned = expected.clone();
+    unsigned.request_digest = NbdRequestDigest([0; SHA256_SIZE]);
+    let encoded = codec()
+        .serialize(&unsigned)
+        .expect("validated bounded NBD install expectation serializes");
+    domain_hash(NBD_INSTALL_DIGEST_DOMAIN, &encoded)
+}
+
+fn nbd_connection_digest(expected: &NbdConnectionExpectation) -> [u8; SHA256_SIZE] {
+    let mut unsigned = expected.clone();
+    unsigned.request_digest = NbdRequestDigest([0; SHA256_SIZE]);
+    let encoded = codec()
+        .serialize(&unsigned)
+        .expect("validated bounded NBD connection expectation serializes");
+    domain_hash(NBD_CONNECTION_DIGEST_DOMAIN, &encoded)
 }
 
 fn validate_record(record: &ExportAuthorityRecord) -> Result<(), ExportAuthorityError> {
@@ -2047,6 +2952,68 @@ mod tests {
             runtime_id: session.runtime_id.clone(),
             server_boot_id: session.server_boot_id.clone(),
         }
+    }
+
+    fn nbd_connector(record: &ExportAuthorityRecord) -> NbdConnectorIdentity {
+        let session = record.active_session.as_ref().unwrap();
+        NbdConnectorIdentity {
+            boot_id: "connector-linux-boot-a".into(),
+            process_id: 4242,
+            process_start_time_ticks: 987_654,
+            node_incarnation_id: session.node_incarnation_id.clone(),
+            runtime_id: session.runtime_id.clone(),
+        }
+    }
+
+    fn nbd_socket_target() -> NbdSocketTarget {
+        NbdSocketTarget {
+            parent_path: b"/run/rhizome/nbd/session-a".to_vec(),
+            parent_device: 31,
+            parent_inode: 41,
+            name: b"session-a.sock".to_vec(),
+            required_parent_user_id: 501,
+            required_parent_group_id: 502,
+            required_parent_mode: 0o700,
+            required_socket_user_id: 501,
+            required_socket_group_id: 502,
+            required_socket_mode: 0o600,
+        }
+    }
+
+    fn nbd_socket(target: &NbdSocketTarget) -> NbdSocketIdentity {
+        NbdSocketIdentity {
+            target: target.clone(),
+            socket_device: 31,
+            socket_inode: 42,
+            socket_user_id: target.required_socket_user_id,
+            socket_group_id: target.required_socket_group_id,
+            socket_mode: target.required_socket_mode,
+        }
+    }
+
+    fn nbd_peer(record: &ExportAuthorityRecord) -> NbdPeerCredentials {
+        NbdPeerCredentials {
+            process_id: nbd_connector(record).process_id,
+            user_id: 0,
+            group_id: 0,
+        }
+    }
+
+    fn nbd_install(record: &ExportAuthorityRecord, ordinal: u8) -> InstallNbdSession {
+        InstallNbdSession::new(
+            token(record),
+            nbd_connector(record),
+            nbd_socket_target(),
+            NbdProtocolProfile::rhizome_p0_p1(),
+            record
+                .active_session
+                .as_ref()
+                .unwrap()
+                .expires_at_unix_millis,
+            [ordinal; SHA256_SIZE],
+            [ordinal.wrapping_add(1); SHA256_SIZE],
+        )
+        .unwrap()
     }
 
     fn mutation_for(
@@ -5215,5 +6182,407 @@ mod tests {
             .unwrap();
         assert!(current.active_session.is_some());
         assert_eq!(current.authority, replacement.authority);
+    }
+
+    #[test]
+    fn nbd_install_builder_binds_the_closed_profile_and_complete_process_identity() {
+        let active = apply_transition(
+            None,
+            ExportAuthorityTransition::Activate(activate_command(authority(3, 5))),
+            NOW,
+            BOOT,
+        )
+        .unwrap();
+        let install = nbd_install(&active, 0x80).expectation();
+        validate_nbd_install_expectation(&install, true).unwrap();
+
+        let mut altered = install.clone();
+        altered.profile.can_multi_conn = true;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Invalid)
+        );
+        let mut altered = install.clone();
+        altered.profile.allow_list = true;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Invalid)
+        );
+        let mut altered = install.clone();
+        altered.profile.send_write_zeroes = true;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Invalid)
+        );
+        let mut altered = install.clone();
+        altered.connector.process_start_time_ticks += 1;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Corrupt)
+        );
+        let mut altered = install;
+        altered.socket_target.parent_inode += 1;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Corrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn nbd_install_is_durable_after_activate_and_replays_before_live_authority() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let command = nbd_install(&active, 0x81);
+        let expected = command.expectation();
+        let outcome = fs
+            .export_authority
+            .install_nbd_session(command.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, NbdSessionInstallOutcome::Pending(expected.clone()));
+        assert_eq!(
+            fs.export_authority
+                .lookup_nbd_session_install(&expected)
+                .await
+                .unwrap(),
+            NbdSessionInstallLookup::Pending(expected.clone())
+        );
+        let mut conflicting_target = nbd_socket_target();
+        conflicting_target.parent_inode += 1;
+        let conflicting = InstallNbdSession::new(
+            token(&active),
+            nbd_connector(&active),
+            conflicting_target,
+            NbdProtocolProfile::rhizome_p0_p1(),
+            active
+                .active_session
+                .as_ref()
+                .unwrap()
+                .expires_at_unix_millis,
+            [0x81; SHA256_SIZE],
+            [0x82; SHA256_SIZE],
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority.install_nbd_session(conflicting).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+
+        fs.write_coordinator
+            .dst_advance_authority_time_floor(u64::MAX);
+        assert_eq!(
+            fs.export_authority.install_nbd_session(command).await,
+            Ok(outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn nbd_install_response_loss_and_flush_unknown_converge_by_durable_outcome() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let dropped = nbd_install(&active, 0x82);
+        let dropped_expected = dropped.expectation();
+        fs.write_coordinator.dst_drop_next_workspace_durable_reply();
+        assert_eq!(
+            fs.export_authority.install_nbd_session(dropped).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        assert!(matches!(
+            fs.export_authority
+                .lookup_nbd_session_install(&dropped_expected)
+                .await
+                .unwrap(),
+            NbdSessionInstallLookup::Pending(_)
+        ));
+
+        let retry_fs = new_export_fs().await;
+        let retry_active = retry_fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let retry = nbd_install(&retry_active, 0x83);
+        let retry_expected = retry.expectation();
+        retry_fs
+            .write_coordinator
+            .dst_fail_next_workspace_durable_flush();
+        assert_eq!(
+            retry_fs
+                .export_authority
+                .install_nbd_session(retry.clone())
+                .await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        assert_eq!(
+            retry_fs
+                .export_authority
+                .lookup_nbd_session_install(&retry_expected)
+                .await
+                .unwrap(),
+            NbdSessionInstallLookup::Unknown
+        );
+        let converged = retry_fs
+            .export_authority
+            .install_nbd_session(retry)
+            .await
+            .unwrap();
+        assert_eq!(converged, NbdSessionInstallOutcome::Pending(retry_expected));
+    }
+
+    #[tokio::test]
+    async fn successful_go_consumes_once_and_publishes_an_exact_connection_receipt() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let install = nbd_install(&active, 0x84);
+        let install_expected = install.expectation();
+        fs.export_authority
+            .install_nbd_session(install)
+            .await
+            .unwrap();
+
+        let socket = nbd_socket(&install_expected.socket_target);
+        let installed = fs
+            .export_authority
+            .complete_nbd_session_install(
+                CompleteNbdSessionInstall::new(install_expected.clone(), socket.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // INFO and failed negotiation have no typed mutation request. Durable
+        // readback before GO proves the terminal install remains unconsumed.
+        let install_key = nbd_session_install_key(&install_expected);
+        let before = read_nbd_session_install_durable(&fs.db, &install_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.state,
+            NbdSessionInstallState::Installed {
+                socket: socket.clone()
+            }
+        );
+
+        let go = ConsumeNbdSession::successful_go(
+            installed,
+            nbd_peer(&active),
+            NbdProtocolProfile::rhizome_p0_p1(),
+        )
+        .unwrap();
+        let expected = go.expectation();
+        let receipt = fs
+            .export_authority
+            .consume_nbd_session(go.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt.expectation, expected);
+        assert_eq!(
+            fs.export_authority
+                .lookup_nbd_connection(&expected)
+                .await
+                .unwrap(),
+            NbdConnectionLookup::Connected(Box::new(receipt.clone()))
+        );
+        assert_eq!(
+            fs.export_authority.consume_nbd_session(go).await,
+            Ok(receipt)
+        );
+
+        let mut competing_peer = expected.peer;
+        competing_peer.group_id = 1;
+        let competing = ConsumeNbdSession::successful_go(
+            expected.install.clone(),
+            competing_peer,
+            expected.negotiated_profile.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority.consume_nbd_session(competing).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+        let after = read_nbd_session_install_durable(&fs.db, &install_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state,
+            NbdSessionInstallState::Consumed {
+                socket,
+                connection_id: expected.connection_id,
+                request_digest: expected.request_digest,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_response_loss_is_unknown_but_single_use_readback_converges() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let install = nbd_install(&active, 0x89);
+        let install_expected = install.expectation();
+        fs.export_authority
+            .install_nbd_session(install)
+            .await
+            .unwrap();
+        let socket = nbd_socket(&install_expected.socket_target);
+        let installed = fs
+            .export_authority
+            .complete_nbd_session_install(
+                CompleteNbdSessionInstall::new(install_expected, socket).unwrap(),
+            )
+            .await
+            .unwrap();
+        let go = ConsumeNbdSession::successful_go(
+            installed,
+            nbd_peer(&active),
+            NbdProtocolProfile::rhizome_p0_p1(),
+        )
+        .unwrap();
+        let expected = go.expectation();
+        fs.write_coordinator.dst_drop_next_workspace_durable_reply();
+        assert_eq!(
+            fs.export_authority.consume_nbd_session(go.clone()).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        let receipt = match fs
+            .export_authority
+            .lookup_nbd_connection(&expected)
+            .await
+            .unwrap()
+        {
+            NbdConnectionLookup::Connected(receipt) => *receipt,
+            NbdConnectionLookup::Unknown => panic!("durable GO receipt missing"),
+        };
+        assert_eq!(
+            fs.export_authority.consume_nbd_session(go).await,
+            Ok(receipt)
+        );
+    }
+
+    #[test]
+    fn nbd_records_reject_checksum_damage_and_cross_key_copy() {
+        let active = apply_transition(
+            None,
+            ExportAuthorityTransition::Activate(activate_command(authority(3, 5))),
+            NOW,
+            BOOT,
+        )
+        .unwrap();
+        let install = nbd_install(&active, 0x8c).expectation();
+        let record = NbdSessionInstallRecord {
+            expectation: install.clone(),
+            state: NbdSessionInstallState::Pending,
+        };
+        let encoded = encode_nbd_session_install(&record).unwrap();
+        let key = nbd_session_install_key(&install);
+        assert_eq!(decode_nbd_session_install(&encoded, &key).unwrap(), record);
+
+        let mut damaged = encoded.to_vec();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            decode_nbd_session_install(&damaged, &key),
+            Err(ExportAuthorityError::Corrupt)
+        );
+
+        let mut different = install.clone();
+        different.token.session_id = "session-b".into();
+        different.request_digest = NbdRequestDigest(nbd_install_digest(&different));
+        assert_eq!(
+            decode_nbd_session_install(&encoded, &nbd_session_install_key(&different)),
+            Err(ExportAuthorityError::Corrupt)
+        );
+
+        let installed = NbdSessionInstallReceipt {
+            socket: nbd_socket(&install.socket_target),
+            expectation: install,
+        };
+        let connection = ConsumeNbdSession::successful_go(
+            installed,
+            nbd_peer(&active),
+            NbdProtocolProfile::rhizome_p0_p1(),
+        )
+        .unwrap();
+        let receipt = NbdConnectionReceipt {
+            expectation: connection.expectation(),
+        };
+        let encoded = encode_nbd_connection_receipt(&receipt).unwrap();
+        let key = nbd_connection_receipt_key(&receipt.expectation);
+        let mut damaged = encoded.to_vec();
+        damaged[8] ^= 1;
+        assert_eq!(
+            decode_nbd_connection_receipt(&damaged, &key),
+            Err(ExportAuthorityError::Corrupt)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn nbd_handshake_action_traces_consume_only_one_successful_go(
+            actions in prop::collection::vec(0u8..3, 1..128)
+        ) {
+            let active = apply_transition(
+                None,
+                ExportAuthorityTransition::Activate(activate_command(authority(3, 5))),
+                NOW,
+                BOOT,
+            ).unwrap();
+            let install = nbd_install(&active, 0x90).expectation();
+            let socket = nbd_socket(&install.socket_target);
+            let installed = NbdSessionInstallReceipt {
+                expectation: install.clone(),
+                socket: socket.clone(),
+            };
+            let go = ConsumeNbdSession::successful_go(
+                installed,
+                nbd_peer(&active),
+                NbdProtocolProfile::rhizome_p0_p1(),
+            ).unwrap().expectation();
+            let mut record = NbdSessionInstallRecord {
+                expectation: install,
+                state: NbdSessionInstallState::Installed { socket },
+            };
+            let mut consumed = false;
+
+            for action in actions {
+                let before = record.clone();
+                match action {
+                    // INFO is read-only at the future adapter boundary.
+                    0 => prop_assert_eq!(&record, &before),
+                    // Failed negotiation is also read-only.
+                    1 => prop_assert_eq!(&record, &before),
+                    _ if !consumed => {
+                        let receipt = apply_nbd_connection_consume(&mut record, go.clone()).unwrap();
+                        prop_assert_eq!(receipt.expectation, go.clone());
+                        consumed = true;
+                    }
+                    _ => {
+                        prop_assert_eq!(
+                            apply_nbd_connection_consume(&mut record, go.clone()),
+                            Err(ExportAuthorityError::Conflict)
+                        );
+                        prop_assert_eq!(&record, &before);
+                    }
+                }
+                let encoded = encode_nbd_session_install(&record).unwrap();
+                let key = nbd_session_install_key(&record.expectation);
+                prop_assert_eq!(decode_nbd_session_install(&encoded, &key).unwrap(), record.clone());
+            }
+        }
     }
 }

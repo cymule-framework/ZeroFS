@@ -57,6 +57,12 @@ const EXPORT_MUTATION_OUTCOME_SUBTYPE: u8 = 2;
 const EXPORT_REVERSE_NAME_SUBTYPE: u8 = 3;
 #[cfg(feature = "rhizome-export-authority-core")]
 const EXPORT_REVERSE_INODE_SUBTYPE: u8 = 4;
+#[cfg(feature = "rhizome-export-authority-core")]
+const NBD_SESSION_INSTALL_SUBTYPE: u8 = 5;
+#[cfg(feature = "rhizome-export-authority-core")]
+const NBD_SESSION_INSTALL_OUTCOME_SUBTYPE: u8 = 6;
+#[cfg(feature = "rhizome-export-authority-core")]
+const NBD_CONNECTION_RECEIPT_SUBTYPE: u8 = 7;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -210,6 +216,16 @@ pub(crate) struct ExportMutationKey<'a> {
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
+pub(crate) struct NbdSessionKey<'a> {
+    pub workspace_id: &'a str,
+    pub actor: &'a str,
+    pub actor_generation: u64,
+    pub placement_epoch: u64,
+    pub session_id: &'a str,
+    pub server_boot_id: &'a str,
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
 pub(crate) enum ExportBindingMetadataKey {
     Inode(u64),
     Extent(u64),
@@ -324,6 +340,114 @@ impl KeyCodec {
         key.push(EXPORT_REVERSE_NAME_SUBTYPE);
         if let Some(directory_inode) = directory_inode {
             key.extend_from_slice(&directory_inode.to_be_bytes());
+        }
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn nbd_session_install_key(&self, identity: &NbdSessionKey<'_>) -> Bytes {
+        self.nbd_session_scoped_key(NBD_SESSION_INSTALL_SUBTYPE, identity, None)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn nbd_connection_receipt_key(
+        &self,
+        identity: &NbdSessionKey<'_>,
+        connection_id: &[u8; 32],
+    ) -> Bytes {
+        self.nbd_session_scoped_key(
+            NBD_CONNECTION_RECEIPT_SUBTYPE,
+            identity,
+            Some(connection_id),
+        )
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn nbd_session_install_outcome_key(
+        &self,
+        workspace_id: &str,
+        request_id: &[u8; 32],
+    ) -> Bytes {
+        self.nbd_request_outcome_key(
+            NBD_SESSION_INSTALL_OUTCOME_SUBTYPE,
+            workspace_id,
+            request_id,
+        )
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    fn nbd_request_outcome_key(
+        &self,
+        subtype: u8,
+        workspace_id: &str,
+        request_id: &[u8; 32],
+    ) -> Bytes {
+        let workspace = workspace_id.as_bytes();
+        let workspace_len =
+            u16::try_from(workspace.len()).expect("validated Workspace id fits u16");
+        let mut key = Vec::with_capacity(
+            META_DOMAIN.len() + 1 + 1 + 1 + 2 + workspace.len() + request_id.len(),
+        );
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(subtype);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace);
+        key.extend_from_slice(request_id);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    fn nbd_session_scoped_key(
+        &self,
+        subtype: u8,
+        identity: &NbdSessionKey<'_>,
+        suffix: Option<&[u8; 32]>,
+    ) -> Bytes {
+        let workspace = identity.workspace_id.as_bytes();
+        let actor = identity.actor.as_bytes();
+        let session = identity.session_id.as_bytes();
+        let boot = identity.server_boot_id.as_bytes();
+        let workspace_len =
+            u16::try_from(workspace.len()).expect("validated Workspace id fits u16");
+        let actor_len = u16::try_from(actor.len()).expect("validated Actor id fits u16");
+        let session_len = u16::try_from(session.len()).expect("validated session id fits u16");
+        let boot_len = u16::try_from(boot.len()).expect("validated boot id fits u16");
+        let suffix_len = suffix.map_or(0, |_| 32);
+        let mut key = Vec::with_capacity(
+            META_DOMAIN.len()
+                + 1
+                + 1
+                + 1
+                + 2
+                + workspace.len()
+                + 2
+                + actor.len()
+                + U64_SIZE
+                + U64_SIZE
+                + 2
+                + session.len()
+                + 2
+                + boot.len()
+                + suffix_len,
+        );
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(subtype);
+        key.extend_from_slice(&workspace_len.to_be_bytes());
+        key.extend_from_slice(workspace);
+        key.extend_from_slice(&actor_len.to_be_bytes());
+        key.extend_from_slice(actor);
+        key.extend_from_slice(&identity.actor_generation.to_be_bytes());
+        key.extend_from_slice(&identity.placement_epoch.to_be_bytes());
+        key.extend_from_slice(&session_len.to_be_bytes());
+        key.extend_from_slice(session);
+        key.extend_from_slice(&boot_len.to_be_bytes());
+        key.extend_from_slice(boot);
+        if let Some(suffix) = suffix {
+            key.extend_from_slice(suffix);
         }
         Bytes::from(key)
     }

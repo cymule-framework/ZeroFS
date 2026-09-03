@@ -8,12 +8,20 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 #[cfg(feature = "rhizome-export-authority-core")]
 use crate::fs::export_authority::{
-    ExportAdmissionGuard, ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition,
-    ExportMutationContext, ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict,
-    MutationIdentity, apply_transition, encode_outcome, encode_record, encode_reverse_binding,
-    ensure_outcome, mutation_outcome_key, read_outcome_current, read_record_current,
+    CompleteNbdSessionInstall, ConsumeNbdSession, ExportAdmissionGuard, ExportAuthorityError,
+    ExportAuthorityRecord, ExportAuthorityTransition, ExportMutationContext,
+    ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict, InstallNbdSession,
+    MutationIdentity, NbdConnectionReceipt, NbdSessionInstallOutcome, NbdSessionInstallReceipt,
+    NbdSessionInstallRecord, NbdSessionInstallState, apply_nbd_connection_consume,
+    apply_transition, encode_nbd_connection_receipt, encode_nbd_install_outcome,
+    encode_nbd_session_install, encode_outcome, encode_record, encode_reverse_binding,
+    ensure_nbd_connection_receipt, ensure_nbd_install_outcome, ensure_nbd_install_state,
+    ensure_outcome, mutation_outcome_key, nbd_connection_receipt_key, nbd_install_outcome_key,
+    nbd_session_install_key, read_nbd_connection_receipt_current, read_nbd_install_outcome_current,
+    read_nbd_session_install_current, read_outcome_current, read_record_current,
     read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
-    trusted_now_unix_millis, validate_mutation,
+    trusted_now_unix_millis, validate_mutation, validate_nbd_connection_expectation,
+    validate_nbd_install_expectation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -82,6 +90,24 @@ enum Request {
         ExportAuthorityTransition,
         ExportAdmissionGuard,
         oneshot::Sender<Result<ExportAuthorityRecord, ExportAuthorityError>>,
+    ),
+    #[cfg(feature = "rhizome-export-authority-core")]
+    InstallNbdSession(
+        InstallNbdSession,
+        ExportAdmissionGuard,
+        oneshot::Sender<Result<NbdSessionInstallOutcome, ExportAuthorityError>>,
+    ),
+    #[cfg(feature = "rhizome-export-authority-core")]
+    CompleteNbdSessionInstall(
+        CompleteNbdSessionInstall,
+        ExportAdmissionGuard,
+        oneshot::Sender<Result<NbdSessionInstallReceipt, ExportAuthorityError>>,
+    ),
+    #[cfg(feature = "rhizome-export-authority-core")]
+    ConsumeNbdSession(
+        ConsumeNbdSession,
+        ExportAdmissionGuard,
+        oneshot::Sender<Result<NbdConnectionReceipt, ExportAuthorityError>>,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
     FenceMutationConflict(
@@ -272,6 +298,51 @@ impl WriteCoordinator {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::ExportAuthority(transition, guard, reply_tx))
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) async fn install_nbd_session(
+        &self,
+        command: InstallNbdSession,
+        guard: ExportAdmissionGuard,
+    ) -> Result<NbdSessionInstallOutcome, ExportAuthorityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::InstallNbdSession(command, guard, reply_tx))
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) async fn complete_nbd_session_install(
+        &self,
+        command: CompleteNbdSessionInstall,
+        guard: ExportAdmissionGuard,
+    ) -> Result<NbdSessionInstallReceipt, ExportAuthorityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::CompleteNbdSessionInstall(command, guard, reply_tx))
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) async fn consume_nbd_session(
+        &self,
+        command: ConsumeNbdSession,
+        guard: ExportAdmissionGuard,
+    ) -> Result<NbdConnectionReceipt, ExportAuthorityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::ConsumeNbdSession(command, guard, reply_tx))
             .map_err(|_| ExportAuthorityError::Storage)?;
         reply_rx
             .await
@@ -640,6 +711,51 @@ async fn worker_loop(
             continue;
         }
         #[cfg(feature = "rhizome-export-authority-core")]
+        if let Request::InstallNbdSession(command, _guard, reply) = first {
+            let result = commit_nbd_session_install(&mut ctx, command).await;
+            #[cfg(any(test, dst))]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
+        #[cfg(feature = "rhizome-export-authority-core")]
+        if let Request::CompleteNbdSessionInstall(command, _guard, reply) = first {
+            let result = commit_nbd_session_install_completion(&mut ctx, command).await;
+            #[cfg(any(test, dst))]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
+        #[cfg(feature = "rhizome-export-authority-core")]
+        if let Request::ConsumeNbdSession(command, _guard, reply) = first {
+            let result = commit_nbd_session_consume(&mut ctx, command).await;
+            #[cfg(any(test, dst))]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
+        #[cfg(feature = "rhizome-export-authority-core")]
         if let Request::FenceMutationConflict(conflict, _guard, reply) = first {
             let result = commit_mutation_conflict_fence(&mut ctx, conflict).await;
             #[cfg(any(test, dst))]
@@ -684,6 +800,12 @@ async fn worker_loop(
             ),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::ExportAuthority(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-export-authority-core")]
+            Request::InstallNbdSession(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-export-authority-core")]
+            Request::CompleteNbdSessionInstall(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-export-authority-core")]
+            Request::ConsumeNbdSession(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::FenceMutationConflict(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
@@ -738,6 +860,21 @@ async fn worker_loop(
                 #[cfg(feature = "rhizome-export-authority-core")]
                 Request::ExportAuthority(transition, guard, reply) => {
                     pending = Some(Request::ExportAuthority(transition, guard, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-export-authority-core")]
+                Request::InstallNbdSession(command, guard, reply) => {
+                    pending = Some(Request::InstallNbdSession(command, guard, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-export-authority-core")]
+                Request::CompleteNbdSessionInstall(command, guard, reply) => {
+                    pending = Some(Request::CompleteNbdSessionInstall(command, guard, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-export-authority-core")]
+                Request::ConsumeNbdSession(command, guard, reply) => {
+                    pending = Some(Request::ConsumeNbdSession(command, guard, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1399,6 +1536,249 @@ async fn validate_physical_export(
         return Err(ExportAuthorityError::Invalid);
     }
     Ok(())
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn commit_nbd_session_install(
+    ctx: &mut WorkerContext,
+    command: InstallNbdSession,
+) -> Result<NbdSessionInstallOutcome, ExportAuthorityError> {
+    if ctx.replicator.is_some() {
+        return Err(ExportAuthorityError::Storage);
+    }
+    let expected = command.expectation();
+    validate_nbd_install_expectation(&expected, true)?;
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let outcome_key = nbd_install_outcome_key(&expected);
+    if let Some(outcome) =
+        read_nbd_install_outcome_current(&ctx.db, &outcome_key, &expected).await?
+    {
+        ensure_nbd_install_outcome(&outcome, &expected)?;
+        let install_key = nbd_session_install_key(&expected);
+        let install = read_nbd_session_install_current(&ctx.db, &install_key)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        ensure_nbd_install_state(&install, &outcome, &expected)?;
+        drop(permit);
+        flush_nbd_session_commit(ctx).await?;
+        return Ok(outcome);
+    }
+    validate_nbd_session_authority(ctx, &expected).await?;
+
+    let install_key = nbd_session_install_key(&expected);
+    if let Some(existing) = read_nbd_session_install_current(&ctx.db, &install_key).await? {
+        if existing.expectation == expected {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+        return Err(ExportAuthorityError::Conflict);
+    }
+
+    let record = NbdSessionInstallRecord {
+        expectation: expected.clone(),
+        state: NbdSessionInstallState::Pending,
+    };
+    let outcome = NbdSessionInstallOutcome::Pending(expected);
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(install_key, encode_nbd_session_install(&record)?);
+    batch.put_bytes(outcome_key, encode_nbd_install_outcome(&outcome)?);
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
+    flush_nbd_session_commit(ctx).await?;
+    Ok(outcome)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn commit_nbd_session_install_completion(
+    ctx: &mut WorkerContext,
+    command: CompleteNbdSessionInstall,
+) -> Result<NbdSessionInstallReceipt, ExportAuthorityError> {
+    if ctx.replicator.is_some() {
+        return Err(ExportAuthorityError::Storage);
+    }
+    let expected = command.expectation().clone();
+    let socket = command.socket().clone();
+    validate_nbd_install_expectation(&expected, true)?;
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let outcome_key = nbd_install_outcome_key(&expected);
+    let outcome = read_nbd_install_outcome_current(&ctx.db, &outcome_key, &expected)
+        .await?
+        .ok_or(ExportAuthorityError::NotFound)?;
+    ensure_nbd_install_outcome(&outcome, &expected)?;
+    let install_key = nbd_session_install_key(&expected);
+    let mut install = read_nbd_session_install_current(&ctx.db, &install_key)
+        .await?
+        .ok_or(ExportAuthorityError::Corrupt)?;
+    ensure_nbd_install_state(&install, &outcome, &expected)?;
+    if let NbdSessionInstallOutcome::Installed(receipt) = outcome {
+        if receipt.socket != socket {
+            return Err(ExportAuthorityError::Conflict);
+        }
+        drop(permit);
+        flush_nbd_session_commit(ctx).await?;
+        return Ok(receipt);
+    }
+    if !matches!(install.state, NbdSessionInstallState::Pending) {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    let receipt = NbdSessionInstallReceipt {
+        expectation: expected,
+        socket,
+    };
+    install.state = NbdSessionInstallState::Installed {
+        socket: receipt.socket.clone(),
+    };
+    let terminal = NbdSessionInstallOutcome::Installed(receipt.clone());
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(install_key, encode_nbd_session_install(&install)?);
+    batch.put_bytes(outcome_key, encode_nbd_install_outcome(&terminal)?);
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
+    flush_nbd_session_commit(ctx).await?;
+    Ok(receipt)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn commit_nbd_session_consume(
+    ctx: &mut WorkerContext,
+    command: ConsumeNbdSession,
+) -> Result<NbdConnectionReceipt, ExportAuthorityError> {
+    if ctx.replicator.is_some() {
+        return Err(ExportAuthorityError::Storage);
+    }
+    let expected = command.expectation();
+    validate_nbd_connection_expectation(&expected, true)?;
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let receipt_key = nbd_connection_receipt_key(&expected);
+    if let Some(receipt) = read_nbd_connection_receipt_current(&ctx.db, &receipt_key).await? {
+        ensure_nbd_connection_receipt(&receipt, &expected)?;
+        let install_key = nbd_session_install_key(&expected.install.expectation);
+        let install = read_nbd_session_install_current(&ctx.db, &install_key)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        if install.expectation != expected.install.expectation
+            || install.state
+                != (NbdSessionInstallState::Consumed {
+                    socket: expected.install.socket.clone(),
+                    connection_id: expected.connection_id,
+                    request_digest: expected.request_digest,
+                })
+        {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+        drop(permit);
+        flush_nbd_session_commit(ctx).await?;
+        return Ok(receipt);
+    }
+    validate_nbd_session_authority(ctx, &expected.install.expectation).await?;
+
+    let install_outcome_key = nbd_install_outcome_key(&expected.install.expectation);
+    let install_outcome = read_nbd_install_outcome_current(
+        &ctx.db,
+        &install_outcome_key,
+        &expected.install.expectation,
+    )
+    .await?
+    .ok_or(ExportAuthorityError::Corrupt)?;
+    ensure_nbd_install_outcome(&install_outcome, &expected.install.expectation)?;
+    if install_outcome != NbdSessionInstallOutcome::Installed(expected.install.clone()) {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    let install_key = nbd_session_install_key(&expected.install.expectation);
+    let mut install = read_nbd_session_install_current(&ctx.db, &install_key)
+        .await?
+        .ok_or(ExportAuthorityError::NotFound)?;
+    if read_nbd_connection_receipt_current(&ctx.db, &receipt_key)
+        .await?
+        .is_some()
+    {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+
+    let receipt = apply_nbd_connection_consume(&mut install, expected)?;
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(install_key, encode_nbd_session_install(&install)?);
+    batch.put_bytes(receipt_key, encode_nbd_connection_receipt(&receipt)?);
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
+    flush_nbd_session_commit(ctx).await?;
+    Ok(receipt)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn validate_nbd_session_authority(
+    ctx: &WorkerContext,
+    expected: &crate::fs::export_authority::NbdSessionInstallExpectation,
+) -> Result<(), ExportAuthorityError> {
+    let boot = ctx
+        .db
+        .get_bytes(&ctx.key_codec.export_boot_key())
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes()) {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    let now = authority_now(&ctx.authority_time_floor);
+    if expected.expires_at_unix_millis <= now {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    let authority_key = ctx
+        .key_codec
+        .export_authority_key(&expected.token.workspace_id);
+    let current = read_record_current(&ctx.db, &authority_key, &expected.token.workspace_id)
+        .await?
+        .ok_or(ExportAuthorityError::NotFound)?;
+    validate_mutation(
+        Some(&current),
+        &expected.token,
+        now,
+        &ctx.export_server_boot_id,
+    )?;
+    let binding = reverse_binding_for(&current);
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    let by_name = read_reverse_binding_current(&ctx.db, &name_key).await?;
+    let by_inode = read_reverse_binding_current(&ctx.db, &inode_key).await?;
+    if current.export != expected.token.export
+        || by_name.as_ref() != Some(&binding)
+        || by_inode.as_ref() != Some(&binding)
+    {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    validate_physical_export(&ctx.db, &ctx.key_codec, &binding.export).await
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn flush_nbd_session_commit(ctx: &mut WorkerContext) -> Result<(), ExportAuthorityError> {
+    #[cfg(test)]
+    let fail_injected = ctx
+        .workspace_durable_test_hook
+        .fail_next_flush
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let fail_injected = false;
+    let flush_result = if fail_injected {
+        Err(crate::fs::errors::FsError::IoError)
+    } else {
+        ctx.flush_coordinator.flush().await
+    };
+    flush_result.map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
