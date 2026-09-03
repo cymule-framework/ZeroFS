@@ -50,6 +50,7 @@ jobs:
       - run: cargo test
       - run: cargo test -p zerofs --features rhizome-export-authority-core --lib
       - run: cargo test -p zerofs --features rhizome-workspace-genesis-core --lib fs::workspace_genesis
+      - run: cargo test -p zerofs --features 'rhizome-workspace-genesis-core failpoints' --lib fs::workspace_genesis
       - run: cargo test -p zerofs-client --all-features
       - run: cargo test -p zerofs --features failpoints --lib workspace_operation
       - run: cargo test --features failpoints --test failpoints

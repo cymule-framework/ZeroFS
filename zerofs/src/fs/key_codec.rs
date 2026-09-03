@@ -237,6 +237,29 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn workspace_genesis_prefix(&self) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 2);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_GENESIS);
+        key.push(1);
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn parse_workspace_genesis_workspace<'a>(&self, key: &'a [u8]) -> Option<&'a str> {
+        let prefix = self.workspace_genesis_prefix();
+        if !key.starts_with(&prefix) || key.len() < prefix.len() + 2 {
+            return None;
+        }
+        let offset = prefix.len();
+        let len = u16::from_be_bytes(key[offset..offset + 2].try_into().ok()?) as usize;
+        if key.len() != offset + 2 + len {
+            return None;
+        }
+        std::str::from_utf8(&key[offset + 2..]).ok()
+    }
+
     #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn export_authority_key(&self, workspace_id: &str) -> Bytes {
         let bytes = workspace_id.as_bytes();

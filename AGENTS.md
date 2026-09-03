@@ -159,6 +159,16 @@ attribution intact.
   conditional Create followed by exact-key byte/digest readback. Never replace
   this with HEAD-before-PUT, overwrite, retrying an unknown mutation, or Redis
   authority.
+- The generic ZeroFS object-store stack is not a genesis mutation executor: it
+  may contain automatic or unbounded PUT retries. Genesis uses a dedicated
+  single-dispatch adapter. The production adapter is intentionally unavailable
+  in this candidate; only tests have a direct non-retrying implementation.
+- Before the one Create attempt, atomically advance the same 0x0A operation from
+  PENDING to its immutable effect-dispatch claim. Only the call that installs
+  that claim may send Create. Every replay, including cold reopen after unknown
+  Create/readback, may perform exact-key GET only. Generic terminal completion
+  is rejected after a claim; only the typed genesis completion path may finish
+  it after exact receipt and durable graph verification.
 - The coordinator atomically publishes the sparse `.nbd` file, immutable 0x0C
   record, and both 0x0B reverse bindings, then flushes and reads writer epoch
   plus durable sequence from one `DbStatus` snapshot. Activation under this
@@ -167,3 +177,9 @@ attribution intact.
   unreachable until Rhizome's normative CDDL and official fixtures exist.
   Tests may use only the sealed test constructors. Genesis records use the
   explicit closed codec; do not serialize them with bincode or protobuf.
+- The 0x0C row binds the complete operation key, authority creation baseline,
+  tenant, immutable template/root-policy refs, source CreateActor digest,
+  object lineage, storage shard/routing revision, root identity, and exact
+  export identity. Validate the configured local shard before lookup or effect.
+  Activation requires the same home/authority baseline and a durable 0x0A
+  SUCCEEDED outcome; PENDING or effect-dispatched is not genesis success.

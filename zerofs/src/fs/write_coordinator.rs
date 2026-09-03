@@ -1629,8 +1629,21 @@ async fn commit_workspace_genesis(
 #[cfg(feature = "rhizome-workspace-genesis-core")]
 fn same_genesis_intent(current: &GenesisDomainRecord, requested: &GenesisDomainRecord) -> bool {
     current.workspace_id == requested.workspace_id
+        && current.operation_kind == requested.operation_kind
+        && current.request_id == requested.request_id
         && current.actor == requested.actor
         && current.actor_generation == requested.actor_generation
+        && current.home_cell == requested.home_cell
+        && current.home_revision == requested.home_revision
+        && current.authority_epoch == requested.authority_epoch
+        && current.tenant == requested.tenant
+        && current.template == requested.template
+        && current.root_policy == requested.root_policy
+        && current.source_create_actor_request_digest
+            == requested.source_create_actor_request_digest
+        && current.object_lineage == requested.object_lineage
+        && current.storage_shard_id == requested.storage_shard_id
+        && current.storage_routing_revision == requested.storage_routing_revision
         && current.request_digest == requested.request_digest
         && current.root_digest == requested.root_digest
         && current.root_object_key == requested.root_object_key
@@ -1705,14 +1718,38 @@ async fn commit_export_authority_transition(
         crate::fs::workspace_genesis::validate_activation_genesis(
             &genesis,
             &workspace_id,
-            &command.authority.actor,
-            command.authority.actor_generation,
+            &command.authority,
             &command.export,
         )
         .map_err(|error| match error {
             GenesisError::Conflict => ExportAuthorityError::Conflict,
             _ => ExportAuthorityError::Corrupt,
         })?;
+        let operation = crate::fs::workspace_operation::WorkspaceOperationKey::new(
+            genesis.workspace_id.clone(),
+            genesis.operation_kind,
+            genesis.request_id.clone(),
+        );
+        match crate::fs::workspace_operation::read_operation_durable(
+            &ctx.db,
+            &operation,
+            genesis.request_digest,
+        )
+        .await
+        .map_err(|_| ExportAuthorityError::Corrupt)?
+        {
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Known(record)
+                if matches!(
+                    record.state,
+                    crate::fs::workspace_operation::WorkspaceOperationState::Succeeded(_)
+                ) => {}
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Known(_) => {
+                return Err(ExportAuthorityError::Conflict);
+            }
+            crate::fs::workspace_operation::WorkspaceOperationLookup::Unknown => {
+                return Err(ExportAuthorityError::NotFound);
+            }
+        }
     }
     let key = ctx.key_codec.export_authority_key(&workspace_id);
     let permit = ctx
@@ -1825,7 +1862,7 @@ async fn commit_export_authority_transition(
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
-async fn validate_physical_export(
+pub(super) async fn validate_physical_export(
     db: &Db,
     key_codec: &KeyCodec,
     export: &crate::fs::export_authority::ExportIdentity,
@@ -2057,6 +2094,30 @@ async fn ensure_export_binding_index(
         };
         if record.binding_initialized {
             rebuilt.insert(&reverse_binding_for(&record));
+        }
+    }
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    {
+        let mut genesis = match db
+            .scan_prefix(key_codec.workspace_genesis_prefix(), None, 4 * 1024)
+            .await
+        {
+            Ok(scan) => scan,
+            Err(_) => return poison_export_binding_index(index, rebuilt),
+        };
+        while let Some(row) = genesis.next().await {
+            let (key, value) = match row {
+                Ok(row) => row,
+                Err(_) => return poison_export_binding_index(index, rebuilt),
+            };
+            let Some(workspace) = key_codec.parse_workspace_genesis_workspace(&key) else {
+                return poison_export_binding_index(index, rebuilt);
+            };
+            let record = match decode_genesis_record(&key, &value) {
+                Ok(record) if record.workspace_id == workspace => record,
+                _ => return poison_export_binding_index(index, rebuilt),
+            };
+            rebuilt.insert(&crate::fs::workspace_genesis::reverse_binding(&record));
         }
     }
     for prefix in [

@@ -67,6 +67,9 @@ pub enum WorkspaceTerminalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceOperationState {
     Pending,
+    /// One immutable, domain-specific effect-dispatch claim. The exact bytes
+    /// identify the only mutation attempt authorized for this operation.
+    EffectDispatched(Bytes),
     Succeeded(Bytes),
     Failed(Bytes),
     NotCommitted(Bytes),
@@ -74,8 +77,14 @@ pub enum WorkspaceOperationState {
 
 impl WorkspaceOperationState {
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Pending)
+        !matches!(self, Self::Pending | Self::EffectDispatched(_))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectDispatchClaim {
+    Installed(WorkspaceOperationRecord),
+    Existing(WorkspaceOperationRecord),
 }
 
 impl From<WorkspaceTerminalOutcome> for WorkspaceOperationState {
@@ -227,6 +236,9 @@ impl WorkspaceOperationLedger {
             return Ok(WorkspaceOperationLookup::Unknown);
         };
         ensure_digest(&existing, request_digest)?;
+        if matches!(existing.state, WorkspaceOperationState::EffectDispatched(_)) {
+            return Err(WorkspaceOperationError::TerminalImmutable);
+        }
         if existing.state.is_terminal() {
             return if existing == desired {
                 Ok(WorkspaceOperationLookup::Known(existing))
@@ -238,6 +250,98 @@ impl WorkspaceOperationLedger {
         self.commit_record(&encoded_key, &desired, guard).await?;
         self.maybe_lose_commit_reply()?;
         Ok(WorkspaceOperationLookup::Known(desired))
+    }
+
+    /// Complete an externally claimed effect. The claim bytes are the durable
+    /// handoff identity; only the typed domain owner may use this path after
+    /// validating its effect receipt.
+    pub(super) async fn complete_claimed_effect(
+        &self,
+        key: &WorkspaceOperationKey,
+        request_digest: CanonicalRequestDigest,
+        exact_claim: &Bytes,
+        outcome: WorkspaceTerminalOutcome,
+    ) -> Result<WorkspaceOperationLookup, WorkspaceOperationError> {
+        let encoded_key = self.encode_key(key)?;
+        let desired = WorkspaceOperationRecord {
+            request_digest,
+            state: outcome.into(),
+        };
+        validate_record(&desired)?;
+        let (existing, guard) = self.read_durable_current(&encoded_key).await?;
+        let Some(existing) = existing else {
+            return Ok(WorkspaceOperationLookup::Unknown);
+        };
+        ensure_digest(&existing, request_digest)?;
+        match &existing.state {
+            WorkspaceOperationState::EffectDispatched(current) if current == exact_claim => {
+                self.commit_record(&encoded_key, &desired, guard).await?;
+                self.maybe_lose_commit_reply()?;
+                Ok(WorkspaceOperationLookup::Known(desired))
+            }
+            WorkspaceOperationState::EffectDispatched(_) => {
+                Err(WorkspaceOperationError::RequestConflict)
+            }
+            state if state.is_terminal() => {
+                if existing == desired {
+                    Ok(WorkspaceOperationLookup::Known(existing))
+                } else {
+                    Err(WorkspaceOperationError::TerminalImmutable)
+                }
+            }
+            WorkspaceOperationState::Pending => Err(WorkspaceOperationError::TerminalImmutable),
+            WorkspaceOperationState::Succeeded(_)
+            | WorkspaceOperationState::Failed(_)
+            | WorkspaceOperationState::NotCommitted(_) => unreachable!(),
+        }
+    }
+
+    /// Durably authorize exactly one external mutation attempt. Only the call
+    /// that installs the claim may dispatch; replay may perform readback only.
+    pub(crate) async fn claim_effect_dispatch(
+        &self,
+        key: &WorkspaceOperationKey,
+        request_digest: CanonicalRequestDigest,
+        exact_claim: Bytes,
+    ) -> Result<EffectDispatchClaim, WorkspaceOperationError> {
+        if exact_claim.is_empty() {
+            return Err(WorkspaceOperationError::CorruptRecord(
+                "effect dispatch claim is empty",
+            ));
+        }
+        let encoded_key = self.encode_key(key)?;
+        let desired = WorkspaceOperationRecord {
+            request_digest,
+            state: WorkspaceOperationState::EffectDispatched(exact_claim),
+        };
+        validate_record(&desired)?;
+        let (existing, guard) = self.read_durable_current(&encoded_key).await?;
+        let Some(existing) = existing else {
+            return Err(WorkspaceOperationError::CorruptRecord(
+                "effect dispatch requires a pending operation",
+            ));
+        };
+        ensure_digest(&existing, request_digest)?;
+        match &existing.state {
+            WorkspaceOperationState::Pending => {
+                self.commit_record(&encoded_key, &desired, guard).await?;
+                self.maybe_lose_commit_reply()?;
+                Ok(EffectDispatchClaim::Installed(desired))
+            }
+            WorkspaceOperationState::EffectDispatched(bytes)
+                if bytes
+                    == match &desired.state {
+                        WorkspaceOperationState::EffectDispatched(bytes) => bytes,
+                        _ => unreachable!(),
+                    } =>
+            {
+                Ok(EffectDispatchClaim::Existing(existing))
+            }
+            WorkspaceOperationState::EffectDispatched(_) => {
+                Err(WorkspaceOperationError::RequestConflict)
+            }
+            _ => Ok(EffectDispatchClaim::Existing(existing)),
+        }
     }
 
     /// Read only object-store-durable state. Absence is UNKNOWN; this primitive
@@ -381,6 +485,10 @@ fn ensure_digest(
 fn validate_record(record: &WorkspaceOperationRecord) -> Result<(), WorkspaceOperationError> {
     match &record.state {
         WorkspaceOperationState::Pending => Ok(()),
+        WorkspaceOperationState::EffectDispatched(bytes) if bytes.is_empty() => Err(
+            WorkspaceOperationError::CorruptRecord("effect dispatch claim is empty"),
+        ),
+        WorkspaceOperationState::EffectDispatched(_) => Ok(()),
         WorkspaceOperationState::Succeeded(bytes)
         | WorkspaceOperationState::Failed(bytes)
         | WorkspaceOperationState::NotCommitted(bytes)
@@ -406,6 +514,7 @@ fn encode_record(
         WorkspaceOperationState::Succeeded(bytes) => (2, bytes.clone()),
         WorkspaceOperationState::Failed(bytes) => (3, bytes.clone()),
         WorkspaceOperationState::NotCommitted(bytes) => (4, bytes.clone()),
+        WorkspaceOperationState::EffectDispatched(bytes) => (5, bytes.clone()),
     };
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| WorkspaceOperationError::CorruptRecord("terminal payload is too large"))?;
@@ -487,6 +596,14 @@ fn decode_record(
         2 => WorkspaceOperationState::Succeeded(Bytes::copy_from_slice(payload)),
         3 => WorkspaceOperationState::Failed(Bytes::copy_from_slice(payload)),
         4 => WorkspaceOperationState::NotCommitted(Bytes::copy_from_slice(payload)),
+        5 if !payload.is_empty() => {
+            WorkspaceOperationState::EffectDispatched(Bytes::copy_from_slice(payload))
+        }
+        5 => {
+            return Err(WorkspaceOperationError::CorruptRecord(
+                "effect dispatch claim is empty",
+            ));
+        }
         _ => {
             return Err(WorkspaceOperationError::CorruptRecord(
                 "record state is unsupported",
@@ -499,6 +616,36 @@ fn decode_record(
     };
     validate_record(&record)?;
     Ok(record)
+}
+
+pub(crate) async fn read_operation_durable(
+    db: &Db,
+    key: &WorkspaceOperationKey,
+    request_digest: CanonicalRequestDigest,
+) -> Result<WorkspaceOperationLookup, WorkspaceOperationError> {
+    validate_identity("workspace_id", &key.workspace_id)?;
+    validate_identity("request_id", &key.request_id)?;
+    if key.kind <= 0 {
+        return Err(WorkspaceOperationError::InvalidIdentity(
+            "operation kind must be positive",
+        ));
+    }
+    let encoded = KeyCodec::new().workspace_operation_key(
+        KEY_VERSION,
+        key.workspace_id.as_bytes(),
+        key.kind,
+        key.request_id.as_bytes(),
+    );
+    let Some(bytes) = db
+        .get_bytes_durable(&encoded)
+        .await
+        .map_err(|error| FsError::from_db_error(&error))?
+    else {
+        return Ok(WorkspaceOperationLookup::Unknown);
+    };
+    let record = decode_record(&encoded, &bytes)?;
+    ensure_digest(&record, request_digest)?;
+    Ok(WorkspaceOperationLookup::Known(record))
 }
 
 #[cfg(test)]

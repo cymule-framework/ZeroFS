@@ -1332,7 +1332,7 @@ pub(crate) async fn read_reverse_binding_current(
     decode_reverse_binding(&bytes, key).map(Some)
 }
 
-async fn read_reverse_binding_durable(
+pub(crate) async fn read_reverse_binding_durable(
     db: &Db,
     key: &Bytes,
 ) -> Result<Option<ExportReverseBinding>, ExportAuthorityError> {

@@ -8,7 +8,9 @@ commands and signed terminal bytes intentionally do not exist yet.
 ## One lifecycle authority
 
 Genesis uses the existing `meta + 0x0A` Workspace operation ledger for PENDING
-and immutable terminal outcomes. The new `meta + 0x0C` row is only the immutable
+effect-dispatch claim, and immutable terminal outcomes. The claim authorizes one
+external Create attempt; only its installing call may dispatch. The new
+`meta + 0x0C` row is only the immutable
 domain result: Workspace and Actor identity, Actor generation, canonical request
 digest, SHA-256 root identity and object key, and exact physical export binding.
 It is not a second operation state machine.
@@ -23,9 +25,13 @@ Only test code can currently construct those seals.
 
 The immutable root object is written at
 `rhizome/workspace-genesis/sha256/<lowercase digest>` with native conditional
-Create. Success, AlreadyExists, and an ambiguous Create response all converge by
+Create through a dedicated single-dispatch adapter. The generic ZeroFS object
+store is deliberately not reused because its retry layers may repeat PUT.
+Success, AlreadyExists, and an ambiguous Create response all converge by
 one exact-key GET whose length, SHA-256, and bytes must match. A failed readback
-is UNKNOWN; no mutation retry or overwrite is authorized.
+is UNKNOWN; every later invocation and cold reopen performs GET only, never a
+second mutation. The production adapter remains unavailable until its exact
+non-retry configuration and wire-count conformance are qualified.
 
 After object convergence, the sole `WriteCoordinator` acquires the database
 write permit and either replays an exact existing genesis graph or atomically
@@ -45,8 +51,10 @@ through durable 0x0C plus physical/reverse-graph readback.
 ## Activation boundary
 
 When this profile is built for production, `ActivateExport` requires a durable
-genesis row whose Workspace, Actor, Actor generation, and complete export
-identity match. Activation also re-reads the physical `.nbd` graph even when the
+0x0A SUCCEEDED operation and a genesis row whose complete operation, authority
+creation baseline, Workspace, tenant, Actor, Actor generation, immutable spec,
+lineage, storage selection, root, and export identity match. Activation also
+re-reads the physical `.nbd` graph even when the
 reverse bindings were preinstalled by genesis. The normal export-authority test
 profile keeps this additional gate disabled unless a test explicitly enables it,
 so the independent authority-core suite remains scoped to its own primitive.
@@ -54,3 +62,9 @@ so the independent authority-core suite remains scoped to its own primitive.
 HA genesis remains fail-closed. This candidate does not qualify a release, NBD
 listener, S3 provider, checkpoint, clone, GC, signed receipt, runtime, route, or
 Actor READY transition.
+
+The physical receipt currently exposes the root/export binding and coherent
+SlateDB writer/durable cut. It does not yet construct the normative signed
+`WorkspaceHead`, manifest ID, or commit-time payload. Those remain part of the
+unreachable production signer integration, not values this mechanics candidate
+may synthesize or claim as conformance evidence.

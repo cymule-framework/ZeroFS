@@ -22,15 +22,15 @@ use crate::fs::key_codec::KeyCodec;
 #[cfg(test)]
 use crate::fs::workspace_operation::WorkspaceOperationState;
 use crate::fs::workspace_operation::{
-    CanonicalRequestDigest, WorkspaceOperationError, WorkspaceOperationKey,
+    CanonicalRequestDigest, EffectDispatchClaim, WorkspaceOperationError, WorkspaceOperationKey,
     WorkspaceOperationLookup, WorkspaceOperationRecord, WorkspaceTerminalOutcome,
 };
 use crate::fs::write_coordinator::WriteCoordinator;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use slatedb::object_store::{
-    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path,
-};
+use slatedb::object_store::{ObjectStore, path::Path};
+#[cfg(test)]
+use slatedb::object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use std::sync::Arc;
 
 const RECORD_MAGIC: &[u8; 4] = b"RWGN";
@@ -40,6 +40,60 @@ const MAX_ID_BYTES: usize = 1024;
 const MAX_OBJECT_KEY_BYTES: usize = 4096;
 const RECORD_CHECKSUM_DOMAIN: &[u8] = b"rhizome.workspace-genesis-record.v1\0";
 const ROOT_OBJECT_PREFIX: &str = "rhizome/workspace-genesis/sha256/";
+const EFFECT_CLAIM_DOMAIN: &[u8] = b"rhizome.workspace-genesis-object-create.v1\0";
+
+#[async_trait::async_trait]
+trait GenesisObjectCreator: Send + Sync {
+    async fn create_once(&self, path: &Path, bytes: &Bytes) -> Result<(), GenesisError>;
+    async fn get_exact(&self, path: &Path) -> Result<Bytes, GenesisError>;
+}
+
+#[cfg(not(test))]
+struct UnavailableGenesisObjectCreator;
+
+#[cfg(not(test))]
+#[async_trait::async_trait]
+impl GenesisObjectCreator for UnavailableGenesisObjectCreator {
+    async fn create_once(&self, _path: &Path, _bytes: &Bytes) -> Result<(), GenesisError> {
+        Err(GenesisError::Storage)
+    }
+
+    async fn get_exact(&self, _path: &Path) -> Result<Bytes, GenesisError> {
+        Err(GenesisError::ObjectOutcomeUnknown)
+    }
+}
+
+#[cfg(test)]
+struct DirectTestGenesisObjectCreator(Arc<dyn ObjectStore>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl GenesisObjectCreator for DirectTestGenesisObjectCreator {
+    async fn create_once(&self, path: &Path, bytes: &Bytes) -> Result<(), GenesisError> {
+        match self
+            .0
+            .put_opts(
+                path,
+                PutPayload::from(bytes.clone()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(_) => Err(GenesisError::ObjectOutcomeUnknown),
+        }
+    }
+
+    async fn get_exact(&self, path: &Path) -> Result<Bytes, GenesisError> {
+        self.0
+            .get(path)
+            .await
+            .map_err(|_| GenesisError::ObjectOutcomeUnknown)?
+            .bytes()
+            .await
+            .map_err(|_| GenesisError::ObjectOutcomeUnknown)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentDigest([u8; SHA256_SIZE]);
@@ -60,6 +114,16 @@ pub(crate) struct GenesisCommand {
     pub request_digest: CanonicalRequestDigest,
     pub actor: String,
     pub actor_generation: u64,
+    pub home_cell: String,
+    pub home_revision: u64,
+    pub authority_epoch: u64,
+    pub tenant: String,
+    pub template: String,
+    pub root_policy: String,
+    pub source_create_actor_request_digest: ContentDigest,
+    pub object_lineage: String,
+    pub storage_shard_id: String,
+    pub storage_routing_revision: u64,
     pub export_name: Vec<u8>,
     pub advertised_size: u64,
     pub root_digest: ContentDigest,
@@ -87,24 +151,49 @@ impl VerifiedGenesisInput {
 /// Exact signed terminal bytes produced outside this crate. Like the command
 /// seal, this has no production constructor until the normative signer exists.
 pub(crate) struct VerifiedGenesisTerminal {
+    operation: WorkspaceOperationKey,
+    request_digest: CanonicalRequestDigest,
+    receipt: GenesisDurabilityReceipt,
     bytes: Bytes,
 }
 
 impl VerifiedGenesisTerminal {
     #[cfg(any(test, dst))]
-    pub(crate) fn for_test(bytes: Bytes) -> Result<Self, GenesisError> {
+    pub(crate) fn for_test(
+        operation: WorkspaceOperationKey,
+        request_digest: CanonicalRequestDigest,
+        receipt: GenesisDurabilityReceipt,
+        bytes: Bytes,
+    ) -> Result<Self, GenesisError> {
         if bytes.is_empty() {
             return Err(GenesisError::Invalid);
         }
-        Ok(Self { bytes })
+        Ok(Self {
+            operation,
+            request_digest,
+            receipt,
+            bytes,
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GenesisDomainRecord {
     pub workspace_id: String,
+    pub operation_kind: i32,
+    pub request_id: String,
     pub actor: String,
     pub actor_generation: u64,
+    pub home_cell: String,
+    pub home_revision: u64,
+    pub authority_epoch: u64,
+    pub tenant: String,
+    pub template: String,
+    pub root_policy: String,
+    pub source_create_actor_request_digest: ContentDigest,
+    pub object_lineage: String,
+    pub storage_shard_id: String,
+    pub storage_routing_revision: u64,
     pub request_digest: CanonicalRequestDigest,
     pub root_digest: ContentDigest,
     pub root_object_key: String,
@@ -120,7 +209,7 @@ pub(crate) struct GenesisDurabilityReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GenesisMaterializeResult {
-    Materialized(GenesisDurabilityReceipt),
+    Materialized(Box<GenesisDurabilityReceipt>),
     AlreadyTerminal(WorkspaceOperationRecord),
 }
 
@@ -158,7 +247,8 @@ pub(crate) struct WorkspaceGenesisStore {
     db: Arc<Db>,
     coordinator: WriteCoordinator,
     operations: crate::fs::workspace_operation::WorkspaceOperationLedger,
-    object_store: Arc<dyn ObjectStore>,
+    object_creator: Arc<dyn GenesisObjectCreator>,
+    local_storage_shard_id: Arc<str>,
 }
 
 impl WorkspaceGenesisStore {
@@ -168,11 +258,23 @@ impl WorkspaceGenesisStore {
         operations: crate::fs::workspace_operation::WorkspaceOperationLedger,
         object_store: Arc<dyn ObjectStore>,
     ) -> Self {
+        #[cfg(test)]
+        let object_creator: Arc<dyn GenesisObjectCreator> =
+            Arc::new(DirectTestGenesisObjectCreator(object_store));
+        #[cfg(not(test))]
+        let object_creator: Arc<dyn GenesisObjectCreator> = {
+            let _ = object_store;
+            Arc::new(UnavailableGenesisObjectCreator)
+        };
         Self {
             db,
             coordinator,
             operations,
-            object_store,
+            object_creator,
+            #[cfg(test)]
+            local_storage_shard_id: "test-shard".into(),
+            #[cfg(not(test))]
+            local_storage_shard_id: "unconfigured".into(),
         }
     }
 
@@ -182,6 +284,9 @@ impl WorkspaceGenesisStore {
     ) -> Result<GenesisMaterializeResult, GenesisError> {
         let command = verified.command();
         validate_command(command)?;
+        if command.storage_shard_id != self.local_storage_shard_id.as_ref() {
+            return Err(GenesisError::Invalid);
+        }
         let operation = self
             .operations
             .begin(&command.operation, command.request_digest)
@@ -191,18 +296,60 @@ impl WorkspaceGenesisStore {
         }
 
         let object_key = content_object_key(command.root_digest);
-        put_content_addressed_exact(
-            &self.object_store,
-            &object_key,
-            command.root_digest,
-            &command.root_bytes,
-        )
-        .await?;
+        let claim_bytes = effect_claim(command.root_digest, &object_key);
+        let claim = self
+            .operations
+            .claim_effect_dispatch(
+                &command.operation,
+                command.request_digest,
+                claim_bytes.clone(),
+            )
+            .await?;
+        match claim {
+            EffectDispatchClaim::Installed(_) => {
+                let path = Path::from(object_key.as_str());
+                let _ = self
+                    .object_creator
+                    .create_once(&path, &command.root_bytes)
+                    .await;
+                get_content_addressed_exact(
+                    &self.object_creator,
+                    &object_key,
+                    command.root_digest,
+                    &command.root_bytes,
+                )
+                .await?;
+            }
+            EffectDispatchClaim::Existing(record) => {
+                if record.state.is_terminal() {
+                    return Ok(GenesisMaterializeResult::AlreadyTerminal(record));
+                }
+                get_content_addressed_exact(
+                    &self.object_creator,
+                    &object_key,
+                    command.root_digest,
+                    &command.root_bytes,
+                )
+                .await?;
+            }
+        }
 
         let record = GenesisDomainRecord {
             workspace_id: command.operation.workspace_id.clone(),
+            operation_kind: command.operation.kind,
+            request_id: command.operation.request_id.clone(),
             actor: command.actor.clone(),
             actor_generation: command.actor_generation,
+            home_cell: command.home_cell.clone(),
+            home_revision: command.home_revision,
+            authority_epoch: command.authority_epoch,
+            tenant: command.tenant.clone(),
+            template: command.template.clone(),
+            root_policy: command.root_policy.clone(),
+            source_create_actor_request_digest: command.source_create_actor_request_digest,
+            object_lineage: command.object_lineage.clone(),
+            storage_shard_id: command.storage_shard_id.clone(),
+            storage_routing_revision: command.storage_routing_revision,
             request_digest: command.request_digest,
             root_digest: command.root_digest,
             root_object_key: object_key,
@@ -217,7 +364,7 @@ impl WorkspaceGenesisStore {
             .coordinator
             .materialize_workspace_genesis(record)
             .await?;
-        Ok(GenesisMaterializeResult::Materialized(receipt))
+        Ok(GenesisMaterializeResult::Materialized(Box::new(receipt)))
     }
 
     pub(crate) async fn complete(
@@ -226,10 +373,37 @@ impl WorkspaceGenesisStore {
         terminal: VerifiedGenesisTerminal,
     ) -> Result<WorkspaceOperationLookup, GenesisError> {
         let command = verified.command();
+        let expected_claim = effect_claim(
+            command.root_digest,
+            &content_object_key(command.root_digest),
+        );
+        if terminal.operation != command.operation
+            || terminal.request_digest != command.request_digest
+        {
+            return Err(GenesisError::Conflict);
+        }
+        let durable = self
+            .lookup_record_durable(&command.operation.workspace_id)
+            .await?
+            .ok_or(GenesisError::Conflict)?;
+        if durable != terminal.receipt.record {
+            return Err(GenesisError::Conflict);
+        }
+        validate_durable_graph(&self.db, &durable).await?;
+        let (writer_epoch, durable_seq) = self
+            .db
+            .rhizome_durability_snapshot()
+            .ok_or(GenesisError::Storage)?;
+        if writer_epoch != terminal.receipt.writer_epoch
+            || durable_seq < terminal.receipt.durable_seq
+        {
+            return Err(GenesisError::Conflict);
+        }
         self.operations
-            .complete(
+            .complete_claimed_effect(
                 &command.operation,
                 command.request_digest,
+                &expected_claim,
                 WorkspaceTerminalOutcome::Succeeded(terminal.bytes),
             )
             .await
@@ -277,19 +451,43 @@ pub(crate) async fn read_record_current(
 pub(crate) fn validate_activation_genesis(
     record: &GenesisDomainRecord,
     workspace_id: &str,
-    actor: &str,
-    actor_generation: u64,
+    authority: &crate::fs::export_authority::AuthorityVersion,
     export: &ExportIdentity,
 ) -> Result<(), GenesisError> {
     if record.workspace_id == workspace_id
-        && record.actor == actor
-        && record.actor_generation == actor_generation
+        && record.actor == authority.actor
+        && record.actor_generation == authority.actor_generation
+        && record.home_cell == authority.home_cell
+        && record.home_revision == authority.home_revision
+        && record.authority_epoch == authority.authority_epoch
+        && authority.placement_epoch > 0
+        && authority.assignment_revision > 0
         && record.export == *export
     {
         Ok(())
     } else {
         Err(GenesisError::Conflict)
     }
+}
+
+async fn validate_durable_graph(db: &Db, record: &GenesisDomainRecord) -> Result<(), GenesisError> {
+    crate::fs::write_coordinator::validate_physical_export(db, &KeyCodec::new(), &record.export)
+        .await
+        .map_err(|_| GenesisError::Corrupt)?;
+    let binding = reverse_binding(record);
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    if crate::fs::export_authority::read_reverse_binding_durable(db, &name_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        != Some(binding.clone())
+        || crate::fs::export_authority::read_reverse_binding_durable(db, &inode_key)
+            .await
+            .map_err(|_| GenesisError::Storage)?
+            != Some(binding)
+    {
+        return Err(GenesisError::Corrupt);
+    }
+    Ok(())
 }
 
 pub(super) fn encode_record(
@@ -299,8 +497,20 @@ pub(super) fn encode_record(
     validate_record(record)?;
     let mut payload = Vec::new();
     push_string(&mut payload, &record.workspace_id)?;
+    payload.extend_from_slice(&record.operation_kind.to_be_bytes());
+    push_string(&mut payload, &record.request_id)?;
     push_string(&mut payload, &record.actor)?;
     payload.extend_from_slice(&record.actor_generation.to_be_bytes());
+    push_string(&mut payload, &record.home_cell)?;
+    payload.extend_from_slice(&record.home_revision.to_be_bytes());
+    payload.extend_from_slice(&record.authority_epoch.to_be_bytes());
+    push_string(&mut payload, &record.tenant)?;
+    push_string(&mut payload, &record.template)?;
+    push_string(&mut payload, &record.root_policy)?;
+    payload.extend_from_slice(record.source_create_actor_request_digest.as_bytes());
+    push_string(&mut payload, &record.object_lineage)?;
+    push_string(&mut payload, &record.storage_shard_id)?;
+    payload.extend_from_slice(&record.storage_routing_revision.to_be_bytes());
     payload.extend_from_slice(record.request_digest.as_bytes());
     payload.extend_from_slice(record.root_digest.as_bytes());
     push_string_limit(&mut payload, &record.root_object_key, MAX_OBJECT_KEY_BYTES)?;
@@ -352,8 +562,20 @@ pub(crate) fn decode_record(key: &[u8], bytes: &[u8]) -> Result<GenesisDomainRec
     }
     let mut input = &bytes[HEADER..checksum_offset];
     let workspace_id = take_string(&mut input, MAX_ID_BYTES)?;
+    let operation_kind = take_i32(&mut input)?;
+    let request_id = take_string(&mut input, MAX_ID_BYTES)?;
     let actor = take_string(&mut input, MAX_ID_BYTES)?;
     let actor_generation = take_u64(&mut input)?;
+    let home_cell = take_string(&mut input, MAX_ID_BYTES)?;
+    let home_revision = take_u64(&mut input)?;
+    let authority_epoch = take_u64(&mut input)?;
+    let tenant = take_string(&mut input, MAX_ID_BYTES)?;
+    let template = take_string(&mut input, MAX_ID_BYTES)?;
+    let root_policy = take_string(&mut input, MAX_ID_BYTES)?;
+    let source_create_actor_request_digest = ContentDigest::new(take_array(&mut input)?);
+    let object_lineage = take_string(&mut input, MAX_ID_BYTES)?;
+    let storage_shard_id = take_string(&mut input, MAX_ID_BYTES)?;
+    let storage_routing_revision = take_u64(&mut input)?;
     let request_digest = CanonicalRequestDigest::new(take_array(&mut input)?);
     let root_digest = ContentDigest::new(take_array(&mut input)?);
     let root_object_key = take_string(&mut input, MAX_OBJECT_KEY_BYTES)?;
@@ -366,8 +588,20 @@ pub(crate) fn decode_record(key: &[u8], bytes: &[u8]) -> Result<GenesisDomainRec
     }
     let record = GenesisDomainRecord {
         workspace_id,
+        operation_kind,
+        request_id,
         actor,
         actor_generation,
+        home_cell,
+        home_revision,
+        authority_epoch,
+        tenant,
+        template,
+        root_policy,
+        source_create_actor_request_digest,
+        object_lineage,
+        storage_shard_id,
+        storage_routing_revision,
         request_digest,
         root_digest,
         root_object_key,
@@ -393,8 +627,17 @@ fn validate_command(command: &GenesisCommand) -> Result<(), GenesisError> {
     validate_id(&command.operation.workspace_id)?;
     validate_id(&command.operation.request_id)?;
     validate_id(&command.actor)?;
+    validate_id(&command.home_cell)?;
+    validate_id(&command.tenant)?;
+    validate_id(&command.template)?;
+    validate_id(&command.root_policy)?;
+    validate_id(&command.object_lineage)?;
+    validate_id(&command.storage_shard_id)?;
     if command.operation.kind <= 0
         || command.actor_generation == 0
+        || command.home_revision == 0
+        || command.authority_epoch == 0
+        || command.storage_routing_revision == 0
         || command.export_name.is_empty()
         || command.export_name.len() > crate::fs::NAME_MAX
         || command.export_name == b"."
@@ -411,8 +654,19 @@ fn validate_command(command: &GenesisCommand) -> Result<(), GenesisError> {
 
 fn validate_record(record: &GenesisDomainRecord) -> Result<(), GenesisError> {
     validate_id(&record.workspace_id)?;
+    validate_id(&record.request_id)?;
     validate_id(&record.actor)?;
-    if record.actor_generation == 0
+    validate_id(&record.home_cell)?;
+    validate_id(&record.tenant)?;
+    validate_id(&record.template)?;
+    validate_id(&record.root_policy)?;
+    validate_id(&record.object_lineage)?;
+    validate_id(&record.storage_shard_id)?;
+    if record.operation_kind <= 0
+        || record.actor_generation == 0
+        || record.home_revision == 0
+        || record.authority_epoch == 0
+        || record.storage_routing_revision == 0
         || record.export.nbd_directory_inode == 0
         || record.export.inode == 0
         || record.export.name.is_empty()
@@ -445,33 +699,22 @@ fn content_object_key(digest: ContentDigest) -> String {
     out
 }
 
-async fn put_content_addressed_exact(
-    store: &Arc<dyn ObjectStore>,
+fn effect_claim(digest: ContentDigest, object_key: &str) -> Bytes {
+    let mut out = Vec::with_capacity(EFFECT_CLAIM_DOMAIN.len() + SHA256_SIZE + object_key.len());
+    out.extend_from_slice(EFFECT_CLAIM_DOMAIN);
+    out.extend_from_slice(digest.as_bytes());
+    out.extend_from_slice(object_key.as_bytes());
+    Bytes::from(out)
+}
+
+async fn get_content_addressed_exact(
+    creator: &Arc<dyn GenesisObjectCreator>,
     object_key: &str,
     digest: ContentDigest,
     bytes: &Bytes,
 ) -> Result<(), GenesisError> {
     let path = Path::from(object_key);
-    let put = store
-        .put_opts(
-            &path,
-            PutPayload::from(bytes.clone()),
-            PutOptions::from(PutMode::Create),
-        )
-        .await;
-    match put {
-        Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => {}
-        Err(_) => {
-            // Unknown create outcomes converge only through exact-key readback.
-        }
-    }
-    let read = store
-        .get(&path)
-        .await
-        .map_err(|_| GenesisError::ObjectOutcomeUnknown)?
-        .bytes()
-        .await
-        .map_err(|_| GenesisError::ObjectOutcomeUnknown)?;
+    let read = creator.get_exact(&path).await?;
     if read.len() != bytes.len()
         || Sha256::digest(&read).as_slice() != digest.as_bytes()
         || read != *bytes
@@ -525,6 +768,15 @@ fn take_u64(input: &mut &[u8]) -> Result<u64, GenesisError> {
     Ok(value)
 }
 
+fn take_i32(input: &mut &[u8]) -> Result<i32, GenesisError> {
+    if input.len() < 4 {
+        return Err(GenesisError::Corrupt);
+    }
+    let value = i32::from_be_bytes(input[..4].try_into().unwrap());
+    *input = &input[4..];
+    Ok(value)
+}
+
 fn take_array(input: &mut &[u8]) -> Result<[u8; SHA256_SIZE], GenesisError> {
     if input.len() < SHA256_SIZE {
         return Err(GenesisError::Corrupt);
@@ -566,8 +818,20 @@ pub fn dst_workspace_genesis_codec_model(seed: u64) {
     let digest: [u8; 32] = Sha256::digest(seed.to_be_bytes()).into();
     let record = GenesisDomainRecord {
         workspace_id: workspace_id.clone(),
+        operation_kind: 101,
+        request_id: format!("request-{seed}"),
         actor: format!("actor-{seed}"),
         actor_generation: seed.saturating_add(1),
+        home_cell: "cells/dst".into(),
+        home_revision: 1,
+        authority_epoch: 1,
+        tenant: "tenants/dst".into(),
+        template: "templates/dst@sha256:01".into(),
+        root_policy: "policies/dst@1".into(),
+        source_create_actor_request_digest: ContentDigest::new(digest),
+        object_lineage: format!("lineage-{seed}"),
+        storage_shard_id: "shard-dst".into(),
+        storage_routing_revision: 1,
         request_digest: CanonicalRequestDigest::new(digest),
         root_digest: ContentDigest::new(digest),
         root_object_key: content_object_key(ContentDigest::new(digest)),
@@ -671,6 +935,16 @@ mod tests {
             request_digest: CanonicalRequestDigest::new(Sha256::digest(request).into()),
             actor: format!("tenants/t/actors/{workspace}"),
             actor_generation: 7,
+            home_cell: "cells/c".into(),
+            home_revision: 1,
+            authority_epoch: 1,
+            tenant: "tenants/t".into(),
+            template: "templates/base@sha256:01".into(),
+            root_policy: "policies/root@1".into(),
+            source_create_actor_request_digest: ContentDigest::new([9; 32]),
+            object_lineage: "lineage-a".into(),
+            storage_shard_id: "test-shard".into(),
+            storage_routing_revision: 1,
             export_name: format!("{workspace}.img").into_bytes(),
             advertised_size: 4096,
             root_digest: ContentDigest::new(Sha256::digest(&root_bytes).into()),
@@ -731,8 +1005,13 @@ mod tests {
             Some(binding)
         );
 
-        let terminal =
-            VerifiedGenesisTerminal::for_test(Bytes::from_static(b"signed-receipt")).unwrap();
+        let terminal = VerifiedGenesisTerminal::for_test(
+            input.command().operation.clone(),
+            input.command().request_digest,
+            (*receipt).clone(),
+            Bytes::from_static(b"signed-receipt"),
+        )
+        .unwrap();
         assert!(matches!(
             fs.workspace_genesis
                 .complete(&input, terminal)
@@ -749,8 +1028,8 @@ mod tests {
     async fn unknown_genesis_reply_converges_without_a_second_export() {
         let fs = new_fs().await;
         let input = verified("workspace-a", "request-a", b"root-a");
-        fs.workspace_operations
-            .begin(&input.command().operation, input.command().request_digest)
+        fs.workspace_genesis
+            .materialize(input.clone())
             .await
             .unwrap();
         fs.write_coordinator.dst_drop_next_workspace_durable_reply();
@@ -778,8 +1057,8 @@ mod tests {
         let first = open_reopen_fs(object_store.clone()).await;
         let input = verified("workspace-a", "request-a", b"root-a");
         first
-            .workspace_operations
-            .begin(&input.command().operation, input.command().request_digest)
+            .workspace_genesis
+            .materialize(input.clone())
             .await
             .unwrap();
         first
@@ -831,7 +1110,8 @@ mod tests {
             db: fs.workspace_genesis.db.clone(),
             coordinator: fs.workspace_genesis.coordinator.clone(),
             operations: fs.workspace_genesis.operations.clone(),
-            object_store: fault,
+            object_creator: Arc::new(DirectTestGenesisObjectCreator(fault)),
+            local_storage_shard_id: "test-shard".into(),
         };
         assert!(matches!(
             store
@@ -854,7 +1134,8 @@ mod tests {
             db: fs.workspace_genesis.db.clone(),
             coordinator: fs.workspace_genesis.coordinator.clone(),
             operations: fs.workspace_genesis.operations.clone(),
-            object_store: fault,
+            object_creator: Arc::new(DirectTestGenesisObjectCreator(fault)),
+            local_storage_shard_id: "test-shard".into(),
         };
         assert_eq!(
             store
@@ -868,6 +1149,45 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(matches!(
+            store
+                .materialize(verified("workspace-a", "request-a", b"root-a"))
+                .await
+                .unwrap(),
+            GenesisMaterializeResult::Materialized(_)
+        ));
+        assert_eq!(controls.put_count(), 1);
+        assert_eq!(controls.get_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn local_shard_mismatch_rejects_before_lookup_or_object_effect() {
+        let fs = new_fs().await;
+        let inner: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (fault, controls) = crate::fault_store::FaultStore::new(inner);
+        let store = WorkspaceGenesisStore {
+            db: fs.workspace_genesis.db.clone(),
+            coordinator: fs.workspace_genesis.coordinator.clone(),
+            operations: fs.workspace_genesis.operations.clone(),
+            object_creator: Arc::new(DirectTestGenesisObjectCreator(fault)),
+            local_storage_shard_id: "test-shard".into(),
+        };
+        let mut input = verified("workspace-a", "request-a", b"root-a");
+        input.0.storage_shard_id = "other-shard".into();
+        assert_eq!(
+            store.materialize(input.clone()).await,
+            Err(GenesisError::Invalid)
+        );
+        assert_eq!(controls.put_count(), 0);
+        assert_eq!(controls.get_count(), 0);
+        assert_eq!(
+            store
+                .operations
+                .lookup(&input.command().operation, input.command().request_digest)
+                .await
+                .unwrap(),
+            WorkspaceOperationLookup::Unknown
         );
     }
 
@@ -885,11 +1205,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn genesis_forward_row_rebuilds_raw_write_deny_index_after_reopen() {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_reopen_fs(object_store.clone()).await;
+        let GenesisMaterializeResult::Materialized(receipt) = first
+            .workspace_genesis
+            .materialize(verified("workspace-a", "request-a", b"root-a"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected materialized genesis");
+        };
+        let binding = reverse_binding(&receipt.record);
+        let (name_key, inode_key) = reverse_binding_keys(&binding);
+        first
+            .db
+            .inject_reserved_authority_delete_for_test(name_key)
+            .await
+            .unwrap();
+        first
+            .db
+            .inject_reserved_authority_delete_for_test(inode_key)
+            .await
+            .unwrap();
+        first.db.flush().await.unwrap();
+        first.db.close().await.unwrap();
+
+        let reopened = open_reopen_fs(object_store).await;
+        let mut inode = reopened
+            .inode_store
+            .get(receipt.record.export.inode)
+            .await
+            .unwrap();
+        let crate::fs::inode::Inode::File(file) = &mut inode else {
+            panic!("genesis export must be a file");
+        };
+        file.mode = 0o640;
+        let mut txn = reopened.db.new_transaction().unwrap();
+        reopened
+            .inode_store
+            .save(&mut txn, receipt.record.export.inode, &inode)
+            .unwrap();
+        assert_eq!(
+            reopened.write_coordinator.commit(txn).await,
+            Err(crate::fs::errors::FsError::OperationNotPermitted)
+        );
+    }
+
+    async fn reopened_with_genesis_row() -> ZeroFS {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_reopen_fs(object_store.clone()).await;
+        first
+            .workspace_genesis
+            .materialize(verified("workspace-a", "request-a", b"root-a"))
+            .await
+            .unwrap();
+        first.db.close().await.unwrap();
+        open_reopen_fs(object_store).await
+    }
+
+    #[tokio::test]
+    async fn genesis_deny_index_setup_scan_failure_is_sticky() {
+        let fs = reopened_with_genesis_row().await;
+        fs.db.dst_fail_scan_setup_on(3);
+        assert!(matches!(
+            fs.create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"unrelated",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await,
+            Err(crate::fs::errors::FsError::InvalidData)
+        ));
+        assert!(matches!(
+            fs.create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"still-poisoned",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await,
+            Err(crate::fs::errors::FsError::InvalidData)
+        ));
+    }
+
+    #[tokio::test]
+    async fn genesis_deny_index_midstream_scan_failure_is_sticky() {
+        let fs = reopened_with_genesis_row().await;
+        fs.db.dst_fail_scan_midstream_on(3);
+        assert!(matches!(
+            fs.create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"unrelated",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await,
+            Err(crate::fs::errors::FsError::InvalidData)
+        ));
+        assert!(matches!(
+            fs.create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"still-poisoned",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await,
+            Err(crate::fs::errors::FsError::InvalidData)
+        ));
+    }
+
+    #[tokio::test]
+    async fn success_terminal_requires_exact_materialized_receipt() {
+        let fs = new_fs().await;
+        let input = verified("workspace-a", "request-a", b"root-a");
+        fs.workspace_operations
+            .begin(&input.command().operation, input.command().request_digest)
+            .await
+            .unwrap();
+        let forged = GenesisDurabilityReceipt {
+            record: GenesisDomainRecord {
+                workspace_id: "workspace-a".into(),
+                operation_kind: 101,
+                request_id: "request-a".into(),
+                actor: "tenants/t/actors/workspace-a".into(),
+                actor_generation: 7,
+                home_cell: "cells/c".into(),
+                home_revision: 1,
+                authority_epoch: 1,
+                tenant: "tenants/t".into(),
+                template: "templates/base@sha256:01".into(),
+                root_policy: "policies/root@1".into(),
+                source_create_actor_request_digest: ContentDigest::new([9; 32]),
+                object_lineage: "lineage-a".into(),
+                storage_shard_id: "test-shard".into(),
+                storage_routing_revision: 1,
+                request_digest: input.command().request_digest,
+                root_digest: input.command().root_digest,
+                root_object_key: content_object_key(input.command().root_digest),
+                export: ExportIdentity {
+                    nbd_directory_inode: 1,
+                    name: b"workspace-a.img".to_vec(),
+                    inode: 2,
+                    advertised_size: 4096,
+                },
+            },
+            writer_epoch: 1,
+            durable_seq: 1,
+        };
+        assert_eq!(
+            fs.workspace_genesis
+                .complete(
+                    &input,
+                    VerifiedGenesisTerminal::for_test(
+                        input.command().operation.clone(),
+                        input.command().request_digest,
+                        forged,
+                        Bytes::from_static(b"forged-success"),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(GenesisError::Conflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_effect_rejects_generic_terminal_completion() {
+        let fs = new_fs().await;
+        let input = verified("workspace-a", "request-a", b"root-a");
+        fs.workspace_operations
+            .begin(&input.command().operation, input.command().request_digest)
+            .await
+            .unwrap();
+        fs.workspace_operations
+            .claim_effect_dispatch(
+                &input.command().operation,
+                input.command().request_digest,
+                effect_claim(
+                    input.command().root_digest,
+                    &content_object_key(input.command().root_digest),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.workspace_operations
+                .complete(
+                    &input.command().operation,
+                    input.command().request_digest,
+                    WorkspaceTerminalOutcome::Failed(Bytes::from_static(b"negative")),
+                )
+                .await,
+            Err(WorkspaceOperationError::TerminalImmutable)
+        );
+    }
+
+    #[tokio::test]
     async fn activation_gate_requires_exact_genesis_binding() {
         let fs = new_fs().await;
         let input = verified("workspace-a", "request-a", b"root-a");
-        let GenesisMaterializeResult::Materialized(receipt) =
-            fs.workspace_genesis.materialize(input).await.unwrap()
+        let GenesisMaterializeResult::Materialized(receipt) = fs
+            .workspace_genesis
+            .materialize(input.clone())
+            .await
+            .unwrap()
         else {
             panic!("expected materialized genesis");
         };
@@ -910,6 +1433,40 @@ mod tests {
             placement_epoch: 1,
             assignment_revision: 1,
         };
+        let pending = fs
+            .export_authority
+            .activate(ActivateExport {
+                workspace_id: receipt.record.workspace_id.clone(),
+                export: receipt.record.export.clone(),
+                authority: authority.clone(),
+                session: ExportSessionState {
+                    session_id: "session-a".into(),
+                    capability_id: "capability-a".into(),
+                    expires_at_unix_millis: u64::MAX - 1,
+                    node_incarnation_id: "node-a".into(),
+                    runtime_id: "runtime-a".into(),
+                    server_boot_id: "replaced".into(),
+                    committed_through_sequence: 0,
+                },
+            })
+            .await;
+        assert_eq!(
+            pending,
+            Err(crate::fs::export_authority::ExportAuthorityError::Conflict)
+        );
+        fs.workspace_genesis
+            .complete(
+                &input,
+                VerifiedGenesisTerminal::for_test(
+                    input.command().operation.clone(),
+                    input.command().request_digest,
+                    (*receipt).clone(),
+                    Bytes::from_static(b"signed-receipt"),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
         let active = fs
             .export_authority
             .activate(ActivateExport {
@@ -957,8 +1514,20 @@ mod tests {
     fn explicit_codec_rejects_cross_key_copy_and_trailing_bytes() {
         let mut record = GenesisDomainRecord {
             workspace_id: "workspace-a".into(),
+            operation_kind: 101,
+            request_id: "request-a".into(),
             actor: "actor-a".into(),
             actor_generation: 1,
+            home_cell: "cells/c".into(),
+            home_revision: 1,
+            authority_epoch: 1,
+            tenant: "tenants/t".into(),
+            template: "templates/base@sha256:01".into(),
+            root_policy: "policies/root@1".into(),
+            source_create_actor_request_digest: ContentDigest::new([3; 32]),
+            object_lineage: "lineage-a".into(),
+            storage_shard_id: "test-shard".into(),
+            storage_routing_revision: 1,
             request_digest: CanonicalRequestDigest::new([1; 32]),
             root_digest: ContentDigest::new([2; 32]),
             root_object_key: content_object_key(ContentDigest::new([2; 32])),
@@ -985,7 +1554,7 @@ mod tests {
     #[test]
     fn failpoint_after_durable_commit_requires_exact_readback() {
         crate::test_helpers::isolated_failpoint::run(
-            "workspace_genesis::failpoint_after_durable_commit_requires_exact_readback",
+            "fs::workspace_genesis::tests::failpoint_after_durable_commit_requires_exact_readback",
             crate::test_helpers::isolated_failpoint::Runtime::CurrentThread,
             || async {
                 let fs = new_fs().await;
