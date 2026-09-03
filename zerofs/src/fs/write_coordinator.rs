@@ -16,6 +16,8 @@ use crate::fs::export_authority::{
     trusted_now_unix_millis, validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
+#[cfg(feature = "rhizome-export-authority-core")]
+use crate::fs::key_codec::ExportBindingMetadataKey;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
@@ -23,6 +25,8 @@ use crate::fs::workspace_operation::WorkspaceLedgerRequest;
 use crate::replication::ShipOutcome;
 use crate::replication::types::SlateDbSeqno;
 use crate::task::spawn_named;
+#[cfg(feature = "rhizome-export-authority-core")]
+use bincode::Options;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
@@ -769,7 +773,11 @@ async fn worker_loop(
         let mut workspace_guards = Vec::new();
         #[cfg(feature = "rhizome-export-authority-core")]
         let mut export_mutation = None;
+        #[cfg(feature = "rhizome-export-authority-core")]
+        let mut export_binding_metadata_keys = Vec::new();
         for (mut txn, reply, workspace_guard, _export_context) in batch {
+            #[cfg(feature = "rhizome-export-authority-core")]
+            let is_export_transaction = _export_context.is_some();
             if let Some(guard) = workspace_guard {
                 workspace_guards.push(guard);
             }
@@ -781,6 +789,10 @@ async fn worker_loop(
                 debug_assert!(export_mutation.is_none());
                 require_durable |= context.kind.requires_durability();
                 export_mutation = Some(context);
+            }
+            #[cfg(feature = "rhizome-export-authority-core")]
+            if !is_export_transaction {
+                export_binding_metadata_keys.extend(txn.export_binding_metadata_keys());
             }
             any_ops |= !txn.is_empty();
             if let Some(entry) = txn.take_dedup_entry() {
@@ -1027,6 +1039,16 @@ async fn worker_loop(
             let final_fence_error: Option<FsError> = None;
             let write_result = match ctx.db.acquire_write_permit().await {
                 Ok(permit) => {
+                    #[cfg(feature = "rhizome-export-authority-core")]
+                    if let Err(error) = reject_bound_export_metadata_mutations(
+                        &ctx.db,
+                        &ctx.key_codec,
+                        &export_binding_metadata_keys,
+                    )
+                    .await
+                    {
+                        final_fence_error = Some(error);
+                    }
                     #[cfg(all(feature = "rhizome-export-authority-core", test))]
                     if has_export_mutation
                         && ctx
@@ -1337,9 +1359,7 @@ async fn validate_physical_export(
         .await
         .map_err(|_| ExportAuthorityError::Storage)?
         .ok_or(ExportAuthorityError::Invalid)
-        .and_then(|bytes| {
-            KeyCodec::decode_dir_entry(&bytes).map_err(|_| ExportAuthorityError::Corrupt)
-        })?;
+        .and_then(|bytes| decode_exact_dir_entry(&bytes))?;
     if root_mapping.0 != export.nbd_directory_inode {
         return Err(ExportAuthorityError::Invalid);
     }
@@ -1348,8 +1368,7 @@ async fn validate_physical_export(
         .await
         .map_err(|_| ExportAuthorityError::Storage)?
         .ok_or(ExportAuthorityError::Invalid)?;
-    let directory: crate::fs::inode::Inode =
-        bincode::deserialize(&directory_bytes).map_err(|_| ExportAuthorityError::Corrupt)?;
+    let directory: crate::fs::inode::Inode = decode_exact_inode(&directory_bytes)?;
     let crate::fs::inode::Inode::Directory(directory) = directory else {
         return Err(ExportAuthorityError::Invalid);
     };
@@ -1361,8 +1380,7 @@ async fn validate_physical_export(
         .await
         .map_err(|_| ExportAuthorityError::Storage)?
         .ok_or(ExportAuthorityError::Invalid)?;
-    let inode: crate::fs::inode::Inode =
-        bincode::deserialize(&inode_bytes).map_err(|_| ExportAuthorityError::Corrupt)?;
+    let inode: crate::fs::inode::Inode = decode_exact_inode(&inode_bytes)?;
     let crate::fs::inode::Inode::File(file) = inode else {
         return Err(ExportAuthorityError::Invalid);
     };
@@ -1371,9 +1389,7 @@ async fn validate_physical_export(
         .await
         .map_err(|_| ExportAuthorityError::Storage)?
         .ok_or(ExportAuthorityError::Invalid)
-        .and_then(|bytes| {
-            KeyCodec::decode_dir_entry(&bytes).map_err(|_| ExportAuthorityError::Corrupt)
-        })?;
+        .and_then(|bytes| decode_exact_dir_entry(&bytes))?;
     if mapped_inode.0 != export.inode
         || file.parent != Some(export.nbd_directory_inode)
         || file.name.as_deref() != Some(export.name.as_slice())
@@ -1383,6 +1399,23 @@ async fn validate_physical_export(
         return Err(ExportAuthorityError::Invalid);
     }
     Ok(())
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+fn decode_exact_inode(bytes: &[u8]) -> Result<crate::fs::inode::Inode, ExportAuthorityError> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|_| ExportAuthorityError::Corrupt)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+fn decode_exact_dir_entry(bytes: &[u8]) -> Result<(u64, u64), ExportAuthorityError> {
+    if bytes.len() != 16 {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    KeyCodec::decode_dir_entry(bytes).map_err(|_| ExportAuthorityError::Corrupt)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1472,6 +1505,67 @@ fn authority_now(floor: &std::sync::atomic::AtomicU64) -> u64 {
     let wall = trusted_now_unix_millis();
     let previous = floor.fetch_max(wall, std::sync::atomic::Ordering::SeqCst);
     wall.max(previous)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn reject_bound_export_metadata_mutations(
+    db: &Db,
+    key_codec: &KeyCodec,
+    keys: &[bytes::Bytes],
+) -> Result<(), FsError> {
+    for key in keys {
+        let Some(candidate) = key_codec.parse_export_binding_metadata_key(key) else {
+            continue;
+        };
+        let is_bound = match candidate {
+            ExportBindingMetadataKey::Inode(inode) => {
+                if read_reverse_binding_current(db, &key_codec.export_reverse_inode_key(inode))
+                    .await
+                    .map_err(|_| FsError::InvalidData)?
+                    .is_some()
+                {
+                    true
+                } else {
+                    reverse_prefix_has_entry(db, key_codec.export_reverse_name_prefix(Some(inode)))
+                        .await?
+                }
+            }
+            ExportBindingMetadataKey::DirectoryEntry {
+                directory_inode,
+                name,
+            } => {
+                let exact = key_codec.export_reverse_name_key(directory_inode, &name);
+                if read_reverse_binding_current(db, &exact)
+                    .await
+                    .map_err(|_| FsError::InvalidData)?
+                    .is_some()
+                {
+                    true
+                } else if directory_inode == 0 && name.as_ref() == b".nbd" {
+                    reverse_prefix_has_entry(db, key_codec.export_reverse_name_prefix(None)).await?
+                } else {
+                    false
+                }
+            }
+        };
+        if is_bound {
+            return Err(FsError::OperationNotPermitted);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn reverse_prefix_has_entry(db: &Db, prefix: bytes::Bytes) -> Result<bool, FsError> {
+    let mut rows = db
+        .scan_prefix(prefix, None, 4 * 1024)
+        .await
+        .map_err(|_| FsError::IoError)?;
+    rows.next()
+        .await
+        .transpose()
+        .map(|row| row.is_some())
+        .map_err(|_| FsError::IoError)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]

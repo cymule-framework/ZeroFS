@@ -703,6 +703,7 @@ impl ExportAuthorityStore {
         command: ActivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        self.ensure_current_schema().await?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -721,6 +722,7 @@ impl ExportAuthorityStore {
         command: RefreshExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        self.ensure_current_schema().await?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -739,6 +741,7 @@ impl ExportAuthorityStore {
         command: DeactivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        self.ensure_current_schema().await?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -757,6 +760,7 @@ impl ExportAuthorityStore {
         command: AdvanceFence,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        self.ensure_current_schema().await?;
         let guard = self
             .admission_locks
             .acquire(command.workspace_id.clone())
@@ -1010,6 +1014,7 @@ impl ExportAuthorityStore {
         &self,
         expected: &ExportMutationExpectation,
     ) -> Result<ExportMutationLookup, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
         validate_expectation(expected)?;
         let key = mutation_outcome_key(expected);
         match read_outcome_current(&self.db, &key, expected).await? {
@@ -1029,6 +1034,7 @@ impl ExportAuthorityStore {
         &self,
         expected: &ExportMutationExpectation,
     ) -> Result<ExportMutationLookup, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
         validate_expectation(expected)?;
         let key = mutation_outcome_key(expected);
         match read_outcome_durable(&self.db, &key, expected).await? {
@@ -1048,6 +1054,7 @@ impl ExportAuthorityStore {
         &self,
         workspace_id: &str,
     ) -> Result<Option<ExportAuthorityRecord>, ExportAuthorityError> {
+        self.ensure_current_schema().await?;
         validate_id(workspace_id)?;
         let codec = crate::fs::key_codec::KeyCodec::new();
         let key = codec.export_authority_key(workspace_id);
@@ -1116,6 +1123,14 @@ impl ExportAuthorityStore {
         {
             return Ok(());
         }
+        self.ensure_current_schema().await?;
+        self.coordinator.initialize_export_boot().await?;
+        self.profile_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn ensure_current_schema(&self) -> Result<(), ExportAuthorityError> {
         let mut legacy = self
             .db
             .scan_prefix(KeyCodec::new().legacy_export_v1_prefix(), None, 4 * 1024)
@@ -1128,12 +1143,10 @@ impl ExportAuthorityStore {
             .map_err(|_| ExportAuthorityError::Storage)?
             .is_some()
         {
-            return Err(ExportAuthorityError::MigrationRequired);
+            Err(ExportAuthorityError::MigrationRequired)
+        } else {
+            Ok(())
         }
-        self.coordinator.initialize_export_boot().await?;
-        self.profile_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
     }
 
     fn require_enabled(&self) -> Result<(), ExportAuthorityError> {
@@ -3526,6 +3539,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_activation_reply_loss_and_cancellation_converge_through_three_row_readback() {
+        let fs = Arc::new(new_export_fs().await);
+        let command = activate_command(authority(3, 5));
+        fs.write_coordinator.dst_drop_next_workspace_durable_reply();
+        assert_eq!(
+            fs.export_authority.activate(command.clone()).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        let readback = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(readback.binding_initialized);
+        assert_eq!(
+            fs.export_authority.activate(command).await.unwrap(),
+            readback
+        );
+
+        let other = Arc::new(new_export_fs().await);
+        let mut cancelled = activate_command(authority(3, 5));
+        cancelled.workspace_id = "workspace-cancelled".into();
+        cancelled.session.session_id = "session-cancelled".into();
+        cancelled.session.capability_id = "capability-cancelled".into();
+        other
+            .write_coordinator
+            .dst_pause_next_authority_after_permit();
+        let request = tokio::spawn({
+            let other = other.clone();
+            async move { other.export_authority.activate(cancelled).await }
+        });
+        other
+            .write_coordinator
+            .dst_wait_authority_after_permit()
+            .await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        other.write_coordinator.dst_release_authority_after_permit();
+        other.write_coordinator.barrier().await.unwrap();
+        let cancelled_readback = other
+            .export_authority
+            .get("workspace-cancelled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cancelled_readback.binding_initialized);
+    }
+
+    #[tokio::test]
     async fn reverse_bindings_survive_restart_and_fail_closed_on_cross_key_copy() {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -3624,6 +3687,28 @@ mod tests {
                 Err(ExportAuthorityError::Corrupt)
             );
         }
+
+        let fs = new_export_fs().await;
+        let command = activate_command(authority(3, 5));
+        let active = fs.export_authority.activate(command.clone()).await.unwrap();
+        let (name_key, inode_key) = reverse_binding_keys(&reverse_binding_for(&active));
+        fs.db
+            .inject_reserved_authority_delete_for_test(name_key)
+            .await
+            .unwrap();
+        fs.db
+            .inject_reserved_authority_delete_for_test(inode_key)
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        assert_eq!(
+            fs.export_authority.get("workspace-a").await,
+            Err(ExportAuthorityError::Corrupt)
+        );
+        assert_eq!(
+            fs.export_authority.activate(command).await,
+            Err(ExportAuthorityError::Corrupt)
+        );
     }
 
     #[tokio::test]
@@ -3645,6 +3730,27 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 fs.export_authority.enable_standalone_profile().await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority.get("workspace-a").await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            let model = apply_transition(
+                None,
+                ExportAuthorityTransition::Activate(activate_command(authority(3, 5))),
+                NOW,
+                BOOT,
+            )
+            .unwrap();
+            let expected =
+                mutation_for(&model, Transaction::new(), MutationKind::Flush, 79).expectation();
+            assert_eq!(
+                fs.export_authority.lookup_mutation_current(&expected).await,
+                Err(ExportAuthorityError::MigrationRequired)
+            );
+            assert_eq!(
+                fs.export_authority.lookup_mutation_durable(&expected).await,
                 Err(ExportAuthorityError::MigrationRequired)
             );
         }
@@ -3717,23 +3823,45 @@ mod tests {
                     crate::fs::key_codec::KeyCodec::encode_dir_entry(active.export.inode + 100, 3),
                 );
             }
+            assert_eq!(
+                fs.write_coordinator.commit(corrupt).await,
+                Err(crate::fs::errors::FsError::OperationNotPermitted)
+            );
+            assert_eq!(fs.export_authority.dst_prepared_mutations(), 0);
+            let inode = fs.inode_store.get(active.export.inode).await.unwrap();
+            assert_eq!(inode.size(), active.export.advertised_size);
+            assert_eq!(
+                fs.directory_store
+                    .get(active.export.nbd_directory_inode, &active.export.name)
+                    .await
+                    .unwrap(),
+                active.export.inode
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_binding_decoder_rejects_trailing_inode_or_directory_bytes() {
+        for corrupt_inode in [true, false] {
+            let fs = new_export_fs().await;
+            let export = ensure_test_export(&fs, 4096).await.unwrap();
+            let codec = crate::fs::key_codec::KeyCodec::new();
+            let key = if corrupt_inode {
+                codec.inode_key(export.inode)
+            } else {
+                codec.dir_entry_key(export.nbd_directory_inode, &export.name)
+            };
+            let mut bytes = fs.db.get_bytes(&key).await.unwrap().unwrap().to_vec();
+            bytes.push(0xff);
+            let mut corrupt = Transaction::new();
+            corrupt.put_bytes(&key, Bytes::from(bytes));
             fs.write_coordinator.commit(corrupt).await.unwrap();
-            let data_key = crate::fs::key_codec::KeyCodec::new()
-                .extent_key(active.export.inode, 900 + u64::from(corrupt_inode));
-            let mut transaction = Transaction::new();
-            transaction.put_bytes(&data_key, Bytes::from_static(b"must-not-apply"));
             assert_eq!(
                 fs.export_authority
-                    .commit_mutation(mutation_for(
-                        &active,
-                        transaction,
-                        MutationKind::Write { fua: false },
-                        74 + u8::from(corrupt_inode),
-                    ))
+                    .activate(activate_command_for(authority(3, 5), export))
                     .await,
-                Err(ExportAuthorityError::Storage)
+                Err(ExportAuthorityError::Corrupt)
             );
-            assert!(fs.db.get_bytes(&data_key).await.unwrap().is_none());
         }
     }
 

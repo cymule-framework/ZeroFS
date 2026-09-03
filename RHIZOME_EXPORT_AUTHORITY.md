@@ -85,7 +85,9 @@ The remaining NBD adapter must install the already-defined immutable export
 identity and revalidate the root-owned `.nbd` ingress before opening a session.
 The core schema already binds the canonical `.nbd` directory inode, exact name,
 device inode, and advertised size, and revalidates raw current database rows at
-the final permit. The first
+the final permit. The coordinator also rejects any ordinary transaction that
+would mutate a retained reverse-bound inode, directory entry, `.nbd` directory,
+or root `.nbd` mapping. The first
 listener profile is one root-owned Unix socket per export; it must not expose
 TCP, unauthenticated LIST, or `CAN_MULTI_CONN`. It must create operation IDs from
 a connection incarnation plus command ordinal/cookie, construct the exact typed

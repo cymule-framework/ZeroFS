@@ -209,6 +209,12 @@ pub(crate) struct ExportMutationKey<'a> {
     pub operation_id: [u8; 32],
 }
 
+#[cfg(feature = "rhizome-export-authority-core")]
+pub(crate) enum ExportBindingMetadataKey {
+    Inode(u64),
+    DirectoryEntry { directory_inode: u64, name: Bytes },
+}
+
 impl KeyCodec {
     pub fn new() -> Self {
         Self
@@ -306,6 +312,44 @@ impl KeyCodec {
         key.push(EXPORT_REVERSE_INODE_SUBTYPE);
         key.extend_from_slice(&inode.to_be_bytes());
         Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_reverse_name_prefix(&self, directory_inode: Option<u64>) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 1 + U64_SIZE);
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(EXPORT_REVERSE_NAME_SUBTYPE);
+        if let Some(directory_inode) = directory_inode {
+            key.extend_from_slice(&directory_inode.to_be_bytes());
+        }
+        Bytes::from(key)
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn parse_export_binding_metadata_key(
+        &self,
+        key: &Bytes,
+    ) -> Option<ExportBindingMetadataKey> {
+        let kind_offset = META_DOMAIN.len();
+        let id_offset = kind_offset + 1;
+        if !key.starts_with(META_DOMAIN) || key.len() < id_offset + U64_SIZE {
+            return None;
+        }
+        let inode = u64::from_be_bytes(key[id_offset..id_offset + U64_SIZE].try_into().ok()?);
+        match key[kind_offset] {
+            PREFIX_INODE if key.len() == id_offset + U64_SIZE => {
+                Some(ExportBindingMetadataKey::Inode(inode))
+            }
+            PREFIX_DIR_ENTRY if key.len() > id_offset + U64_SIZE => {
+                Some(ExportBindingMetadataKey::DirectoryEntry {
+                    directory_inode: inode,
+                    name: key.slice(id_offset + U64_SIZE..),
+                })
+            }
+            _ => None,
+        }
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]

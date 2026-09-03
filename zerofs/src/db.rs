@@ -222,6 +222,22 @@ impl Transaction {
         }
     }
 
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_binding_metadata_keys(&self) -> Vec<Bytes> {
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        self.ops
+            .iter()
+            .filter_map(|operation| match operation {
+                TxOp::Put(key, _) | TxOp::Delete(key)
+                    if codec.parse_export_binding_metadata_key(key).is_some() =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
         self.ops.push(TxOp::Put(key.clone(), value));
     }

@@ -100,10 +100,11 @@ attribution intact.
   v1 data as absent or rebuild missing reverse rows for an initialized record.
   Physical checks at activation and the final mutation permit read and strictly
   decode current DB inode/directory rows rather than trusting metadata caches.
-- Ordinary rename/link/truncate entry points are not yet reverse-index-aware.
-  The host-local NBD adapter must make `.nbd` a closed supervisor-owned ingress
-  before this feature can be release-enabled; post-binding typed mutations fail
-  closed if those ordinary paths changed the identity in the meantime.
+- The coordinator derives inode/directory candidates from every ordinary
+  transaction and, under the final write permit, rejects changes to any retained
+  reverse-bound file, `.nbd` directory, exact entry, or root `.nbd` mapping.
+  Keep the host-local `.nbd` ingress supervisor-owned as an additional adapter
+  release gate; do not rely on metadata caches for this protection.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct
