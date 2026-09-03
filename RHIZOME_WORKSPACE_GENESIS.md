@@ -5,11 +5,19 @@ This branch adds a non-default, protocol-neutral Workspace genesis effect behind
 verify a capability, or sign a receipt. The production constructors for verified
 commands and signed terminal bytes intentionally do not exist yet.
 
+The canonical command and physical materialization plan are distinct types.
+`virtual_size_bytes` is part of the command. Export name and initial root
+bytes/digest are plan outputs that must eventually be derived from the exact
+immutable template, root-policy, and spec inputs. Only tests can currently seal
+such a plan; production cannot pass caller-selected root/export data.
+
 ## One lifecycle authority
 
 Genesis uses the existing `meta + 0x0A` Workspace operation ledger for PENDING
-effect-dispatch claim, and immutable terminal outcomes. The claim authorizes one
-external Create attempt; only its installing call may dispatch. The new
+effect-dispatch claim, and immutable terminal outcomes. The claim includes a
+fresh installer UUID and authorizes one external Create attempt; only the exact
+installing call may dispatch, including after its own ambiguous claim reply is
+resolved by exact durable readback. The new
 `meta + 0x0C` row is only the immutable
 domain result: Workspace and Actor identity, Actor generation, canonical request
 digest, SHA-256 root identity and object key, and exact physical export binding.
@@ -33,6 +41,19 @@ is UNKNOWN; every later invocation and cold reopen performs GET only, never a
 second mutation. The production adapter remains unavailable until its exact
 non-retry configuration and wire-count conformance are qualified.
 
+If that unique installer process disappears after the claim commits but before
+dispatch, the operation remains fail-closed at EffectDispatched. A later process
+cannot distinguish the crash window safely and therefore performs GET only. A
+future supervised installer-incarnation receipt is required to recover this
+liveness case without weakening the one-mutation invariant.
+
+Deterministic exact-object and pre-write physical conflicts return a typed
+rejection proof. A separately sealed negative terminal can complete the same
+claimed 0x0A operation as FAILED only through the coordinator, which atomically
+rechecks the exact claim and refuses the negative if the matching 0x0C effect
+exists. UNKNOWN outcomes remain EffectDispatched; this path never fabricates a
+NOT_COMMITTED absence proof.
+
 After object convergence, the sole `WriteCoordinator` acquires the database
 write permit and either replays an exact existing genesis graph or atomically
 publishes all of:
@@ -43,8 +64,12 @@ publishes all of:
 - the explicit-codec 0x0C immutable genesis row;
 - the 0x0B reverse-name and reverse-inode bindings.
 
-The batch is flushed before returning. The receipt's SlateDB writer epoch and
-durable sequence are read from one post-flush `DbStatus` snapshot. A write,
+The batch is flushed before returning. The pre-terminal materialization
+receipt's SlateDB writer epoch and durable sequence are a coherent durable
+readback cut read from one post-flush `DbStatus` snapshot. Replaying an
+unterminated effect after reopen may return a newer cut; it does not pretend the
+new writer performed the original commit. Once exact signed terminal bytes are
+stored in 0x0A, those bytes are immutable and no new receipt is produced. A write,
 flush, or reply failure after the point of no return is UNKNOWN and converges
 through durable 0x0C plus physical/reverse-graph readback.
 

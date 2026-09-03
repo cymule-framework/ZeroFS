@@ -504,7 +504,7 @@ fn validate_record(record: &WorkspaceOperationRecord) -> Result<(), WorkspaceOpe
     }
 }
 
-fn encode_record(
+pub(super) fn encode_record(
     key: &Bytes,
     record: &WorkspaceOperationRecord,
 ) -> Result<Bytes, WorkspaceOperationError> {
@@ -533,7 +533,7 @@ fn encode_record(
     Ok(Bytes::from(encoded))
 }
 
-fn decode_record(
+pub(super) fn decode_record(
     key: &Bytes,
     raw: &[u8],
 ) -> Result<WorkspaceOperationRecord, WorkspaceOperationError> {
@@ -616,6 +616,22 @@ fn decode_record(
     };
     validate_record(&record)?;
     Ok(record)
+}
+
+pub(super) fn storage_key(key: &WorkspaceOperationKey) -> Result<Bytes, WorkspaceOperationError> {
+    validate_identity("workspace_id", &key.workspace_id)?;
+    validate_identity("request_id", &key.request_id)?;
+    if key.kind <= 0 {
+        return Err(WorkspaceOperationError::InvalidIdentity(
+            "operation kind must be positive",
+        ));
+    }
+    Ok(KeyCodec::new().workspace_operation_key(
+        KEY_VERSION,
+        key.workspace_id.as_bytes(),
+        key.kind,
+        key.request_id.as_bytes(),
+    ))
 }
 
 pub(crate) async fn read_operation_durable(

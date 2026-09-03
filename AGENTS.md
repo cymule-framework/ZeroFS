@@ -165,7 +165,8 @@ attribution intact.
   in this candidate; only tests have a direct non-retrying implementation.
 - Before the one Create attempt, atomically advance the same 0x0A operation from
   PENDING to its immutable effect-dispatch claim. Only the call that installs
-  that claim may send Create. Every replay, including cold reopen after unknown
+  that claim may send Create. Bind a fresh random installer identity into the
+  claim so another claimant cannot satisfy an unknown claim readback. Every replay, including cold reopen after unknown
   Create/readback, may perform exact-key GET only. Generic terminal completion
   is rejected after a claim; only the typed genesis completion path may finish
   it after exact receipt and durable graph verification.
@@ -177,9 +178,25 @@ attribution intact.
   unreachable until Rhizome's normative CDDL and official fixtures exist.
   Tests may use only the sealed test constructors. Genesis records use the
   explicit closed codec; do not serialize them with bincode or protobuf.
+- Keep the canonical genesis command separate from the derived physical plan.
+  `virtual_size_bytes` belongs to the command; export name and initial root
+  bytes/digest belong to a separately sealed plan derived from the exact
+  immutable template/root-policy inputs. The current candidate has only a
+  test constructor for that seal and must not accept caller-selected plan data
+  in production.
 - The 0x0C row binds the complete operation key, authority creation baseline,
   tenant, immutable template/root-policy refs, source CreateActor digest,
   object lineage, storage shard/routing revision, root identity, and exact
   export identity. Validate the configured local shard before lookup or effect.
   Activation requires the same home/authority baseline and a durable 0x0A
   SUCCEEDED outcome; PENDING or effect-dispatched is not genesis success.
+- If the unique installer disappears after its claim becomes durable but before
+  Create dispatch, the operation remains fail-closed at EffectDispatched. A new
+  invocation may GET only and cannot adopt or repeat the mutation. Closing that
+  liveness gap requires a future supervised installer-incarnation receipt, not
+  a retry heuristic.
+- Deterministic object/physical conflicts after dispatch use the typed genesis
+  rejection request. The coordinator atomically rechecks the exact 0x0A claim
+  and that no matching 0x0C result exists before writing signed FAILED bytes.
+  It must never manufacture NOT_COMMITTED from absence or use this path for an
+  unknown object/database outcome.

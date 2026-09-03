@@ -23,9 +23,9 @@ use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
 #[cfg(feature = "rhizome-workspace-genesis-core")]
 use crate::fs::workspace_genesis::{
-    GenesisDomainRecord, GenesisDurabilityReceipt, GenesisError, WorkspaceGenesisRequest,
-    decode_record as decode_genesis_record, encode_record as encode_genesis_record,
-    encoded_reverse_bindings,
+    GenesisDomainRecord, GenesisDurabilityReceipt, GenesisError, WorkspaceGenesisRejectionRequest,
+    WorkspaceGenesisRequest, decode_record as decode_genesis_record,
+    encode_record as encode_genesis_record, encoded_reverse_bindings,
 };
 use crate::fs::workspace_operation::WorkspaceLedgerRequest;
 use crate::replication::ShipOutcome;
@@ -90,6 +90,13 @@ enum Request {
     WorkspaceGenesis(
         WorkspaceGenesisRequest,
         oneshot::Sender<Result<GenesisDurabilityReceipt, GenesisError>>,
+    ),
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    WorkspaceGenesisRejection(
+        WorkspaceGenesisRejectionRequest,
+        oneshot::Sender<
+            Result<crate::fs::workspace_operation::WorkspaceOperationRecord, GenesisError>,
+        >,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
     #[cfg_attr(
@@ -353,6 +360,27 @@ impl WriteCoordinator {
         self.sender
             .send(Request::WorkspaceGenesis(
                 WorkspaceGenesisRequest { record },
+                reply_tx,
+            ))
+            .map_err(|_| GenesisError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| GenesisError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) async fn complete_workspace_genesis_rejection(
+        &self,
+        rejection: crate::fs::workspace_genesis::GenesisRejection,
+        terminal_bytes: bytes::Bytes,
+    ) -> Result<crate::fs::workspace_operation::WorkspaceOperationRecord, GenesisError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::WorkspaceGenesisRejection(
+                WorkspaceGenesisRejectionRequest {
+                    rejection,
+                    terminal_bytes,
+                },
                 reply_tx,
             ))
             .map_err(|_| GenesisError::Storage)?;
@@ -789,6 +817,12 @@ async fn worker_loop(
             }
             continue;
         }
+        #[cfg(feature = "rhizome-workspace-genesis-core")]
+        if let Request::WorkspaceGenesisRejection(request, reply) = first {
+            let result = commit_workspace_genesis_rejection(&mut ctx, request).await;
+            let _ = reply.send(result);
+            continue;
+        }
         let (txn, reply, mut require_durable, workspace_guard, export_context) = match first {
             Request::Commit(txn, reply) => (txn, reply, false, None, no_export_mutation()),
             Request::WorkspaceLedger(request, reply, guard) => (
@@ -800,6 +834,8 @@ async fn worker_loop(
             ),
             #[cfg(feature = "rhizome-workspace-genesis-core")]
             Request::WorkspaceGenesis(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            Request::WorkspaceGenesisRejection(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::ExportMutation(txn, context, reply) => {
                 let durable = context.kind.requires_durability();
@@ -854,6 +890,11 @@ async fn worker_loop(
                 #[cfg(feature = "rhizome-workspace-genesis-core")]
                 Request::WorkspaceGenesis(request, reply) => {
                     pending = Some(Request::WorkspaceGenesis(request, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-workspace-genesis-core")]
+                Request::WorkspaceGenesisRejection(request, reply) => {
+                    pending = Some(Request::WorkspaceGenesisRejection(request, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1398,6 +1439,94 @@ async fn worker_loop(
 }
 
 #[cfg(feature = "rhizome-workspace-genesis-core")]
+async fn commit_workspace_genesis_rejection(
+    ctx: &mut WorkerContext,
+    request: WorkspaceGenesisRejectionRequest,
+) -> Result<crate::fs::workspace_operation::WorkspaceOperationRecord, GenesisError> {
+    if ctx.replicator.is_some() || request.terminal_bytes.is_empty() {
+        return Err(GenesisError::Storage);
+    }
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| GenesisError::Storage)?;
+    validate_genesis_operation_claim_current(
+        &ctx.db,
+        &request.rejection.operation,
+        request.rejection.request_digest,
+        &request.rejection.effect_claim,
+    )
+    .await?;
+    let genesis_key = ctx
+        .key_codec
+        .workspace_genesis_key(&request.rejection.operation.workspace_id);
+    if let Some(bytes) = ctx
+        .db
+        .get_bytes(&genesis_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+    {
+        let existing = decode_genesis_record(&genesis_key, &bytes)?;
+        if existing.operation_kind == request.rejection.operation.kind
+            && existing.request_id == request.rejection.operation.request_id
+            && existing.request_digest == request.rejection.request_digest
+        {
+            return Err(GenesisError::Conflict);
+        }
+    }
+    match request.rejection.reason {
+        crate::fs::workspace_genesis::GenesisRejectionReason::ObjectConflict
+        | crate::fs::workspace_genesis::GenesisRejectionReason::PhysicalConflict => {}
+    }
+    let operation_key = crate::fs::workspace_operation::storage_key(&request.rejection.operation)?;
+    let terminal = crate::fs::workspace_operation::WorkspaceOperationRecord {
+        request_digest: request.rejection.request_digest,
+        state: crate::fs::workspace_operation::WorkspaceOperationState::Failed(
+            request.terminal_bytes,
+        ),
+    };
+    let value = crate::fs::workspace_operation::encode_record(&operation_key, &terminal)?;
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(operation_key, value);
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| GenesisError::CommitOutcomeUnknown)?;
+    ctx.flush_coordinator
+        .flush()
+        .await
+        .map_err(|_| GenesisError::CommitOutcomeUnknown)?;
+    Ok(terminal)
+}
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+async fn validate_genesis_operation_claim_current(
+    db: &Db,
+    operation: &crate::fs::workspace_operation::WorkspaceOperationKey,
+    digest: crate::fs::workspace_operation::CanonicalRequestDigest,
+    claim: &bytes::Bytes,
+) -> Result<(), GenesisError> {
+    let key = crate::fs::workspace_operation::storage_key(operation)?;
+    let bytes = db
+        .get_bytes(&key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .ok_or(GenesisError::Conflict)?;
+    let record = crate::fs::workspace_operation::decode_record(&key, &bytes)?;
+    if record.request_digest == digest
+        && record.state
+            == crate::fs::workspace_operation::WorkspaceOperationState::EffectDispatched(
+                claim.clone(),
+            )
+    {
+        Ok(())
+    } else {
+        Err(GenesisError::Conflict)
+    }
+}
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
 async fn commit_workspace_genesis(
     ctx: &mut WorkerContext,
     request: WorkspaceGenesisRequest,
@@ -1412,6 +1541,17 @@ async fn commit_workspace_genesis(
         .acquire_write_permit()
         .await
         .map_err(|_| GenesisError::Storage)?;
+    validate_genesis_operation_claim_current(
+        &ctx.db,
+        &crate::fs::workspace_operation::WorkspaceOperationKey::new(
+            requested.workspace_id.clone(),
+            requested.operation_kind,
+            requested.request_id.clone(),
+        ),
+        requested.request_digest,
+        &requested.effect_claim,
+    )
+    .await?;
 
     if let Some(bytes) = ctx
         .db
@@ -1644,6 +1784,7 @@ fn same_genesis_intent(current: &GenesisDomainRecord, requested: &GenesisDomainR
         && current.object_lineage == requested.object_lineage
         && current.storage_shard_id == requested.storage_shard_id
         && current.storage_routing_revision == requested.storage_routing_revision
+        && current.effect_claim == requested.effect_claim
         && current.request_digest == requested.request_digest
         && current.root_digest == requested.root_digest
         && current.root_object_key == requested.root_object_key
