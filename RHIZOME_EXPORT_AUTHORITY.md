@@ -128,7 +128,7 @@ protobuf descriptors or field numbers into ZeroFS. The mapping is closed:
 | --- | --- |
 | request ID and canonical request digest | `request_id`, `VerifiedNbdInstallDigest` |
 | Workspace, session, complete AuthorityVersion, installed capability, expiry | `MutationFenceToken` |
-| Node-allocated connection ID | `expected_connection_id` / `connection_id` |
+| Node-allocated connection ID | `expected_connection_id` / `connection_id` plus one shard-global immutable reservation |
 | connector boot, PID/start, peer UID/GID, Node and runtime | `NbdConnectorIdentity` |
 | bind target and captured listener identity | `NbdSocketTarget`, `NbdSocketIdentity` |
 | exact export and closed NBD profile | `NbdExportIdentity`, `NbdProtocolProfile` |
@@ -156,7 +156,9 @@ cold rebuild; the durable tuple never authorizes stream reconstruction.
 
 All related durable rows are read from one SlateDB remote-durable snapshot
 while holding the same per-Workspace admission reservation. Install outcome and
-record must both exist at one sequence. A successful connection additionally
+record plus the connection-ID reservation must all exist at one sequence. The
+Pending Install creates the reservation atomically, and any later session or
+Workspace attempting to reuse that UUID conflicts. A successful connection additionally
 requires the exact receipt and consumed Install at that sequence. Partial graphs
 are corruption, including after reopen; independent point reads are not a valid
 receipt.

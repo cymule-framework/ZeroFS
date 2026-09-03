@@ -15,17 +15,18 @@ use crate::fs::export_authority::{
     NbdSessionClaimLookup, NbdSessionInstallOutcome, NbdSessionInstallReceipt,
     NbdSessionInstallRecord, NbdSessionInstallState, apply_nbd_connection_consume,
     apply_nbd_session_burn, apply_nbd_session_claim, apply_transition, decode_record,
-    decode_reverse_binding, encode_nbd_connection_receipt, encode_nbd_install_outcome,
-    encode_nbd_session_install, encode_outcome, encode_record, encode_reverse_binding,
-    ensure_nbd_connection_receipt, ensure_nbd_install_outcome, ensure_nbd_install_state,
-    ensure_outcome, mutation_outcome_key, nbd_connection_receipt_key, nbd_install_outcome_key,
-    nbd_session_install_key, read_nbd_connection_receipt_current,
-    read_nbd_connection_receipt_durable, read_nbd_install_outcome_current,
+    decode_reverse_binding, encode_nbd_connection_receipt, encode_nbd_connection_reservation,
+    encode_nbd_install_outcome, encode_nbd_session_install, encode_outcome, encode_record,
+    encode_reverse_binding, ensure_nbd_connection_receipt, ensure_nbd_install_outcome,
+    ensure_nbd_install_state, ensure_outcome, mutation_outcome_key, nbd_connection_receipt_key,
+    nbd_connection_reservation_key, nbd_install_outcome_key, nbd_session_install_key,
+    read_nbd_connection_receipt_current, read_nbd_connection_receipt_durable,
+    read_nbd_connection_reservation_current, read_nbd_install_outcome_current,
     read_nbd_install_outcome_durable, read_nbd_session_install_current,
     read_nbd_session_install_durable, read_outcome_current, read_record_current,
     read_reverse_binding_current, reverse_binding_for, reverse_binding_keys,
-    trusted_now_unix_millis, validate_mutation, validate_nbd_connection_expectation,
-    validate_nbd_install_expectation,
+    same_nbd_install_request, trusted_now_unix_millis, validate_mutation,
+    validate_nbd_connection_expectation, validate_nbd_install_expectation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1763,6 +1764,13 @@ async fn commit_nbd_session_install(
             .await?
             .ok_or(ExportAuthorityError::Corrupt)?;
         ensure_nbd_install_state(&install, &outcome, &expected)?;
+        let reservation_key = nbd_connection_reservation_key(&expected);
+        let reservation = read_nbd_connection_reservation_current(&ctx.db, &reservation_key)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        if reservation != install.expectation {
+            return Err(ExportAuthorityError::Corrupt);
+        }
         drop(permit);
         flush_nbd_session_commit(ctx).await?;
         return Ok(outcome);
@@ -1770,6 +1778,15 @@ async fn commit_nbd_session_install(
     validate_nbd_session_authority(ctx, &expected).await?;
 
     let install_key = nbd_session_install_key(&expected);
+    let reservation_key = nbd_connection_reservation_key(&expected);
+    if let Some(reservation) =
+        read_nbd_connection_reservation_current(&ctx.db, &reservation_key).await?
+    {
+        if same_nbd_install_request(&reservation, &expected) {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+        return Err(ExportAuthorityError::Conflict);
+    }
     if let Some(existing) = read_nbd_session_install_current(&ctx.db, &install_key).await? {
         if existing.expectation == expected {
             return Err(ExportAuthorityError::Corrupt);
@@ -1785,6 +1802,10 @@ async fn commit_nbd_session_install(
     let mut batch = WriteBatch::new();
     batch.put_bytes(install_key, encode_nbd_session_install(&record)?);
     batch.put_bytes(outcome_key, encode_nbd_install_outcome(&outcome)?);
+    batch.put_bytes(
+        reservation_key,
+        encode_nbd_connection_reservation(&record.expectation)?,
+    );
     permit
         .write_with_options(batch, &WriteOptions::default())
         .await
@@ -1819,6 +1840,7 @@ async fn commit_nbd_session_install_completion(
         .await?
         .ok_or(ExportAuthorityError::Corrupt)?;
     ensure_nbd_install_state(&install, &outcome, &expected)?;
+    validate_nbd_connection_reservation_current(ctx, &expected, &install.expectation).await?;
     if let NbdSessionInstallOutcome::Installed(receipt) = outcome {
         if receipt.socket != socket {
             return Err(ExportAuthorityError::Conflict);
@@ -1833,12 +1855,16 @@ async fn commit_nbd_session_install_completion(
     let durable_pending = read_nbd_install_outcome_durable(&ctx.db, &outcome_key, &expected)
         .await?
         .ok_or(ExportAuthorityError::Conflict)?;
-    if durable_pending != NbdSessionInstallOutcome::Pending(Box::new(expected.clone())) {
+    ensure_nbd_install_outcome(&durable_pending, &expected)?;
+    let NbdSessionInstallOutcome::Pending(canonical_expected) = durable_pending else {
         return Err(ExportAuthorityError::Conflict);
+    };
+    if install.expectation != *canonical_expected {
+        return Err(ExportAuthorityError::Corrupt);
     }
     validate_nbd_session_authority(ctx, &expected).await?;
     let receipt = NbdSessionInstallReceipt {
-        expectation: expected,
+        expectation: *canonical_expected,
         socket,
         committed_at_unix_millis: authority_now(&ctx.authority_time_floor),
     };
@@ -1883,6 +1909,7 @@ async fn commit_nbd_session_claim(
     let mut install = read_nbd_session_install_current(&ctx.db, &install_key)
         .await?
         .ok_or(ExportAuthorityError::Corrupt)?;
+    validate_nbd_connection_reservation_current(ctx, &expected, &install.expectation).await?;
     let was_claimed = matches!(install.state, NbdSessionInstallState::Claimed { .. });
     let claim = apply_nbd_session_claim(&mut install, command)?;
     if was_claimed {
@@ -1934,6 +1961,8 @@ async fn commit_nbd_session_burn(
     let mut install = read_nbd_session_install_current(&ctx.db, &install_key)
         .await?
         .ok_or(ExportAuthorityError::Corrupt)?;
+    validate_nbd_connection_reservation_current(ctx, &install_expected, &install.expectation)
+        .await?;
     let was_burned = matches!(install.state, NbdSessionInstallState::Burned { .. });
     let result = apply_nbd_session_burn(&mut install, command)?;
     if was_burned {
@@ -1978,6 +2007,12 @@ async fn commit_nbd_session_consume(
         let install = read_nbd_session_install_current(&ctx.db, &install_key)
             .await?
             .ok_or(ExportAuthorityError::Corrupt)?;
+        validate_nbd_connection_reservation_current(
+            ctx,
+            &expected.install.expectation,
+            &install.expectation,
+        )
+        .await?;
         if install.expectation != expected.install.expectation
             || install.state
                 != (NbdSessionInstallState::Consumed {
@@ -2016,6 +2051,12 @@ async fn commit_nbd_session_consume(
     let mut install = read_nbd_session_install_current(&ctx.db, &install_key)
         .await?
         .ok_or(ExportAuthorityError::NotFound)?;
+    validate_nbd_connection_reservation_current(
+        ctx,
+        &expected.install.expectation,
+        &install.expectation,
+    )
+    .await?;
     if read_nbd_connection_receipt_current(&ctx.db, &receipt_key)
         .await?
         .is_some()
@@ -2034,6 +2075,22 @@ async fn commit_nbd_session_consume(
         .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
     flush_nbd_session_commit(ctx).await?;
     Ok(receipt)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn validate_nbd_connection_reservation_current(
+    ctx: &WorkerContext,
+    expected: &crate::fs::export_authority::NbdSessionInstallExpectation,
+    canonical: &crate::fs::export_authority::NbdSessionInstallExpectation,
+) -> Result<(), ExportAuthorityError> {
+    let key = nbd_connection_reservation_key(expected);
+    let reservation = read_nbd_connection_reservation_current(&ctx.db, &key)
+        .await?
+        .ok_or(ExportAuthorityError::Corrupt)?;
+    if reservation != *canonical || !same_nbd_install_request(&reservation, expected) {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]

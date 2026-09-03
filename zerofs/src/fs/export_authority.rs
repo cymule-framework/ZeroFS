@@ -26,6 +26,7 @@ const REVERSE_BINDING_MAGIC: &[u8; 4] = b"RBND";
 const NBD_SESSION_INSTALL_MAGIC: &[u8; 4] = b"RNBI";
 const NBD_SESSION_INSTALL_OUTCOME_MAGIC: &[u8; 4] = b"RNBO";
 const NBD_CONNECTION_RECEIPT_MAGIC: &[u8; 4] = b"RNBC";
+const NBD_CONNECTION_RESERVATION_MAGIC: &[u8; 4] = b"RNBR";
 const MAX_ID_BYTES: usize = 1024;
 const SHA256_SIZE: usize = 32;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -1227,16 +1228,17 @@ impl ExportAuthorityStore {
             .admission_locks
             .acquire(expected.token.workspace_id.clone())
             .await;
-        let outcome_key = nbd_install_outcome_key(&expected);
         if let Some((outcome, _)) = read_nbd_install_graph_durable(&self.db, &expected).await? {
             return Ok(outcome);
         }
         self.coordinator.install_nbd_session(command, guard).await?;
-        let outcome = read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected)
+        let _guard = self
+            .admission_locks
+            .acquire(expected.token.workspace_id.clone())
+            .await;
+        let (outcome, _) = read_nbd_install_graph_durable(&self.db, &expected)
             .await?
             .ok_or(ExportAuthorityError::Corrupt)?;
-        ensure_nbd_install_outcome(&outcome, &expected)?;
-        validate_nbd_install_graph_durable(&self.db, &expected, &outcome).await?;
         Ok(outcome)
     }
 
@@ -1282,7 +1284,6 @@ impl ExportAuthorityStore {
             .admission_locks
             .acquire(expected.token.workspace_id.clone())
             .await;
-        let outcome_key = nbd_install_outcome_key(&expected);
         if let Some((NbdSessionInstallOutcome::Installed(receipt), _)) =
             read_nbd_install_graph_durable(&self.db, &expected).await?
         {
@@ -1294,11 +1295,13 @@ impl ExportAuthorityStore {
         self.coordinator
             .complete_nbd_session_install(command, guard)
             .await?;
-        let outcome = read_nbd_install_outcome_durable(&self.db, &outcome_key, &expected)
+        let _guard = self
+            .admission_locks
+            .acquire(expected.token.workspace_id.clone())
+            .await;
+        let (outcome, _) = read_nbd_install_graph_durable(&self.db, &expected)
             .await?
             .ok_or(ExportAuthorityError::Corrupt)?;
-        ensure_nbd_install_outcome(&outcome, &expected)?;
-        validate_nbd_install_graph_durable(&self.db, &expected, &outcome).await?;
         match outcome {
             NbdSessionInstallOutcome::Installed(receipt) => Ok(*receipt),
             NbdSessionInstallOutcome::Pending(_) => Err(ExportAuthorityError::Corrupt),
@@ -1411,18 +1414,17 @@ impl ExportAuthorityStore {
             .admission_locks
             .acquire(expected.install.expectation.token.workspace_id.clone())
             .await;
-        let receipt_key = nbd_connection_receipt_key(&expected);
         let (receipt, _, _) = read_nbd_connection_graph_durable(&self.db, &expected).await?;
         if let Some(receipt) = receipt {
             return Ok(receipt);
         }
         self.coordinator.consume_nbd_session(command, guard).await?;
-        let receipt = read_nbd_connection_receipt_durable(&self.db, &receipt_key)
-            .await?
-            .ok_or(ExportAuthorityError::Corrupt)?;
-        ensure_nbd_connection_receipt(&receipt, &expected)?;
-        validate_nbd_connection_graph_durable(&self.db, &receipt).await?;
-        Ok(receipt)
+        let _guard = self
+            .admission_locks
+            .acquire(expected.install.expectation.token.workspace_id.clone())
+            .await;
+        let (receipt, _, _) = read_nbd_connection_graph_durable(&self.db, &expected).await?;
+        receipt.ok_or(ExportAuthorityError::Corrupt)
     }
 
     #[cfg_attr(
@@ -2082,6 +2084,10 @@ pub(crate) fn nbd_connection_receipt_key(expected: &NbdConnectionExpectation) ->
     )
 }
 
+pub(crate) fn nbd_connection_reservation_key(expected: &NbdSessionInstallExpectation) -> Bytes {
+    KeyCodec::new().nbd_connection_reservation_key(&expected.expected_connection_id.0)
+}
+
 pub(crate) async fn read_nbd_session_install_current(
     db: &Db,
     key: &Bytes,
@@ -2168,30 +2174,48 @@ pub(crate) async fn read_nbd_connection_receipt_durable(
     decode_nbd_connection_receipt(&bytes, key).map(Some)
 }
 
+pub(crate) async fn read_nbd_connection_reservation_current(
+    db: &Db,
+    key: &Bytes,
+) -> Result<Option<NbdSessionInstallExpectation>, ExportAuthorityError> {
+    let Some(bytes) = db
+        .get_bytes(key)
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?
+    else {
+        return Ok(None);
+    };
+    decode_nbd_connection_reservation(&bytes, key).map(Some)
+}
+
 async fn read_nbd_install_graph_durable(
     db: &Db,
     expected: &NbdSessionInstallExpectation,
 ) -> Result<Option<(NbdSessionInstallOutcome, NbdSessionInstallRecord)>, ExportAuthorityError> {
     let outcome_key = nbd_install_outcome_key(expected);
     let install_key = nbd_session_install_key(expected);
+    let reservation_key = nbd_connection_reservation_key(expected);
     let mut values = db
-        .get_bytes_durable_snapshot(&[outcome_key.clone(), install_key.clone()])
+        .get_bytes_durable_snapshot(&[
+            outcome_key.clone(),
+            install_key.clone(),
+            reservation_key.clone(),
+        ])
         .await
         .map_err(|_| ExportAuthorityError::Storage)?;
-    let install_bytes = values
-        .pop()
-        .ok_or(ExportAuthorityError::Corrupt)?
-        .ok_or(ExportAuthorityError::Corrupt)?;
-    let outcome_bytes = values
-        .pop()
-        .ok_or(ExportAuthorityError::Corrupt)?
-        .ok_or(ExportAuthorityError::Corrupt)?;
-    match (outcome_bytes, install_bytes) {
-        (None, None) => Ok(None),
-        (Some(outcome), Some(install)) => {
+    let reservation_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let install_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    match (outcome_bytes, install_bytes, reservation_bytes) {
+        (None, None, None) => Ok(None),
+        (Some(outcome), Some(install), Some(reservation)) => {
             let outcome = decode_nbd_install_outcome(&outcome, &outcome_key, expected)?;
             let install = decode_nbd_session_install(&install, &install_key)?;
+            let reservation = decode_nbd_connection_reservation(&reservation, &reservation_key)?;
             ensure_nbd_install_state(&install, &outcome, expected)?;
+            if reservation != install.expectation {
+                return Err(ExportAuthorityError::Corrupt);
+            }
             Ok(Some((outcome, install)))
         }
         _ => Err(ExportAuthorityError::Corrupt),
@@ -2213,20 +2237,36 @@ async fn read_nbd_connection_graph_durable(
     let receipt_key = nbd_connection_receipt_key(expected);
     let outcome_key = nbd_install_outcome_key(install_expected);
     let install_key = nbd_session_install_key(install_expected);
+    let reservation_key = nbd_connection_reservation_key(install_expected);
     let mut values = db
         .get_bytes_durable_snapshot(&[
             receipt_key.clone(),
             outcome_key.clone(),
             install_key.clone(),
+            reservation_key.clone(),
         ])
         .await
         .map_err(|_| ExportAuthorityError::Storage)?;
-    let install_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
-    let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
+    let reservation_bytes = values
+        .pop()
+        .ok_or(ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::Corrupt)?;
+    let install_bytes = values
+        .pop()
+        .ok_or(ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::Corrupt)?;
+    let outcome_bytes = values
+        .pop()
+        .ok_or(ExportAuthorityError::Corrupt)?
+        .ok_or(ExportAuthorityError::Corrupt)?;
     let receipt_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
     let outcome = decode_nbd_install_outcome(&outcome_bytes, &outcome_key, install_expected)?;
     let install = decode_nbd_session_install(&install_bytes, &install_key)?;
+    let reservation = decode_nbd_connection_reservation(&reservation_bytes, &reservation_key)?;
     ensure_nbd_install_state(&install, &outcome, install_expected)?;
+    if reservation != install.expectation {
+        return Err(ExportAuthorityError::Corrupt);
+    }
     if outcome != NbdSessionInstallOutcome::Installed(Box::new(expected.install.clone())) {
         return Err(ExportAuthorityError::Corrupt);
     }
@@ -2249,33 +2289,6 @@ async fn read_nbd_connection_graph_durable(
         return Err(ExportAuthorityError::Corrupt);
     }
     Ok((receipt, outcome, install))
-}
-
-async fn validate_nbd_install_graph_durable(
-    db: &Db,
-    expected: &NbdSessionInstallExpectation,
-    outcome: &NbdSessionInstallOutcome,
-) -> Result<(), ExportAuthorityError> {
-    let (durable_outcome, _) = read_nbd_install_graph_durable(db, expected)
-        .await?
-        .ok_or(ExportAuthorityError::Corrupt)?;
-    if &durable_outcome == outcome {
-        Ok(())
-    } else {
-        Err(ExportAuthorityError::Corrupt)
-    }
-}
-
-async fn validate_nbd_connection_graph_durable(
-    db: &Db,
-    receipt: &NbdConnectionReceipt,
-) -> Result<(), ExportAuthorityError> {
-    let (durable_receipt, _, _) =
-        read_nbd_connection_graph_durable(db, &receipt.expectation).await?;
-    if durable_receipt.as_ref() != Some(receipt) {
-        return Err(ExportAuthorityError::Corrupt);
-    }
-    Ok(())
 }
 
 async fn read_outcome_durable(
@@ -2554,6 +2567,17 @@ pub(crate) fn encode_nbd_connection_receipt(
     encode_bound_record(NBD_CONNECTION_RECEIPT_MAGIC, &key, &payload)
 }
 
+pub(crate) fn encode_nbd_connection_reservation(
+    expected: &NbdSessionInstallExpectation,
+) -> Result<Bytes, ExportAuthorityError> {
+    validate_nbd_install_expectation(expected, true)?;
+    let key = nbd_connection_reservation_key(expected);
+    let payload = codec()
+        .serialize(expected)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    encode_bound_record(NBD_CONNECTION_RESERVATION_MAGIC, &key, &payload)
+}
+
 pub(crate) fn decode_record(
     bytes: &[u8],
     expected_workspace_id: &str,
@@ -2655,6 +2679,21 @@ fn decode_nbd_connection_receipt(
         return Err(ExportAuthorityError::Corrupt);
     }
     Ok(receipt)
+}
+
+fn decode_nbd_connection_reservation(
+    bytes: &[u8],
+    key: &Bytes,
+) -> Result<NbdSessionInstallExpectation, ExportAuthorityError> {
+    let payload = decode_bound_record(NBD_CONNECTION_RESERVATION_MAGIC, key, bytes)?;
+    let expected: NbdSessionInstallExpectation = codec()
+        .deserialize(payload)
+        .map_err(|_| ExportAuthorityError::Corrupt)?;
+    validate_nbd_install_expectation(&expected, true).map_err(|_| ExportAuthorityError::Corrupt)?;
+    if nbd_connection_reservation_key(&expected) != *key {
+        return Err(ExportAuthorityError::Corrupt);
+    }
+    Ok(expected)
 }
 
 fn encode_bound_record(
@@ -2803,7 +2842,7 @@ pub(crate) fn ensure_nbd_install_state(
     }
 }
 
-fn same_nbd_install_request(
+pub(crate) fn same_nbd_install_request(
     left: &NbdSessionInstallExpectation,
     right: &NbdSessionInstallExpectation,
 ) -> bool {
@@ -3073,7 +3112,7 @@ pub(crate) fn validate_nbd_install_expectation(
         || expected.activation_receipt_digest == [0; SHA256_SIZE]
         || expected.storage_routing_revision == 0
         || expected.expires_at_unix_millis == 0
-        || expected.expires_at_unix_millis > expected.token.expires_at_unix_millis
+        || expected.expires_at_unix_millis != expected.token.expires_at_unix_millis
         || !is_uuid_v4(&expected.request_id.0)
         || !is_uuid_v4(&expected.expected_connection_id.0)
         || expected.request_digest.0 == [0; SHA256_SIZE]
@@ -7091,6 +7130,13 @@ mod tests {
             validate_nbd_install_expectation(&altered, true),
             Err(ExportAuthorityError::Invalid)
         );
+
+        let mut altered = nbd_install(&active, 0x80).expectation();
+        altered.expires_at_unix_millis -= 1;
+        assert_eq!(
+            validate_nbd_install_expectation(&altered, true),
+            Err(ExportAuthorityError::Invalid)
+        );
     }
 
     #[tokio::test]
@@ -7426,6 +7472,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_keeps_the_first_install_capability_audit_identity() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let command = nbd_install(&active, 0x98);
+        let original = command.expectation();
+        fs.export_authority
+            .install_nbd_session(command)
+            .await
+            .unwrap();
+
+        let mut current = active.clone();
+        current.active_session.as_mut().unwrap().capability_id = "capability-completion".into();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                KeyCodec::new().export_authority_key(&current.workspace_id),
+                encode_record(&current).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut presenting = original.clone();
+        presenting.token.capability_id = "capability-completion".into();
+        let receipt = fs
+            .export_authority
+            .complete_nbd_session_install(
+                CompleteNbdSessionInstall::new(presenting, nbd_socket(&original.socket_target))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.expectation, original);
+    }
+
+    #[tokio::test]
+    async fn connection_id_cannot_be_reused_by_a_later_session() {
+        let fs = new_export_fs().await;
+        let first = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let first_install = nbd_install(&first, 0x99);
+        let reserved_connection = first_install.expectation.expected_connection_id;
+        fs.export_authority
+            .install_nbd_session(first_install)
+            .await
+            .unwrap();
+        fs.export_authority
+            .deactivate(DeactivateExport {
+                workspace_id: first.workspace_id.clone(),
+                expected_export: first.export.clone(),
+                expected_authority: first.authority.clone(),
+                session_id: first.active_session.as_ref().unwrap().session_id.clone(),
+            })
+            .await
+            .unwrap();
+        let second = fs
+            .export_authority
+            .activate(ActivateExport {
+                workspace_id: first.workspace_id.clone(),
+                export: first.export.clone(),
+                authority: authority(4, 6),
+                session: session("session-b", "capability-b", u64::MAX - 1),
+            })
+            .await
+            .unwrap();
+        let mut reused = nbd_install(&second, 0x9a);
+        reused.expectation.expected_connection_id = reserved_connection;
+        assert_eq!(
+            fs.export_authority.install_nbd_session(reused).await,
+            Err(ExportAuthorityError::Conflict)
+        );
+    }
+
+    #[tokio::test]
     async fn undurable_go_never_becomes_committed_by_replay() {
         let fs = new_export_fs().await;
         let active = fs
@@ -7623,7 +7747,7 @@ mod tests {
 
     #[tokio::test]
     async fn reopened_partial_connection_graphs_fail_closed() {
-        for missing in 0..3 {
+        for missing in 0..4 {
             let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
                 Arc::new(slatedb::object_store::memory::InMemory::new());
             let fs = open_fs(object_store.clone()).await.unwrap();
@@ -7649,7 +7773,8 @@ mod tests {
             let key = match missing {
                 0 => nbd_session_install_key(&expected.install.expectation),
                 1 => nbd_install_outcome_key(&expected.install.expectation),
-                _ => nbd_connection_receipt_key(&expected),
+                2 => nbd_connection_receipt_key(&expected),
+                _ => nbd_connection_reservation_key(&expected.install.expectation),
             };
             fs.db
                 .inject_reserved_authority_delete_for_test(key)

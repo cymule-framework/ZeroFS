@@ -63,6 +63,8 @@ const NBD_SESSION_INSTALL_SUBTYPE: u8 = 5;
 const NBD_SESSION_INSTALL_OUTCOME_SUBTYPE: u8 = 6;
 #[cfg(feature = "rhizome-export-authority-core")]
 const NBD_CONNECTION_RECEIPT_SUBTYPE: u8 = 7;
+#[cfg(feature = "rhizome-export-authority-core")]
+const NBD_CONNECTION_RESERVATION_SUBTYPE: u8 = 8;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -392,6 +394,17 @@ impl KeyCodec {
             identity,
             Some(connection_id),
         )
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn nbd_connection_reservation_key(&self, connection_id: &[u8; 16]) -> Bytes {
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 3 + connection_id.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_EXPORT_AUTHORITY);
+        key.push(EXPORT_KEY_VERSION);
+        key.push(NBD_CONNECTION_RESERVATION_SUBTYPE);
+        key.extend_from_slice(connection_id);
+        Bytes::from(key)
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -1041,6 +1054,9 @@ mod tests {
             ));
             assert!(is_reserved_mutation_key(
                 &codec.nbd_connection_receipt_key(&session, &[2; 16])
+            ));
+            assert!(is_reserved_mutation_key(
+                &codec.nbd_connection_reservation_key(&[2; 16])
             ));
         }
         #[cfg(feature = "rhizome-export-authority-core")]

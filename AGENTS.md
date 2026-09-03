@@ -147,6 +147,9 @@ attribution intact.
   a consumed Install without its connection receipt, or a receipt without the
   exact consumed Install are corruption; never assemble authority from point
   reads at different sequences.
+- The first Pending Install atomically reserves its Node-allocated connection
+  UUID in a shard-global immutable reverse row. Every later graph includes that
+  row and no later session or Workspace may reuse the UUID.
 - Install completion must revalidate the current guarded server boot, full
   Actor/session authority, both immutable reverse bindings, and the physical
   export mapping at its final write permit. A stale or replaced export may
