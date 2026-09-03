@@ -32,6 +32,7 @@ use bytes::Bytes;
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
 //   0x0A WORKSPACE_OP   Rhizome Workspace operation ledger, versioned composite key
 //   0x0B EXPORT_AUTHORITY Rhizome per-export authority/session state
+//   0x0C WORKSPACE_GENESIS Rhizome immutable Workspace genesis domain record
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -45,6 +46,7 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_WORKSPACE_OPERATION: u8 = 0x0A;
 const PREFIX_EXPORT_AUTHORITY: u8 = 0x0B;
+const PREFIX_WORKSPACE_GENESIS: u8 = 0x0C;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -101,6 +103,7 @@ pub(crate) fn is_reserved_mutation_key(key: &[u8]) -> bool {
     let kind = key[META_DOMAIN.len()];
     kind == PREFIX_WORKSPACE_OPERATION
         || kind == PREFIX_EXPORT_AUTHORITY
+        || kind == PREFIX_WORKSPACE_GENESIS
         || (kind == PREFIX_SYSTEM
             && key.get(META_DOMAIN.len() + 1) == Some(&SYSTEM_EXPORT_BOOT_SUBTYPE))
 }
@@ -219,6 +222,19 @@ pub(crate) enum ExportBindingMetadataKey {
 impl KeyCodec {
     pub fn new() -> Self {
         Self
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) fn workspace_genesis_key(&self, workspace_id: &str) -> Bytes {
+        let bytes = workspace_id.as_bytes();
+        let len = u16::try_from(bytes.len()).expect("validated Workspace id fits u16");
+        let mut key = Vec::with_capacity(META_DOMAIN.len() + 1 + 1 + 2 + bytes.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_WORKSPACE_GENESIS);
+        key.push(1);
+        key.extend_from_slice(&len.to_be_bytes());
+        key.extend_from_slice(bytes);
+        Bytes::from(key)
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]

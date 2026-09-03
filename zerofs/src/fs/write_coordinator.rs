@@ -21,6 +21,12 @@ use crate::fs::key_codec::ExportBindingMetadataKey;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+use crate::fs::workspace_genesis::{
+    GenesisDomainRecord, GenesisDurabilityReceipt, GenesisError, WorkspaceGenesisRequest,
+    decode_record as decode_genesis_record, encode_record as encode_genesis_record,
+    encoded_reverse_bindings,
+};
 use crate::fs::workspace_operation::WorkspaceLedgerRequest;
 use crate::replication::ShipOutcome;
 use crate::replication::types::SlateDbSeqno;
@@ -73,6 +79,11 @@ enum Request {
         Reply,
         tokio::sync::OwnedMutexGuard<()>,
     ),
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    WorkspaceGenesis(
+        WorkspaceGenesisRequest,
+        oneshot::Sender<Result<GenesisDurabilityReceipt, GenesisError>>,
+    ),
     #[cfg(feature = "rhizome-export-authority-core")]
     #[cfg_attr(
         not(test),
@@ -110,6 +121,8 @@ pub struct WriteCoordinator {
     /// mutation still flows through `sender`; this lock is not a second commit
     /// authority or worker.
     workspace_ledger_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    genesis_gate_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "rhizome-export-authority-core")]
     export_server_boot_id: Arc<str>,
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -169,6 +182,8 @@ struct WorkerContext {
     lineage_token: u64,
     /// Data plane used to attach un-PUT segment bytes to replication.
     extent_store: ExtentStore,
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    genesis_gate_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "rhizome-export-authority-core")]
     export_server_boot_id: Arc<str>,
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -242,6 +257,8 @@ impl WriteCoordinator {
         let export_binding_index_rebuilds = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(any(test, dst))]
         let workspace_durable_test_hook = Arc::new(WorkspaceDurableTestHook::default());
+        #[cfg(feature = "rhizome-workspace-genesis-core")]
+        let genesis_gate_enabled = Arc::new(std::sync::atomic::AtomicBool::new(!cfg!(test)));
         let ctx = WorkerContext {
             db,
             inode_store,
@@ -254,6 +271,8 @@ impl WriteCoordinator {
             dedup,
             lineage_token,
             extent_store,
+            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            genesis_gate_enabled: genesis_gate_enabled.clone(),
             #[cfg(feature = "rhizome-export-authority-core")]
             export_server_boot_id: export_server_boot_id.clone(),
             #[cfg(feature = "rhizome-export-authority-core")]
@@ -271,6 +290,8 @@ impl WriteCoordinator {
         Self {
             sender,
             workspace_ledger_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            genesis_gate_enabled,
             #[cfg(feature = "rhizome-export-authority-core")]
             export_server_boot_id,
             #[cfg(feature = "rhizome-export-authority-core")]
@@ -307,6 +328,29 @@ impl WriteCoordinator {
 
     pub(crate) async fn lock_workspace_ledger(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.workspace_ledger_lock.clone().lock_owned().await
+    }
+
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    pub(crate) async fn materialize_workspace_genesis(
+        &self,
+        record: GenesisDomainRecord,
+    ) -> Result<GenesisDurabilityReceipt, GenesisError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::WorkspaceGenesis(
+                WorkspaceGenesisRequest { record },
+                reply_tx,
+            ))
+            .map_err(|_| GenesisError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| GenesisError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
+    pub(crate) fn dst_enable_workspace_genesis_gate(&self) {
+        self.genesis_gate_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -716,6 +760,21 @@ async fn worker_loop(
             let _ = reply.send(result);
             continue;
         }
+        #[cfg(feature = "rhizome-workspace-genesis-core")]
+        if let Request::WorkspaceGenesis(request, reply) = first {
+            let result = commit_workspace_genesis(&mut ctx, request).await;
+            #[cfg(any(test, dst))]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
         let (txn, reply, mut require_durable, workspace_guard, export_context) = match first {
             Request::Commit(txn, reply) => (txn, reply, false, None, no_export_mutation()),
             Request::WorkspaceLedger(request, reply, guard) => (
@@ -725,6 +784,8 @@ async fn worker_loop(
                 Some(SequencingGuard::Workspace { _guard: guard }),
                 no_export_mutation(),
             ),
+            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            Request::WorkspaceGenesis(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::ExportMutation(txn, context, reply) => {
                 let durable = context.kind.requires_durability();
@@ -775,6 +836,11 @@ async fn worker_loop(
                         Some(SequencingGuard::Workspace { _guard: guard }),
                         no_export_mutation(),
                     ));
+                }
+                #[cfg(feature = "rhizome-workspace-genesis-core")]
+                Request::WorkspaceGenesis(request, reply) => {
+                    pending = Some(Request::WorkspaceGenesis(request, reply));
+                    break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
                 Request::ExportMutation(txn, context, reply) => {
@@ -1317,6 +1383,284 @@ async fn worker_loop(
     }
 }
 
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+async fn commit_workspace_genesis(
+    ctx: &mut WorkerContext,
+    request: WorkspaceGenesisRequest,
+) -> Result<GenesisDurabilityReceipt, GenesisError> {
+    if ctx.replicator.is_some() {
+        return Err(GenesisError::Storage);
+    }
+    let requested = request.record;
+    let genesis_key = ctx.key_codec.workspace_genesis_key(&requested.workspace_id);
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| GenesisError::Storage)?;
+
+    if let Some(bytes) = ctx
+        .db
+        .get_bytes(&genesis_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+    {
+        let current = decode_genesis_record(&genesis_key, &bytes)?;
+        if !same_genesis_intent(&current, &requested) {
+            return Err(GenesisError::Conflict);
+        }
+        validate_committed_genesis(ctx, &current).await?;
+        drop(permit);
+        ctx.flush_coordinator
+            .flush()
+            .await
+            .map_err(|_| GenesisError::CommitOutcomeUnknown)?;
+        let durable = ctx
+            .db
+            .get_bytes_durable(&genesis_key)
+            .await
+            .map_err(|_| GenesisError::Storage)?
+            .ok_or(GenesisError::CommitOutcomeUnknown)?;
+        if decode_genesis_record(&genesis_key, &durable)? != current {
+            return Err(GenesisError::Corrupt);
+        }
+        return durability_receipt(&ctx.db, current);
+    }
+
+    if ctx
+        .db
+        .get_bytes(&ctx.key_codec.export_authority_key(&requested.workspace_id))
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .is_some()
+    {
+        return Err(GenesisError::Conflict);
+    }
+
+    let nbd_mapping = ctx
+        .db
+        .get_bytes(&ctx.key_codec.dir_entry_key(0, b".nbd"))
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .ok_or(GenesisError::Invalid)
+        .and_then(|bytes| decode_exact_dir_entry(&bytes).map_err(|_| GenesisError::Corrupt))?;
+    let nbd_directory_inode = nbd_mapping.0;
+    let nbd_directory_key = ctx.key_codec.inode_key(nbd_directory_inode);
+    let nbd_directory_bytes = ctx
+        .db
+        .get_bytes(&nbd_directory_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .ok_or(GenesisError::Invalid)?;
+    let mut nbd_directory: crate::fs::inode::Inode =
+        decode_exact_inode(&nbd_directory_bytes).map_err(|_| GenesisError::Corrupt)?;
+    let crate::fs::inode::Inode::Directory(directory) = &mut nbd_directory else {
+        return Err(GenesisError::Invalid);
+    };
+    if directory.parent != 0 || directory.name.as_deref() != Some(b".nbd") || directory.nlink == 0 {
+        return Err(GenesisError::Invalid);
+    }
+    if ctx
+        .db
+        .get_bytes(
+            &ctx.key_codec
+                .dir_entry_key(nbd_directory_inode, &requested.export.name),
+        )
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .is_some()
+    {
+        return Err(GenesisError::Conflict);
+    }
+
+    let cookie_key = ctx.key_codec.dir_cookie_counter_key(nbd_directory_inode);
+    let cookie = match ctx
+        .db
+        .get_bytes(&cookie_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+    {
+        Some(bytes) => KeyCodec::decode_counter(&bytes).map_err(|_| GenesisError::Corrupt)?,
+        None => crate::fs::store::directory::COOKIE_FIRST_ENTRY,
+    };
+    let inode = ctx.inode_store.allocate();
+    let mut record = requested;
+    record.export.nbd_directory_inode = nbd_directory_inode;
+    record.export.inode = inode;
+    let binding = crate::fs::workspace_genesis::reverse_binding(&record);
+    let (reverse_name_key, reverse_inode_key) = reverse_binding_keys(&binding);
+    if read_reverse_binding_current(&ctx.db, &reverse_name_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        .is_some()
+        || read_reverse_binding_current(&ctx.db, &reverse_inode_key)
+            .await
+            .map_err(|_| GenesisError::Storage)?
+            .is_some()
+    {
+        return Err(GenesisError::Conflict);
+    }
+
+    let (now_sec, now_nsec) = crate::fs::get_current_time();
+    let file = crate::fs::inode::Inode::File(crate::fs::inode::FileInode {
+        size: record.export.advertised_size,
+        mtime: now_sec,
+        mtime_nsec: now_nsec,
+        ctime: now_sec,
+        ctime_nsec: now_nsec,
+        atime: now_sec,
+        atime_nsec: now_nsec,
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        parent: Some(nbd_directory_inode),
+        name: Some(record.export.name.clone()),
+        nlink: 1,
+    });
+    directory.entry_count = directory
+        .entry_count
+        .checked_add(1)
+        .ok_or(GenesisError::Invalid)?;
+    directory.mtime = now_sec;
+    directory.mtime_nsec = now_nsec;
+    directory.ctime = now_sec;
+    directory.ctime_nsec = now_nsec;
+
+    let mut txn = Transaction::new();
+    ctx.inode_store
+        .save(&mut txn, inode, &file)
+        .map_err(|_| GenesisError::Storage)?;
+    ctx.directory_store.add(
+        &mut txn,
+        nbd_directory_inode,
+        &record.export.name,
+        inode,
+        cookie,
+        Some(&file),
+    );
+    ctx.inode_store
+        .save(&mut txn, nbd_directory_inode, &nbd_directory)
+        .map_err(|_| GenesisError::Storage)?;
+    txn.put_bytes(&cookie_key, KeyCodec::encode_counter(cookie + 1));
+    txn.put_bytes(
+        &ctx.key_codec.system_counter_key(),
+        KeyCodec::encode_counter(ctx.inode_store.next_id()),
+    );
+    txn.put_bytes(&genesis_key, encode_genesis_record(&genesis_key, &record)?);
+    let ((name_key, name_value), (inode_key, inode_value)) = encoded_reverse_bindings(&record)?;
+    txn.put_bytes(&name_key, name_value);
+    txn.put_bytes(&inode_key, inode_value);
+
+    let inode_invalidations = txn.take_inode_cache_invalidations();
+    let directory_invalidations = txn.take_directory_entry_cache_invalidations();
+    let mut batch = WriteBatch::new();
+    txn.apply_to(&mut batch);
+    let stats = ctx
+        .global_stats
+        .stage_delta(ctx.global_stats.shard_of(inode), 0, 1);
+    batch.put_bytes(stats.key.clone(), stats.value.clone());
+
+    #[cfg(any(test, dst))]
+    if ctx
+        .workspace_durable_test_hook
+        .pause_before_apply
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        ctx.workspace_durable_test_hook
+            .entered_before_apply
+            .notify_one();
+        ctx.workspace_durable_test_hook
+            .release_before_apply
+            .notified()
+            .await;
+    }
+    let inode_cache_guard = ctx
+        .inode_store
+        .invalidate_cache(inode_invalidations.iter().copied());
+    let directory_cache_guard = ctx
+        .directory_store
+        .invalidate_cache(directory_invalidations.iter().cloned());
+    let write = permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await;
+    drop(directory_cache_guard);
+    drop(inode_cache_guard);
+    if write.is_err() {
+        ctx.export_binding_index.initialized = false;
+        ctx.inode_store.allocate();
+        return Err(GenesisError::CommitOutcomeUnknown);
+    }
+    ctx.global_stats.publish(&stats);
+    if ctx.export_binding_index.initialized {
+        ctx.export_binding_index.insert(&binding);
+    }
+    #[cfg(any(test, dst))]
+    let fail_flush = ctx
+        .workspace_durable_test_hook
+        .fail_next_flush
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(any(test, dst)))]
+    let fail_flush = false;
+    if fail_flush || ctx.flush_coordinator.flush().await.is_err() {
+        return Err(GenesisError::CommitOutcomeUnknown);
+    }
+    durability_receipt(&ctx.db, record)
+}
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+fn same_genesis_intent(current: &GenesisDomainRecord, requested: &GenesisDomainRecord) -> bool {
+    current.workspace_id == requested.workspace_id
+        && current.actor == requested.actor
+        && current.actor_generation == requested.actor_generation
+        && current.request_digest == requested.request_digest
+        && current.root_digest == requested.root_digest
+        && current.root_object_key == requested.root_object_key
+        && current.export.name == requested.export.name
+        && current.export.advertised_size == requested.export.advertised_size
+}
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+async fn validate_committed_genesis(
+    ctx: &WorkerContext,
+    record: &GenesisDomainRecord,
+) -> Result<(), GenesisError> {
+    validate_physical_export(&ctx.db, &ctx.key_codec, &record.export)
+        .await
+        .map_err(|_| GenesisError::Corrupt)?;
+    let binding = crate::fs::workspace_genesis::reverse_binding(record);
+    let (name_key, inode_key) = reverse_binding_keys(&binding);
+    if read_reverse_binding_current(&ctx.db, &name_key)
+        .await
+        .map_err(|_| GenesisError::Storage)?
+        != Some(binding.clone())
+        || read_reverse_binding_current(&ctx.db, &inode_key)
+            .await
+            .map_err(|_| GenesisError::Storage)?
+            != Some(binding)
+    {
+        return Err(GenesisError::Corrupt);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rhizome-workspace-genesis-core")]
+fn durability_receipt(
+    db: &Db,
+    record: GenesisDomainRecord,
+) -> Result<GenesisDurabilityReceipt, GenesisError> {
+    let (writer_epoch, durable_seq) = db
+        .rhizome_durability_snapshot()
+        .ok_or(GenesisError::Storage)?;
+    if writer_epoch == 0 || durable_seq == 0 {
+        return Err(GenesisError::CommitOutcomeUnknown);
+    }
+    Ok(GenesisDurabilityReceipt {
+        record,
+        writer_epoch,
+        durable_seq,
+    })
+}
+
 #[cfg(feature = "rhizome-export-authority-core")]
 async fn commit_export_authority_transition(
     ctx: &mut WorkerContext,
@@ -1329,6 +1673,28 @@ async fn commit_export_authority_transition(
     }
     let is_activation = matches!(&transition, ExportAuthorityTransition::Activate(_));
     let workspace_id = transition.workspace_id().to_owned();
+    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    if ctx
+        .genesis_gate_enabled
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && let ExportAuthorityTransition::Activate(command) = &transition
+    {
+        let genesis = crate::fs::workspace_genesis::read_record_current(&ctx.db, &workspace_id)
+            .await
+            .map_err(|_| ExportAuthorityError::Corrupt)?
+            .ok_or(ExportAuthorityError::NotFound)?;
+        crate::fs::workspace_genesis::validate_activation_genesis(
+            &genesis,
+            &workspace_id,
+            &command.authority.actor,
+            command.authority.actor_generation,
+            &command.export,
+        )
+        .map_err(|error| match error {
+            GenesisError::Conflict => ExportAuthorityError::Conflict,
+            _ => ExportAuthorityError::Corrupt,
+        })?;
+    }
     let key = ctx.key_codec.export_authority_key(&workspace_id);
     let permit = ctx
         .db
@@ -1393,7 +1759,11 @@ async fn commit_export_authority_transition(
         return Err(ExportAuthorityError::Conflict);
     }
     match (desired.binding_initialized, name_binding, inode_binding) {
-        (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {}
+        (true, Some(by_name), Some(by_inode)) if by_name == binding && by_inode == binding => {
+            if is_activation {
+                validate_physical_export(&ctx.db, &ctx.key_codec, &desired.export).await?;
+            }
+        }
         (true, None, None) if is_activation && !binding_was_initialized => {
             validate_physical_export(&ctx.db, &ctx.key_codec, &desired.export).await?;
             batch.put_bytes(

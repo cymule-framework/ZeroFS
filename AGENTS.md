@@ -150,3 +150,20 @@ attribution intact.
   this repository as part of the authority core.
 - Read `RHIZOME_EXPORT_AUTHORITY.md` before changing the reserved namespace,
   transition model, commit-time fence validation, or feature boundary.
+
+- `fs::workspace_genesis` is the non-default `rhizome-workspace-genesis-core`
+  mechanics candidate. It reuses the sole 0x0A Workspace operation ledger;
+  0x0C stores only the immutable genesis domain record and is not another
+  lifecycle state machine.
+- Genesis root objects are SHA-256 addressed and installed with native
+  conditional Create followed by exact-key byte/digest readback. Never replace
+  this with HEAD-before-PUT, overwrite, retrying an unknown mutation, or Redis
+  authority.
+- The coordinator atomically publishes the sparse `.nbd` file, immutable 0x0C
+  record, and both 0x0B reverse bindings, then flushes and reads writer epoch
+  plus durable sequence from one `DbStatus` snapshot. Activation under this
+  profile requires the exact genesis/export/Actor-generation binding.
+- Keep the production capability-verifier and receipt-signer constructors
+  unreachable until Rhizome's normative CDDL and official fixtures exist.
+  Tests may use only the sealed test constructors. Genesis records use the
+  explicit closed codec; do not serialize them with bincode or protobuf.
