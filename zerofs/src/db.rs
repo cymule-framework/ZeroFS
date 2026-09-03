@@ -14,6 +14,8 @@ use slatedb::{CacheTarget, DbCacheManagerOps, DbReader, WriteBatch};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(all(test, feature = "rhizome-export-authority-core"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_stream::Stream;
 
@@ -415,9 +417,18 @@ pub struct Db {
     /// Rejects cache hits and writers once local close begins.
     closing: AtomicBool,
     #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-    fail_next_scan_setup: AtomicBool,
+    fail_scan_setup_countdown: AtomicU64,
     #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-    fail_next_scan_midstream: AtomicBool,
+    fail_scan_midstream_countdown: AtomicU64,
+}
+
+#[cfg(all(test, feature = "rhizome-export-authority-core"))]
+fn countdown_hits(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            if current > 0 { Some(current - 1) } else { None }
+        })
+        .is_ok_and(|previous| previous == 1)
 }
 
 /// Admission to one database write while holding the flush barrier's read side.
@@ -457,9 +468,9 @@ impl Db {
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
             #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-            fail_next_scan_setup: AtomicBool::new(false),
+            fail_scan_setup_countdown: AtomicU64::new(0),
             #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-            fail_next_scan_midstream: AtomicBool::new(false),
+            fail_scan_midstream_countdown: AtomicU64::new(0),
         }
     }
 
@@ -472,9 +483,9 @@ impl Db {
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
             closing: AtomicBool::new(false),
             #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-            fail_next_scan_setup: AtomicBool::new(false),
+            fail_scan_setup_countdown: AtomicU64::new(0),
             #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-            fail_next_scan_midstream: AtomicBool::new(false),
+            fail_scan_midstream_countdown: AtomicU64::new(0),
         }
     }
 
@@ -704,7 +715,7 @@ impl Db {
         read_ahead_bytes: usize,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send>>> {
         #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-        if self.fail_next_scan_setup.swap(false, Ordering::SeqCst) {
+        if countdown_hits(&self.fail_scan_setup_countdown) {
             return Err(anyhow::anyhow!("injected scan setup failure"));
         }
         self.check_lease()?;
@@ -748,7 +759,7 @@ impl Db {
         };
 
         #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-        if self.fail_next_scan_midstream.swap(false, Ordering::SeqCst) {
+        if countdown_hits(&self.fail_scan_midstream_countdown) {
             return Ok(Box::pin(futures::stream::once(async {
                 Err(anyhow::anyhow!("injected midstream scan failure"))
             })));
@@ -767,13 +778,17 @@ impl Db {
     }
 
     #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-    pub(crate) fn dst_fail_next_scan_setup(&self) {
-        self.fail_next_scan_setup.store(true, Ordering::SeqCst);
+    pub(crate) fn dst_fail_scan_setup_on(&self, ordinal: u64) {
+        assert!(ordinal > 0);
+        self.fail_scan_setup_countdown
+            .store(ordinal, Ordering::SeqCst);
     }
 
     #[cfg(all(test, feature = "rhizome-export-authority-core"))]
-    pub(crate) fn dst_fail_next_scan_midstream(&self) {
-        self.fail_next_scan_midstream.store(true, Ordering::SeqCst);
+    pub(crate) fn dst_fail_scan_midstream_on(&self, ordinal: u64) {
+        assert!(ordinal > 0);
+        self.fail_scan_midstream_countdown
+            .store(ordinal, Ordering::SeqCst);
     }
 
     /// Returns the committed batch's SlateDB seqnum, mapped to `durable_seq` to

@@ -4017,24 +4017,26 @@ mod tests {
 
     #[tokio::test]
     async fn scan_setup_or_stream_error_sticky_poison_the_deny_index() {
-        for midstream in [false, true] {
-            let fs = ZeroFS::new_in_memory().await.unwrap();
-            if midstream {
-                fs.db.dst_fail_next_scan_midstream();
-            } else {
-                fs.db.dst_fail_next_scan_setup();
+        for phase in 1..=4 {
+            for midstream in [false, true] {
+                let fs = ZeroFS::new_in_memory().await.unwrap();
+                if midstream {
+                    fs.db.dst_fail_scan_midstream_on(phase);
+                } else {
+                    fs.db.dst_fail_scan_setup_on(phase);
+                }
+                let key = crate::fs::key_codec::KeyCodec::new().extent_key(999, 0);
+                for value in [b"first".as_slice(), b"second".as_slice()] {
+                    let mut transaction = Transaction::new();
+                    transaction.put_bytes(&key, Bytes::copy_from_slice(value));
+                    assert_eq!(
+                        fs.write_coordinator.commit(transaction).await,
+                        Err(crate::fs::errors::FsError::InvalidData)
+                    );
+                }
+                assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
+                assert!(fs.db.get_bytes(&key).await.unwrap().is_none());
             }
-            let key = crate::fs::key_codec::KeyCodec::new().extent_key(999, 0);
-            for value in [b"first".as_slice(), b"second".as_slice()] {
-                let mut transaction = Transaction::new();
-                transaction.put_bytes(&key, Bytes::copy_from_slice(value));
-                assert_eq!(
-                    fs.write_coordinator.commit(transaction).await,
-                    Err(crate::fs::errors::FsError::InvalidData)
-                );
-            }
-            assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
-            assert!(fs.db.get_bytes(&key).await.unwrap().is_none());
         }
     }
 
