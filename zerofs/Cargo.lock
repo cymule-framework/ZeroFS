@@ -6205,6 +6205,7 @@ dependencies = [
  "region",
  "reqwest",
  "rust-embed",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
