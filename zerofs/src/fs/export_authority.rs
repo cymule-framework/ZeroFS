@@ -6,6 +6,7 @@
 //! [`WriteCoordinator`], which is the only ordering authority.
 
 use crate::db::{Db, Transaction};
+use crate::fs::key_codec::{ExportMutationKey, KeyCodec};
 use crate::fs::lock_manager::KeyedLockGuard;
 use crate::fs::store::extent::TailUpdate;
 use crate::fs::store::{ExtentStore, InodeStore};
@@ -114,7 +115,13 @@ pub(crate) struct FenceMutationConflict {
     pub workspace_id: String,
     pub export: ExportIdentity,
     pub session_id: String,
+    pub server_boot_id: String,
+    pub actor: String,
+    pub actor_generation: u64,
+    pub placement_epoch: u64,
 }
+
+pub(crate) type ExportAdmissionGuard = KeyedLockGuard<String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MutationKind {
@@ -132,8 +139,8 @@ pub(crate) enum MutationKind {
 pub(crate) enum ExportMutationCommand {
     Write { offset: u64, data: Bytes, fua: bool },
     Flush,
-    Trim { offset: u64, length: u64, fua: bool },
-    WriteZeroes { offset: u64, length: u64, fua: bool },
+    Trim { offset: u64, length: u32, fua: bool },
+    WriteZeroes { offset: u64, length: u32, fua: bool },
 }
 
 impl ExportMutationCommand {
@@ -352,7 +359,7 @@ pub(crate) struct ExportMutationContext {
     pub(crate) token: MutationFenceToken,
     pub(crate) export: ExportIdentity,
     pub(crate) identity: MutationRequestIdentity,
-    pub(crate) _guard: tokio::sync::OwnedMutexGuard<()>,
+    pub(crate) _guard: ExportAdmissionGuard,
     pub(crate) tail_update: Option<TailUpdate>,
     pub(crate) _inode_guard: Option<KeyedLockGuard<u64>>,
 }
@@ -404,8 +411,14 @@ pub(crate) struct ExportAuthorityStore {
     extent_store: ExtentStore,
     lock_manager: Arc<crate::fs::lock_manager::KeyedLockManager<u64>>,
     server_boot_id: String,
-    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    admission_locks: Arc<crate::fs::lock_manager::KeyedLockManager<String>>,
     profile_enabled: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pause_after_admission: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    entered_after_admission: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    release_after_admission: Arc<tokio::sync::Notify>,
 }
 
 impl ExportAuthorityStore {
@@ -424,8 +437,14 @@ impl ExportAuthorityStore {
             extent_store,
             lock_manager,
             server_boot_id,
-            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            admission_locks: Arc::new(crate::fs::lock_manager::KeyedLockManager::new()),
             profile_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            pause_after_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            entered_after_admission: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            release_after_admission: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -438,8 +457,12 @@ impl ExportAuthorityStore {
         command: ActivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        let guard = self
+            .admission_locks
+            .acquire(command.workspace_id.clone())
+            .await;
         self.coordinator
-            .transition_export_authority(ExportAuthorityTransition::Activate(command))
+            .transition_export_authority(ExportAuthorityTransition::Activate(command), guard)
             .await
     }
 
@@ -452,8 +475,12 @@ impl ExportAuthorityStore {
         command: RefreshExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        let guard = self
+            .admission_locks
+            .acquire(command.workspace_id.clone())
+            .await;
         self.coordinator
-            .transition_export_authority(ExportAuthorityTransition::Refresh(command))
+            .transition_export_authority(ExportAuthorityTransition::Refresh(command), guard)
             .await
     }
 
@@ -466,8 +493,12 @@ impl ExportAuthorityStore {
         command: DeactivateExport,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        let guard = self
+            .admission_locks
+            .acquire(command.workspace_id.clone())
+            .await;
         self.coordinator
-            .transition_export_authority(ExportAuthorityTransition::Deactivate(command))
+            .transition_export_authority(ExportAuthorityTransition::Deactivate(command), guard)
             .await
     }
 
@@ -480,8 +511,12 @@ impl ExportAuthorityStore {
         command: AdvanceFence,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         self.require_enabled()?;
+        let guard = self
+            .admission_locks
+            .acquire(command.workspace_id.clone())
+            .await;
         self.coordinator
-            .transition_export_authority(ExportAuthorityTransition::AdvanceFence(command))
+            .transition_export_authority(ExportAuthorityTransition::AdvanceFence(command), guard)
             .await
     }
 
@@ -494,16 +529,15 @@ impl ExportAuthorityStore {
         mut mutation: ExportMutation,
     ) -> Result<ExportMutationOutcome, ExportAuthorityError> {
         self.require_enabled()?;
-        let guard = self.mutation_lock.clone().lock_owned().await;
+        let guard = self
+            .admission_locks
+            .acquire(mutation.token.workspace_id.clone())
+            .await;
         let expected = mutation.expectation();
-        let key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-            &expected.workspace_id,
-            &expected.session_id,
-            expected.mutation.operation_id.0,
-        );
+        let key = mutation_outcome_key(&expected);
         if let Some(current) = read_outcome_current(&self.db, &key, &expected).await? {
             if ensure_outcome(&current, &expected).is_err() {
-                self.fence_mutation_conflict(&mutation.token).await?;
+                self.fence_mutation_conflict(&mutation.token, guard).await?;
                 return Err(ExportAuthorityError::Conflict);
             }
             if !expected.kind.requires_durability() {
@@ -512,6 +546,15 @@ impl ExportAuthorityStore {
             return self
                 .make_outcome_durable(guard, &key, &expected, current)
                 .await;
+        }
+        self.validate_admission(&mutation.token).await?;
+        #[cfg(test)]
+        if self
+            .pause_after_admission
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered_after_admission.notify_one();
+            self.release_after_admission.notified().await;
         }
         let prepared = self.prepare_mutation(&mut mutation).await?;
         self.coordinator
@@ -574,9 +617,9 @@ impl ExportAuthorityStore {
             .map_err(|_| ExportAuthorityError::Storage)?;
         let tail_update = match &mutation.command {
             ExportMutationCommand::Write { offset, data, .. } => {
-                let end = offset
-                    .checked_add(data.len() as u64)
-                    .ok_or(ExportAuthorityError::Invalid)?;
+                let length =
+                    u32::try_from(data.len()).map_err(|_| ExportAuthorityError::Invalid)?;
+                let end = validate_extent_span(*offset, length)?;
                 if end > file.size {
                     return Err(ExportAuthorityError::Invalid);
                 }
@@ -595,9 +638,7 @@ impl ExportAuthorityStore {
             }
             ExportMutationCommand::Trim { offset, length, .. }
             | ExportMutationCommand::WriteZeroes { offset, length, .. } => {
-                let end = offset
-                    .checked_add(*length)
-                    .ok_or(ExportAuthorityError::Invalid)?;
+                let end = validate_extent_span(*offset, *length)?;
                 if end > file.size {
                     return Err(ExportAuthorityError::Invalid);
                 }
@@ -606,7 +647,7 @@ impl ExportAuthorityStore {
                         &mut transaction,
                         mutation.token.export.inode,
                         *offset,
-                        *length,
+                        u64::from(*length),
                         file.size,
                     )
                     .await
@@ -623,22 +664,69 @@ impl ExportAuthorityStore {
         })
     }
 
-    async fn fence_mutation_conflict(
+    async fn validate_admission(
         &self,
         token: &MutationFenceToken,
     ) -> Result<(), ExportAuthorityError> {
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let boot = self
+            .db
+            .get_bytes(&codec.export_boot_key())
+            .await
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        if boot.as_deref() != Some(self.server_boot_id.as_bytes()) {
+            return Err(ExportAuthorityError::StaleMutation);
+        }
+        let key = codec.export_authority_key(&token.workspace_id);
+        let current = read_record_current(&self.db, &key, &token.workspace_id).await?;
+        validate_mutation(
+            current.as_ref(),
+            token,
+            self.coordinator.export_authority_now(),
+            &self.server_boot_id,
+        )
+    }
+
+    #[cfg(test)]
+    fn dst_pause_next_after_admission(&self) {
+        self.pause_after_admission
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    async fn dst_wait_after_admission(&self) {
+        self.entered_after_admission.notified().await;
+    }
+
+    #[cfg(test)]
+    fn dst_release_after_admission(&self) {
+        self.release_after_admission.notify_one();
+    }
+
+    async fn fence_mutation_conflict(
+        &self,
+        token: &MutationFenceToken,
+        guard: ExportAdmissionGuard,
+    ) -> Result<(), ExportAuthorityError> {
         self.coordinator
-            .fence_mutation_conflict(FenceMutationConflict {
-                workspace_id: token.workspace_id.clone(),
-                export: token.export.clone(),
-                session_id: token.session_id.clone(),
-            })
+            .fence_mutation_conflict(
+                FenceMutationConflict {
+                    workspace_id: token.workspace_id.clone(),
+                    export: token.export.clone(),
+                    session_id: token.session_id.clone(),
+                    server_boot_id: token.server_boot_id.clone(),
+                    actor: token.authority.actor.clone(),
+                    actor_generation: token.authority.actor_generation,
+                    placement_epoch: token.authority.placement_epoch,
+                },
+                guard,
+            )
             .await
     }
 
     async fn make_outcome_durable(
         &self,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: ExportAdmissionGuard,
         key: &Bytes,
         expected: &ExportMutationExpectation,
         current: ExportMutationOutcome,
@@ -669,11 +757,7 @@ impl ExportAuthorityStore {
         expected: &ExportMutationExpectation,
     ) -> Result<ExportMutationLookup, ExportAuthorityError> {
         validate_expectation(expected)?;
-        let key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-            &expected.workspace_id,
-            &expected.session_id,
-            expected.mutation.operation_id.0,
-        );
+        let key = mutation_outcome_key(expected);
         match read_outcome_current(&self.db, &key, expected).await? {
             Some(outcome) => {
                 ensure_outcome(&outcome, expected)?;
@@ -692,11 +776,7 @@ impl ExportAuthorityStore {
         expected: &ExportMutationExpectation,
     ) -> Result<ExportMutationLookup, ExportAuthorityError> {
         validate_expectation(expected)?;
-        let key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-            &expected.workspace_id,
-            &expected.session_id,
-            expected.mutation.operation_id.0,
-        );
+        let key = mutation_outcome_key(expected);
         match read_outcome_durable(&self.db, &key, expected).await? {
             Some(outcome) => {
                 ensure_outcome(&outcome, expected)?;
@@ -761,6 +841,22 @@ impl ExportAuthorityStore {
             Err(ExportAuthorityError::ProfileDisabled)
         }
     }
+}
+
+fn validate_extent_span(offset: u64, length: u32) -> Result<u64, ExportAuthorityError> {
+    let end = offset
+        .checked_add(u64::from(length))
+        .ok_or(ExportAuthorityError::Invalid)?;
+    if length == 0 {
+        return Ok(end);
+    }
+    let extent_size = crate::fs::EXTENT_SIZE as u64;
+    let last = end - 1;
+    let extent_start = (last / extent_size) * extent_size;
+    extent_start
+        .checked_add(extent_size)
+        .ok_or(ExportAuthorityError::Invalid)?;
+    Ok(end)
 }
 
 #[cfg_attr(
@@ -901,6 +997,18 @@ pub(crate) async fn read_outcome_current(
         return Ok(None);
     };
     decode_outcome(&bytes, expected).map(Some)
+}
+
+pub(crate) fn mutation_outcome_key(expected: &ExportMutationExpectation) -> Bytes {
+    KeyCodec::new().export_mutation_outcome_key(&ExportMutationKey {
+        workspace_id: &expected.workspace_id,
+        actor: &expected.authority.actor,
+        actor_generation: expected.authority.actor_generation,
+        placement_epoch: expected.authority.placement_epoch,
+        session_id: &expected.session_id,
+        server_boot_id: &expected.server_boot_id,
+        operation_id: expected.mutation.operation_id.0,
+    })
 }
 
 async fn read_outcome_durable(
@@ -1114,11 +1222,15 @@ pub(crate) fn encode_outcome(
     let payload = codec()
         .serialize(outcome)
         .map_err(|_| ExportAuthorityError::Corrupt)?;
-    let key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-        &outcome.workspace_id,
-        &outcome.session_id,
-        outcome.mutation.operation_id.0,
-    );
+    let key = KeyCodec::new().export_mutation_outcome_key(&ExportMutationKey {
+        workspace_id: &outcome.workspace_id,
+        actor: &outcome.authority.actor,
+        actor_generation: outcome.authority.actor_generation,
+        placement_epoch: outcome.authority.placement_epoch,
+        session_id: &outcome.session_id,
+        server_boot_id: &outcome.server_boot_id,
+        operation_id: outcome.mutation.operation_id.0,
+    });
     encode_bound_record(MUTATION_OUTCOME_MAGIC, &key, &payload)
 }
 
@@ -1142,11 +1254,7 @@ fn decode_outcome(
     bytes: &[u8],
     expected: &ExportMutationExpectation,
 ) -> Result<ExportMutationOutcome, ExportAuthorityError> {
-    let key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-        &expected.workspace_id,
-        &expected.session_id,
-        expected.mutation.operation_id.0,
-    );
+    let key = mutation_outcome_key(expected);
     let payload = decode_bound_record(MUTATION_OUTCOME_MAGIC, &key, bytes)?;
     let outcome: ExportMutationOutcome = codec()
         .deserialize(payload)
@@ -3082,11 +3190,7 @@ mod tests {
             57,
         );
         let expected = other_mutation.expectation();
-        let copied_key = crate::fs::key_codec::KeyCodec::new().export_mutation_outcome_key(
-            &expected.workspace_id,
-            &expected.session_id,
-            expected.mutation.operation_id.0,
-        );
+        let copied_key = mutation_outcome_key(&expected);
         fs.db
             .inject_reserved_authority_value_for_test(
                 copied_key,
@@ -3126,6 +3230,44 @@ mod tests {
             .await
             .unwrap();
         (fs, active)
+    }
+
+    async fn sparse_real_export_fs(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        size: u64,
+    ) -> (ZeroFS, ExportAuthorityRecord) {
+        let fs = open_fs(object_store).await.unwrap();
+        let (inode_id, _) = fs
+            .create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"disk-a",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let mut inode = fs.inode_store.get(inode_id).await.unwrap();
+        let crate::fs::inode::Inode::File(file) = &mut inode else {
+            panic!("created export must be a file");
+        };
+        file.size = size;
+        let mut transaction = fs.db.new_transaction().unwrap();
+        fs.inode_store
+            .save(&mut transaction, inode_id, &inode)
+            .unwrap();
+        fs.write_coordinator.commit(transaction).await.unwrap();
+        let active = fs
+            .export_authority
+            .activate(activate_command_for(authority(3, 5), export(inode_id)))
+            .await
+            .unwrap();
+        (fs, active)
+    }
+
+    async fn object_inventory(store: &Arc<dyn slatedb::object_store::ObjectStore>) -> (usize, u64) {
+        let objects = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+        let bytes = objects.iter().map(|object| object.size).sum();
+        (objects.len(), bytes)
     }
 
     #[tokio::test]
@@ -3400,5 +3542,248 @@ mod tests {
             .unwrap();
         assert!(durable.active_session.is_none());
         assert_eq!(durable.rejected_through_placement_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn durable_fence_rejects_repeated_large_writes_before_any_object_store_cost() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let size = crate::fs::store::extent::SEAL_THRESHOLD as u64 + crate::fs::EXTENT_SIZE as u64;
+        let (fs, active) = sparse_real_export_fs(object_store.clone(), size).await;
+        fs.export_authority
+            .advance_fence(AdvanceFence {
+                workspace_id: active.workspace_id.clone(),
+                export: active.export.clone(),
+                expected_authority: Some(active.authority.clone()),
+                new_non_writable_authority: active.authority.clone(),
+                reject_through_placement_epoch: active.authority.placement_epoch,
+            })
+            .await
+            .unwrap();
+        let before = object_inventory(&object_store).await;
+        let data = Bytes::from(vec![0x5a; crate::fs::store::extent::SEAL_THRESHOLD + 1]);
+        for ordinal in [0x71, 0x72, 0x73] {
+            let mutation = ExportMutationBuilder::build(
+                token(&active),
+                [ordinal; SHA256_SIZE],
+                ExportMutationCommand::Write {
+                    offset: 0,
+                    data: data.clone(),
+                    fua: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fs.export_authority.commit_mutation(mutation).await,
+                Err(ExportAuthorityError::StaleMutation)
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(object_inventory(&object_store).await, before);
+    }
+
+    #[tokio::test]
+    async fn fence_waits_for_admitted_prepare_and_then_orders_after_the_mutation() {
+        let (fs, active) = real_export_fs().await;
+        let fs = Arc::new(fs);
+        fs.export_authority.dst_pause_next_after_admission();
+        let mutation = ExportMutationBuilder::build(
+            token(&active),
+            [0x74; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"admitted"),
+                fua: false,
+            },
+        )
+        .unwrap();
+        let mutation_task = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.export_authority.commit_mutation(mutation).await }
+        });
+        fs.export_authority.dst_wait_after_admission().await;
+        let fence_task = tokio::spawn({
+            let fs = fs.clone();
+            let active = active.clone();
+            async move {
+                fs.export_authority
+                    .advance_fence(AdvanceFence {
+                        workspace_id: active.workspace_id.clone(),
+                        export: active.export.clone(),
+                        expected_authority: Some(active.authority.clone()),
+                        new_non_writable_authority: active.authority.clone(),
+                        reject_through_placement_epoch: active.authority.placement_epoch,
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !fence_task.is_finished(),
+            "the fence must wait for the admitted prepare reservation"
+        );
+        fs.export_authority.dst_release_after_admission();
+        let outcome = mutation_task.await.unwrap().unwrap();
+        assert_eq!(outcome.mutation.sequence, 1);
+        fence_task.await.unwrap().unwrap();
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                0,
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"admitted");
+        let fenced = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fenced.active_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn block_commands_reject_unrepresentable_final_extent_without_panicking() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (fs, active) = sparse_real_export_fs(object_store, u64::MAX).await;
+        let invalid_offset = u64::MAX - 1;
+        for (ordinal, command) in [
+            (
+                0x75,
+                ExportMutationCommand::Write {
+                    offset: invalid_offset,
+                    data: Bytes::from_static(b"x"),
+                    fua: false,
+                },
+            ),
+            (
+                0x76,
+                ExportMutationCommand::Trim {
+                    offset: invalid_offset,
+                    length: 1,
+                    fua: false,
+                },
+            ),
+            (
+                0x77,
+                ExportMutationCommand::WriteZeroes {
+                    offset: invalid_offset,
+                    length: 1,
+                    fua: false,
+                },
+            ),
+        ] {
+            let mutation =
+                ExportMutationBuilder::build(token(&active), [ordinal; 32], command).unwrap();
+            assert_eq!(
+                fs.export_authority.commit_mutation(mutation).await,
+                Err(ExportAuthorityError::Invalid)
+            );
+        }
+        for (ordinal, command) in [
+            (
+                0x78,
+                ExportMutationCommand::Write {
+                    offset: u64::MAX,
+                    data: Bytes::from_static(b"x"),
+                    fua: false,
+                },
+            ),
+            (
+                0x79,
+                ExportMutationCommand::Trim {
+                    offset: u64::MAX,
+                    length: 1,
+                    fua: false,
+                },
+            ),
+            (
+                0x7a,
+                ExportMutationCommand::WriteZeroes {
+                    offset: u64::MAX,
+                    length: 1,
+                    fua: false,
+                },
+            ),
+        ] {
+            let mutation =
+                ExportMutationBuilder::build(token(&active), [ordinal; 32], command).unwrap();
+            assert_eq!(
+                fs.export_authority.commit_mutation(mutation).await,
+                Err(ExportAuthorityError::Invalid)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn old_boot_outcome_cannot_fence_a_reused_session_and_operation_id() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_fs(object_store.clone()).await.unwrap();
+        let active = first
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let old = ExportMutationBuilder::from_transaction_for_test(
+            token(&active),
+            [0x7b; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"old-boot"),
+                fua: false,
+            },
+            Transaction::new(),
+        )
+        .unwrap();
+        let old_outcome = first.export_authority.commit_mutation(old).await.unwrap();
+        first.db.close().await.unwrap();
+        drop(first);
+
+        let reopened = open_fs(object_store).await.unwrap();
+        let replacement = reopened
+            .export_authority
+            .activate(ActivateExport {
+                workspace_id: active.workspace_id.clone(),
+                export: active.export.clone(),
+                authority: authority(4, 7),
+                session: session("session-a", "capability-new-boot", u64::MAX),
+            })
+            .await
+            .unwrap();
+        let new = ExportMutationBuilder::from_transaction_for_test(
+            token(&replacement),
+            [0x7b; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"new-boot"),
+                fua: false,
+            },
+            Transaction::new(),
+        )
+        .unwrap();
+        let new_outcome = reopened
+            .export_authority
+            .commit_mutation(new)
+            .await
+            .unwrap();
+        assert_eq!(new_outcome.mutation.sequence, 1);
+        assert_ne!(new_outcome.server_boot_id, old_outcome.server_boot_id);
+        assert_ne!(
+            new_outcome.authority.placement_epoch,
+            old_outcome.authority.placement_epoch
+        );
+        let current = reopened
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.active_session.is_some());
+        assert_eq!(current.authority, replacement.authority);
     }
 }

@@ -50,6 +50,17 @@ attribution intact.
 - Production mutation construction accepts only typed block commands. Durable
   replay is checked before ExtentStore transaction preparation; never add a
   caller-supplied Transaction, command byte string, or parallel checksum.
+- Authority transitions and mutation preparation share one per-Workspace
+  admission reservation. Validate the current boot, full token, and monotonic
+  expiry before ExtentStore staging, carry the reservation through the queued
+  commit, and still revalidate at the final write permit. A stale session must
+  not append frames, trigger sealing, or upload objects.
+- Mutation outcome identity includes Actor, generation, placement epoch,
+  session, and server boot as well as Workspace and operation ID. A conflict
+  fence must match the current boot session plus Actor generation and placement;
+  an old-boot outcome can never fence a replacement session.
+- Typed block commands use `u32` lengths and reject a range whose final complete
+  extent would overflow `u64` before calling ExtentStore.
 - On writer restart, normalize the old boot session only inside the queued
   authority transition and allow only a strictly higher placement epoch. Do not
   add a startup export scan. Activation resets sequence to zero; sequence is
@@ -82,6 +93,9 @@ attribution intact.
 - This slice is not wired to the public NBD server. Do not claim NBD fencing
   conformance until negotiation installs verified session state and every real
   WRITE/FUA/FLUSH/TRIM/WRITE_ZEROES handler uses the token-bearing commit path.
+- The first Rhizome NBD profile is one host-local root-owned Unix socket per
+  export. Do not expose TCP, unauthenticated LIST, or `CAN_MULTI_CONN`; reuse the
+  upstream NBD and nbd-proto mechanics behind the verified session adapter.
 - Keep this branch protocol-neutral. Do not add protobuf descriptors, generated
   bindings, copied protobuf field numbers, or a Rhizome transport workflow to
   this repository as part of the authority core.

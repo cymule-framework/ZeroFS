@@ -8,10 +8,11 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 #[cfg(feature = "rhizome-export-authority-core")]
 use crate::fs::export_authority::{
-    ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition, ExportMutationContext,
-    ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict, MutationIdentity,
-    apply_transition, encode_outcome, encode_record, ensure_outcome, read_outcome_current,
-    read_record_current, trusted_now_unix_millis, validate_mutation,
+    ExportAdmissionGuard, ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition,
+    ExportMutationContext, ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict,
+    MutationIdentity, apply_transition, encode_outcome, encode_record, ensure_outcome,
+    mutation_outcome_key, read_outcome_current, read_record_current, trusted_now_unix_millis,
+    validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
@@ -36,6 +37,14 @@ const PARALLEL_SEGCOUNT_READS: usize = 16;
 type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
+
+enum SequencingGuard {
+    Workspace {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
+    #[cfg(feature = "rhizome-export-authority-core")]
+    Export { _guard: ExportAdmissionGuard },
+}
 
 #[cfg(feature = "rhizome-export-authority-core")]
 type StagedExportMutation = Option<ExportMutationContext>;
@@ -66,11 +75,13 @@ enum Request {
     )]
     ExportAuthority(
         ExportAuthorityTransition,
+        ExportAdmissionGuard,
         oneshot::Sender<Result<ExportAuthorityRecord, ExportAuthorityError>>,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
     FenceMutationConflict(
         FenceMutationConflict,
+        ExportAdmissionGuard,
         oneshot::Sender<Result<(), ExportAuthorityError>>,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -82,7 +93,7 @@ enum Request {
     #[cfg(feature = "rhizome-export-authority-core")]
     ExportMutation(Transaction, ExportMutationContext, Reply),
     #[cfg(feature = "rhizome-export-authority-core")]
-    ExportDurabilityBarrier(Reply, tokio::sync::OwnedMutexGuard<()>),
+    ExportDurabilityBarrier(Reply, ExportAdmissionGuard),
     #[cfg(any(test, dst))]
     Barrier(Reply),
 }
@@ -245,10 +256,11 @@ impl WriteCoordinator {
     pub(crate) async fn transition_export_authority(
         &self,
         transition: ExportAuthorityTransition,
+        guard: ExportAdmissionGuard,
     ) -> Result<ExportAuthorityRecord, ExportAuthorityError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::ExportAuthority(transition, reply_tx))
+            .send(Request::ExportAuthority(transition, guard, reply_tx))
             .map_err(|_| ExportAuthorityError::Storage)?;
         reply_rx
             .await
@@ -259,10 +271,11 @@ impl WriteCoordinator {
     pub(crate) async fn fence_mutation_conflict(
         &self,
         conflict: FenceMutationConflict,
+        guard: ExportAdmissionGuard,
     ) -> Result<(), ExportAuthorityError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::FenceMutationConflict(conflict, reply_tx))
+            .send(Request::FenceMutationConflict(conflict, guard, reply_tx))
             .map_err(|_| ExportAuthorityError::Storage)?;
         reply_rx
             .await
@@ -272,6 +285,11 @@ impl WriteCoordinator {
     #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) fn export_server_boot_id(&self) -> &str {
         &self.export_server_boot_id
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) fn export_authority_now(&self) -> u64 {
+        authority_now(&self.authority_time_floor)
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
@@ -372,7 +390,7 @@ impl WriteCoordinator {
     #[cfg(feature = "rhizome-export-authority-core")]
     pub(crate) async fn flush_export_mutation_barrier(
         &self,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: ExportAdmissionGuard,
     ) -> Result<(), ExportAuthorityError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -574,7 +592,7 @@ async fn worker_loop(
             }
         };
         #[cfg(feature = "rhizome-export-authority-core")]
-        if let Request::ExportAuthority(transition, reply) = first {
+        if let Request::ExportAuthority(transition, _guard, reply) = first {
             let result = commit_export_authority_transition(&mut ctx, transition).await;
             #[cfg(any(test, dst))]
             let drop_reply = ctx
@@ -589,7 +607,7 @@ async fn worker_loop(
             continue;
         }
         #[cfg(feature = "rhizome-export-authority-core")]
-        if let Request::FenceMutationConflict(conflict, reply) = first {
+        if let Request::FenceMutationConflict(conflict, _guard, reply) = first {
             let result = commit_mutation_conflict_fence(&mut ctx, conflict).await;
             #[cfg(any(test, dst))]
             let drop_reply = ctx
@@ -615,7 +633,7 @@ async fn worker_loop(
                 request.into_transaction(),
                 reply,
                 true,
-                Some(guard),
+                Some(SequencingGuard::Workspace { _guard: guard }),
                 no_export_mutation(),
             ),
             #[cfg(feature = "rhizome-export-authority-core")]
@@ -628,7 +646,7 @@ async fn worker_loop(
                 Transaction::new(),
                 reply,
                 true,
-                Some(guard),
+                Some(SequencingGuard::Export { _guard: guard }),
                 no_export_mutation(),
             ),
             #[cfg(feature = "rhizome-export-authority-core")]
@@ -665,7 +683,7 @@ async fn worker_loop(
                     batch.push((
                         request.into_transaction(),
                         reply,
-                        Some(guard),
+                        Some(SequencingGuard::Workspace { _guard: guard }),
                         no_export_mutation(),
                     ));
                 }
@@ -677,16 +695,21 @@ async fn worker_loop(
                 #[cfg(feature = "rhizome-export-authority-core")]
                 Request::ExportDurabilityBarrier(reply, guard) => {
                     require_durable = true;
-                    batch.push((Transaction::new(), reply, Some(guard), no_export_mutation()));
+                    batch.push((
+                        Transaction::new(),
+                        reply,
+                        Some(SequencingGuard::Export { _guard: guard }),
+                        no_export_mutation(),
+                    ));
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
-                Request::ExportAuthority(transition, reply) => {
-                    pending = Some(Request::ExportAuthority(transition, reply));
+                Request::ExportAuthority(transition, guard, reply) => {
+                    pending = Some(Request::ExportAuthority(transition, guard, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
-                Request::FenceMutationConflict(conflict, reply) => {
-                    pending = Some(Request::FenceMutationConflict(conflict, reply));
+                Request::FenceMutationConflict(conflict, guard, reply) => {
+                    pending = Some(Request::FenceMutationConflict(conflict, guard, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1269,7 +1292,13 @@ async fn commit_mutation_conflict_fence(
         return Err(ExportAuthorityError::Conflict);
     }
     match record.active_session.as_ref() {
-        Some(session) if session.session_id == conflict.session_id => {
+        Some(session)
+            if session.session_id == conflict.session_id
+                && session.server_boot_id == conflict.server_boot_id
+                && record.authority.actor == conflict.actor
+                && record.authority.actor_generation == conflict.actor_generation
+                && record.authority.placement_epoch == conflict.placement_epoch =>
+        {
             record.rejected_through_placement_epoch = record
                 .rejected_through_placement_epoch
                 .max(record.authority.placement_epoch);
@@ -1357,11 +1386,7 @@ async fn validate_export_mutation_context(
         mutation: context.identity.clone(),
         kind: context.kind,
     };
-    let outcome_key = key_codec.export_mutation_outcome_key(
-        &expected.workspace_id,
-        &expected.session_id,
-        expected.mutation.operation_id.0,
-    );
+    let outcome_key = mutation_outcome_key(&expected);
     if let Some(existing) = read_outcome_current(db, &outcome_key, &expected)
         .await
         .map_err(|_| FsError::IoError)?
