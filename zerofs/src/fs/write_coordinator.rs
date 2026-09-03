@@ -80,6 +80,13 @@ enum Request {
         tokio::sync::OwnedMutexGuard<()>,
     ),
     #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "feature-staged until verified control-plane wiring"
+        )
+    )]
     WorkspaceGenesis(
         WorkspaceGenesisRequest,
         oneshot::Sender<Result<GenesisDurabilityReceipt, GenesisError>>,
@@ -121,7 +128,7 @@ pub struct WriteCoordinator {
     /// mutation still flows through `sender`; this lock is not a second commit
     /// authority or worker.
     workspace_ledger_lock: Arc<tokio::sync::Mutex<()>>,
-    #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
     genesis_gate_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "rhizome-export-authority-core")]
     export_server_boot_id: Arc<str>,
@@ -290,7 +297,7 @@ impl WriteCoordinator {
         Self {
             sender,
             workspace_ledger_lock: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(feature = "rhizome-workspace-genesis-core")]
+            #[cfg(all(feature = "rhizome-workspace-genesis-core", test))]
             genesis_gate_enabled,
             #[cfg(feature = "rhizome-export-authority-core")]
             export_server_boot_id,
@@ -331,6 +338,13 @@ impl WriteCoordinator {
     }
 
     #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "feature-staged until verified control-plane wiring"
+        )
+    )]
     pub(crate) async fn materialize_workspace_genesis(
         &self,
         record: GenesisDomainRecord,
@@ -1604,6 +1618,11 @@ async fn commit_workspace_genesis(
     if fail_flush || ctx.flush_coordinator.flush().await.is_err() {
         return Err(GenesisError::CommitOutcomeUnknown);
     }
+    #[cfg(feature = "failpoints")]
+    crate::failpoints::fail_point!(
+        crate::failpoints::WORKSPACE_GENESIS_AFTER_COMMIT_BEFORE_REPLY,
+        |_| Err(GenesisError::CommitOutcomeUnknown)
+    );
     durability_receipt(&ctx.db, record)
 }
 

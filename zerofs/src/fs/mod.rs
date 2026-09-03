@@ -16,8 +16,11 @@ pub mod stats;
 pub mod store;
 pub mod tracing;
 pub mod types;
-#[cfg(feature = "rhizome-workspace-genesis-core")]
+#[cfg(all(feature = "rhizome-workspace-genesis-core", not(dst)))]
 pub(crate) mod workspace_genesis;
+#[cfg(all(feature = "rhizome-workspace-genesis-core", dst))]
+#[doc(hidden)]
+pub mod workspace_genesis;
 pub mod workspace_operation;
 pub mod write_coordinator;
 
@@ -138,6 +141,13 @@ pub struct ZeroFS {
     /// Non-default immutable Workspace genesis mechanics. Inputs are accepted
     /// only through the sealed verifier boundary in `workspace_genesis`.
     #[cfg(feature = "rhizome-workspace-genesis-core")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "feature-staged until verified control-plane wiring"
+        )
+    )]
     pub(crate) workspace_genesis: WorkspaceGenesisStore,
     /// Durable per-export Rhizome authority and session state. Transitions and
     /// fenced mutations are serialized by the single WriteCoordinator.

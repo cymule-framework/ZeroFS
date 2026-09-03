@@ -6,23 +6,33 @@
 //! The durable operation lifecycle remains the existing 0x0A ledger; 0x0C is
 //! only the immutable domain result of the genesis effect.
 
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "feature-staged until the normative verifier and signer are wired"
+    )
+)]
+
 use crate::db::Db;
 use crate::fs::export_authority::{
     ExportIdentity, ExportReverseBinding, encode_reverse_binding, reverse_binding_keys,
 };
 use crate::fs::key_codec::KeyCodec;
+#[cfg(test)]
+use crate::fs::workspace_operation::WorkspaceOperationState;
 use crate::fs::workspace_operation::{
     CanonicalRequestDigest, WorkspaceOperationError, WorkspaceOperationKey,
-    WorkspaceOperationLookup, WorkspaceOperationRecord, WorkspaceOperationState,
-    WorkspaceTerminalOutcome,
+    WorkspaceOperationLookup, WorkspaceOperationRecord, WorkspaceTerminalOutcome,
 };
 use crate::fs::write_coordinator::WriteCoordinator;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use slatedb::object_store::{ObjectStore, PutMode, PutOptions, PutPayload, path::Path};
+use slatedb::object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path,
+};
 use std::sync::Arc;
 
-const KEY_VERSION: u8 = 1;
 const RECORD_MAGIC: &[u8; 4] = b"RWGN";
 const RECORD_VERSION: u8 = 1;
 const SHA256_SIZE: usize = 32;
@@ -390,7 +400,7 @@ fn validate_command(command: &GenesisCommand) -> Result<(), GenesisError> {
         || command.export_name == b"."
         || command.export_name == b".."
         || command.advertised_size == 0
-        || command.advertised_size % 512 != 0
+        || !command.advertised_size.is_multiple_of(512)
         || command.root_bytes.is_empty()
         || Sha256::digest(&command.root_bytes).as_slice() != command.root_digest.as_bytes()
     {
@@ -408,7 +418,7 @@ fn validate_record(record: &GenesisDomainRecord) -> Result<(), GenesisError> {
         || record.export.name.is_empty()
         || record.export.name.len() > crate::fs::NAME_MAX
         || record.export.advertised_size == 0
-        || record.export.advertised_size % 512 != 0
+        || !record.export.advertised_size.is_multiple_of(512)
         || record.root_object_key != content_object_key(record.root_digest)
     {
         return Err(GenesisError::Invalid);
@@ -533,9 +543,11 @@ pub(super) fn reverse_binding(record: &GenesisDomainRecord) -> ExportReverseBind
     }
 }
 
+pub(super) type EncodedReverseBindings = ((Bytes, Bytes), (Bytes, Bytes));
+
 pub(super) fn encoded_reverse_bindings(
     record: &GenesisDomainRecord,
-) -> Result<((Bytes, Bytes), (Bytes, Bytes)), GenesisError> {
+) -> Result<EncodedReverseBindings, GenesisError> {
     let binding = reverse_binding(record);
     let (name_key, inode_key) = reverse_binding_keys(&binding);
     let name_value =
@@ -545,13 +557,53 @@ pub(super) fn encoded_reverse_bindings(
     Ok(((name_key, name_value), (inode_key, inode_value)))
 }
 
+/// Deterministic explicit-codec/cross-key model used by the repository DST
+/// binary. This does not construct a verified production command.
+#[cfg(dst)]
+#[doc(hidden)]
+pub fn dst_workspace_genesis_codec_model(seed: u64) {
+    let workspace_id = format!("workspace-{seed}");
+    let digest: [u8; 32] = Sha256::digest(seed.to_be_bytes()).into();
+    let record = GenesisDomainRecord {
+        workspace_id: workspace_id.clone(),
+        actor: format!("actor-{seed}"),
+        actor_generation: seed.saturating_add(1),
+        request_digest: CanonicalRequestDigest::new(digest),
+        root_digest: ContentDigest::new(digest),
+        root_object_key: content_object_key(ContentDigest::new(digest)),
+        export: ExportIdentity {
+            nbd_directory_inode: seed.saturating_add(2),
+            name: format!("disk-{seed}").into_bytes(),
+            inode: seed.saturating_add(3),
+            advertised_size: 4096,
+        },
+    };
+    let key = KeyCodec::new().workspace_genesis_key(&workspace_id);
+    let encoded = encode_record(&key, &record).expect("DST valid genesis record");
+    assert_eq!(
+        decode_record(&key, &encoded).expect("DST genesis round trip"),
+        record
+    );
+    let wrong_key = KeyCodec::new().workspace_genesis_key(&format!("other-{seed}"));
+    assert_eq!(
+        decode_record(&wrong_key, &encoded),
+        Err(GenesisError::Corrupt)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_transformer::ZeroFsBlockTransformer;
+    use crate::config::CompressionConfig;
+    use crate::db::SlateDbHandle;
+    use crate::frame_codec::FrameCodec;
     use crate::fs::ZeroFS;
     use crate::fs::export_authority::{
         ActivateExport, AuthorityVersion, ExportSessionState, ShardProcessGuard,
     };
+    use slatedb::object_store::path::Path;
+    use slatedb::{BlockTransformer, DbBuilder};
 
     async fn new_fs() -> ZeroFS {
         let fs = ZeroFS::new_in_memory().await.unwrap();
@@ -563,6 +615,52 @@ mod tests {
         )
         .await
         .unwrap();
+        fs
+    }
+
+    async fn open_reopen_fs(object_store: Arc<dyn ObjectStore>) -> ZeroFS {
+        let test_key = [0u8; 32];
+        let transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default()).unwrap();
+        let db = Arc::new(
+            DbBuilder::new(Path::from("workspace-genesis-reopen"), object_store.clone())
+                .with_block_transformer(transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let codec = FrameCodec::try_new(
+            &test_key,
+            crate::segment::SEGMENT_INFO,
+            CompressionConfig::default(),
+        )
+        .unwrap();
+        let fs = ZeroFS::new_with_slatedb(
+            SlateDbHandle::ReadWrite(db),
+            u64::MAX,
+            None,
+            false,
+            object_store,
+            codec,
+        )
+        .await
+        .unwrap();
+        if fs
+            .lookup(&crate::fs::test_util::test_creds(), 0, b".nbd")
+            .await
+            .is_err()
+        {
+            fs.mkdir(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b".nbd",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        }
         fs
     }
 
@@ -671,6 +769,39 @@ mod tests {
             panic!("pending operation must replay materialization");
         };
         assert_eq!(replay.record, durable);
+    }
+
+    #[tokio::test]
+    async fn unknown_reply_converges_after_cold_reopen() {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let first = open_reopen_fs(object_store.clone()).await;
+        let input = verified("workspace-a", "request-a", b"root-a");
+        first
+            .workspace_operations
+            .begin(&input.command().operation, input.command().request_digest)
+            .await
+            .unwrap();
+        first
+            .write_coordinator
+            .dst_drop_next_workspace_durable_reply();
+        assert_eq!(
+            first.workspace_genesis.materialize(input.clone()).await,
+            Err(GenesisError::CommitOutcomeUnknown)
+        );
+        let committed = first
+            .workspace_genesis
+            .lookup_record_durable("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        first.db.close().await.unwrap();
+        let reopened = open_reopen_fs(object_store).await;
+        let replay = reopened.workspace_genesis.materialize(input).await.unwrap();
+        let GenesisMaterializeResult::Materialized(replay) = replay else {
+            panic!("pending operation must replay materialization after reopen");
+        };
+        assert_eq!(replay.record, committed);
     }
 
     #[tokio::test]
@@ -848,5 +979,43 @@ mod tests {
         assert_eq!(decode_record(&key, &trailing), Err(GenesisError::Corrupt));
         record.root_object_key.push('x');
         assert_eq!(encode_record(&key, &record), Err(GenesisError::Invalid));
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn failpoint_after_durable_commit_requires_exact_readback() {
+        crate::test_helpers::isolated_failpoint::run(
+            "workspace_genesis::failpoint_after_durable_commit_requires_exact_readback",
+            crate::test_helpers::isolated_failpoint::Runtime::CurrentThread,
+            || async {
+                let fs = new_fs().await;
+                let input = verified("workspace-a", "request-a", b"root-a");
+                fs.workspace_operations
+                    .begin(&input.command().operation, input.command().request_digest)
+                    .await
+                    .unwrap();
+                let armed = crate::test_helpers::isolated_failpoint::arm(
+                    crate::failpoints::WORKSPACE_GENESIS_AFTER_COMMIT_BEFORE_REPLY,
+                    "return",
+                );
+                assert_eq!(
+                    fs.workspace_genesis.materialize(input.clone()).await,
+                    Err(GenesisError::CommitOutcomeUnknown)
+                );
+                drop(armed);
+                let committed = fs
+                    .workspace_genesis
+                    .lookup_record_durable("workspace-a")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let GenesisMaterializeResult::Materialized(replay) =
+                    fs.workspace_genesis.materialize(input).await.unwrap()
+                else {
+                    panic!("pending operation must replay durable genesis");
+                };
+                assert_eq!(replay.record, committed);
+            },
+        );
     }
 }
