@@ -9,9 +9,9 @@ use crate::fs::errors::FsError;
 #[cfg(feature = "rhizome-export-authority-core")]
 use crate::fs::export_authority::{
     ExportAuthorityError, ExportAuthorityRecord, ExportAuthorityTransition, ExportMutationContext,
-    ExportMutationExpectation, ExportMutationOutcome, MutationIdentity, apply_transition,
-    encode_outcome, encode_record, ensure_outcome, read_outcome_current, read_record_current,
-    trusted_now_unix_millis, validate_mutation,
+    ExportMutationExpectation, ExportMutationOutcome, FenceMutationConflict, MutationIdentity,
+    apply_transition, encode_outcome, encode_record, ensure_outcome, read_outcome_current,
+    read_record_current, trusted_now_unix_millis, validate_mutation,
 };
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
@@ -67,6 +67,11 @@ enum Request {
     ExportAuthority(
         ExportAuthorityTransition,
         oneshot::Sender<Result<ExportAuthorityRecord, ExportAuthorityError>>,
+    ),
+    #[cfg(feature = "rhizome-export-authority-core")]
+    FenceMutationConflict(
+        FenceMutationConflict,
+        oneshot::Sender<Result<(), ExportAuthorityError>>,
     ),
     #[cfg(feature = "rhizome-export-authority-core")]
     #[cfg_attr(
@@ -244,6 +249,20 @@ impl WriteCoordinator {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(Request::ExportAuthority(transition, reply_tx))
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        reply_rx
+            .await
+            .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) async fn fence_mutation_conflict(
+        &self,
+        conflict: FenceMutationConflict,
+    ) -> Result<(), ExportAuthorityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::FenceMutationConflict(conflict, reply_tx))
             .map_err(|_| ExportAuthorityError::Storage)?;
         reply_rx
             .await
@@ -570,6 +589,21 @@ async fn worker_loop(
             continue;
         }
         #[cfg(feature = "rhizome-export-authority-core")]
+        if let Request::FenceMutationConflict(conflict, reply) = first {
+            let result = commit_mutation_conflict_fence(&mut ctx, conflict).await;
+            #[cfg(any(test, dst))]
+            let drop_reply = ctx
+                .workspace_durable_test_hook
+                .drop_next_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(test, dst)))]
+            let drop_reply = false;
+            if !drop_reply {
+                let _ = reply.send(result);
+            }
+            continue;
+        }
+        #[cfg(feature = "rhizome-export-authority-core")]
         if let Request::InitializeExportBoot(reply) = first {
             let result = commit_export_boot(&mut ctx).await;
             let _ = reply.send(result);
@@ -599,6 +633,8 @@ async fn worker_loop(
             ),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::ExportAuthority(..) => unreachable!("handled above"),
+            #[cfg(feature = "rhizome-export-authority-core")]
+            Request::FenceMutationConflict(..) => unreachable!("handled above"),
             #[cfg(feature = "rhizome-export-authority-core")]
             Request::InitializeExportBoot(..) => unreachable!("handled above"),
             #[cfg(any(test, dst))]
@@ -646,6 +682,11 @@ async fn worker_loop(
                 #[cfg(feature = "rhizome-export-authority-core")]
                 Request::ExportAuthority(transition, reply) => {
                     pending = Some(Request::ExportAuthority(transition, reply));
+                    break;
+                }
+                #[cfg(feature = "rhizome-export-authority-core")]
+                Request::FenceMutationConflict(conflict, reply) => {
+                    pending = Some(Request::FenceMutationConflict(conflict, reply));
                     break;
                 }
                 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1010,6 +1051,13 @@ async fn worker_loop(
                 match write_result {
                     Ok(slatedb_seq) => {
                         local_applied = true;
+                        #[cfg(feature = "rhizome-export-authority-core")]
+                        if let Some(context) = export_mutation.as_mut()
+                            && let Some(update) = context.tail_update.take()
+                        {
+                            ctx.extent_store
+                                .apply_tail_update(context.export.inode, update);
+                        }
                         if let Some(permit) = apply_permit.take() {
                             permit.applied(SlateDbSeqno::new(slatedb_seq));
                         }
@@ -1153,7 +1201,20 @@ async fn commit_export_authority_transition(
     if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes()) {
         return Err(ExportAuthorityError::Conflict);
     }
-    let existing = read_record_current(&ctx.db, &key, &workspace_id).await?;
+    let existing =
+        read_record_current(&ctx.db, &key, &workspace_id)
+            .await?
+            .map(|mut record| {
+                if record.active_session.as_ref().is_some_and(|session| {
+                    session.server_boot_id != ctx.export_server_boot_id.as_ref()
+                }) {
+                    record.rejected_through_placement_epoch = record
+                        .rejected_through_placement_epoch
+                        .max(record.authority.placement_epoch);
+                    record.active_session = None;
+                }
+                record
+            });
     let now = authority_now(&ctx.authority_time_floor);
     let desired = apply_transition(existing, transition, now, &ctx.export_server_boot_id)?;
     let encoded = encode_record(&desired)?;
@@ -1177,6 +1238,66 @@ async fn commit_export_authority_transition(
     };
     flush_result.map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
     Ok(desired)
+}
+
+#[cfg(feature = "rhizome-export-authority-core")]
+async fn commit_mutation_conflict_fence(
+    ctx: &mut WorkerContext,
+    conflict: FenceMutationConflict,
+) -> Result<(), ExportAuthorityError> {
+    if ctx.replicator.is_some() {
+        return Err(ExportAuthorityError::Storage);
+    }
+    let key = ctx.key_codec.export_authority_key(&conflict.workspace_id);
+    let permit = ctx
+        .db
+        .acquire_write_permit()
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    let boot = ctx
+        .db
+        .get_bytes(&ctx.key_codec.export_boot_key())
+        .await
+        .map_err(|_| ExportAuthorityError::Storage)?;
+    if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes()) {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    let mut record = read_record_current(&ctx.db, &key, &conflict.workspace_id)
+        .await?
+        .ok_or(ExportAuthorityError::NotFound)?;
+    if record.export != conflict.export {
+        return Err(ExportAuthorityError::Conflict);
+    }
+    match record.active_session.as_ref() {
+        Some(session) if session.session_id == conflict.session_id => {
+            record.rejected_through_placement_epoch = record
+                .rejected_through_placement_epoch
+                .max(record.authority.placement_epoch);
+            record.active_session = None;
+        }
+        None if record.rejected_through_placement_epoch >= record.authority.placement_epoch => {}
+        _ => return Err(ExportAuthorityError::Conflict),
+    }
+    let encoded = encode_record(&record)?;
+    let mut batch = WriteBatch::new();
+    batch.put_bytes(key, encoded);
+    permit
+        .write_with_options(batch, &WriteOptions::default())
+        .await
+        .map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)?;
+    #[cfg(test)]
+    let fail_injected = ctx
+        .workspace_durable_test_hook
+        .fail_next_flush
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let fail_injected = false;
+    let flush_result = if fail_injected {
+        Err(crate::fs::errors::FsError::IoError)
+    } else {
+        ctx.flush_coordinator.flush().await
+    };
+    flush_result.map_err(|_| ExportAuthorityError::CommitOutcomeUnknown)
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -1981,7 +2102,7 @@ mod tests {
     async fn export_authority_profile_fails_before_any_ha_ship_or_local_apply() {
         use crate::fs::export_authority::{
             ActivateExport, AuthorityVersion, ExportAuthorityError, ExportIdentity,
-            ExportMutationBuilder, ExportSessionState, MutationFenceToken, MutationKind,
+            ExportMutationBuilder, ExportSessionState, MutationFenceToken,
         };
 
         let receiver = ReplicationReceiver::new(
@@ -2047,13 +2168,15 @@ mod tests {
             runtime_id: "runtime-a".into(),
             server_boot_id: "untrusted".into(),
         };
-        let mutation = ExportMutationBuilder::build(
+        let mutation = ExportMutationBuilder::from_transaction_for_test(
             token,
             [0xabu8; 32],
-            b"write",
-            b"must-not-apply",
+            crate::fs::export_authority::ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"must-not-apply"),
+                fua: false,
+            },
             transaction,
-            MutationKind::Write { fua: false },
         )
         .unwrap();
         assert_eq!(

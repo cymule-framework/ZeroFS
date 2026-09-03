@@ -46,8 +46,17 @@ attribution intact.
   process-local DedupCache as mutation authority.
 - The sealed mutation owns its complete fence token; callers cannot attach a
   different token at commit time. Command identity covers Workspace, export,
-  authority, session, boot, operation ID, kind, canonical command, and data
-  checksum.
+  authority, session, boot, operation ID, typed command fields, and WRITE data.
+- Production mutation construction accepts only typed block commands. Durable
+  replay is checked before ExtentStore transaction preparation; never add a
+  caller-supplied Transaction, command byte string, or parallel checksum.
+- On writer restart, normalize the old boot session only inside the queued
+  authority transition and allow only a strictly higher placement epoch. Do not
+  add a startup export scan. Activation resets sequence to zero; sequence is
+  coordinator-owned.
+- Operation-ID digest conflict uses the typed coordinator conflict fence. It
+  must durably close the current matching session and must never treat an
+  unproven authority Conflict as successful fencing.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct

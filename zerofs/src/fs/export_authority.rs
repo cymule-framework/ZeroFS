@@ -6,6 +6,9 @@
 //! [`WriteCoordinator`], which is the only ordering authority.
 
 use crate::db::{Db, Transaction};
+use crate::fs::lock_manager::KeyedLockGuard;
+use crate::fs::store::extent::TailUpdate;
+use crate::fs::store::{ExtentStore, InodeStore};
 use crate::fs::write_coordinator::WriteCoordinator;
 use bincode::Options;
 use bytes::Bytes;
@@ -25,7 +28,7 @@ const ENVELOPE_CHECKSUM_DOMAIN: &[u8] = b"rhizome.export-record-envelope.v1\0";
     not(test),
     expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
 )]
-const COMMAND_DIGEST_DOMAIN: &[u8] = b"rhizome.export-mutation-command.v1\0";
+const COMMAND_DIGEST_DOMAIN: &[u8] = b"rhizome.export-mutation-command.v2\0";
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
@@ -106,12 +109,51 @@ pub(crate) struct AdvanceFence {
     pub reject_through_placement_epoch: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FenceMutationConflict {
+    pub workspace_id: String,
+    pub export: ExportIdentity,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MutationKind {
     Write { fua: bool },
     Flush,
     Trim { fua: bool },
     WriteZeroes { fua: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
+)]
+pub(crate) enum ExportMutationCommand {
+    Write { offset: u64, data: Bytes, fua: bool },
+    Flush,
+    Trim { offset: u64, length: u64, fua: bool },
+    WriteZeroes { offset: u64, length: u64, fua: bool },
+}
+
+impl ExportMutationCommand {
+    fn kind(&self) -> MutationKind {
+        match self {
+            Self::Write { fua, .. } => MutationKind::Write { fua: *fua },
+            Self::Flush => MutationKind::Flush,
+            Self::Trim { fua, .. } => MutationKind::Trim { fua: *fua },
+            Self::WriteZeroes { fua, .. } => MutationKind::WriteZeroes { fua: *fua },
+        }
+    }
+
+    fn data_checksum(&self) -> DataChecksum {
+        match self {
+            Self::Write { data, .. } => {
+                DataChecksum(domain_hash(DATA_CHECKSUM_DOMAIN, data.as_ref()))
+            }
+            _ => DataChecksum(domain_hash(DATA_CHECKSUM_DOMAIN, &[])),
+        }
+    }
 }
 
 impl MutationKind {
@@ -196,10 +238,18 @@ pub(crate) enum ExportMutationLookup {
 }
 
 pub(crate) struct ExportMutation {
-    transaction: Transaction,
     kind: MutationKind,
     token: MutationFenceToken,
     identity: MutationRequestIdentity,
+    command: ExportMutationCommand,
+    #[cfg(test)]
+    test_transaction: Option<Transaction>,
+}
+
+struct PreparedExportMutation {
+    transaction: Transaction,
+    tail_update: Option<TailUpdate>,
+    inode_guard: Option<KeyedLockGuard<u64>>,
 }
 
 #[cfg_attr(
@@ -216,10 +266,7 @@ impl ExportMutationBuilder {
     pub(crate) fn build(
         token: MutationFenceToken,
         operation_id: [u8; SHA256_SIZE],
-        canonical_command: &[u8],
-        data: &[u8],
-        transaction: Transaction,
-        kind: MutationKind,
+        command: ExportMutationCommand,
     ) -> Result<ExportMutation, ExportAuthorityError> {
         validate_id(&token.workspace_id)?;
         validate_export(&token.export)?;
@@ -229,13 +276,12 @@ impl ExportMutationBuilder {
         validate_id(&token.node_incarnation_id)?;
         validate_id(&token.runtime_id)?;
         validate_id(&token.server_boot_id)?;
-        if operation_id == [0; SHA256_SIZE] || canonical_command.is_empty() {
+        if operation_id == [0; SHA256_SIZE] {
             return Err(ExportAuthorityError::Invalid);
         }
-        transaction.validate_export_scope(token.export.inode)?;
-        let data_checksum = DataChecksum(domain_hash(DATA_CHECKSUM_DOMAIN, data));
+        let kind = command.kind();
+        let data_checksum = command.data_checksum();
         Ok(ExportMutation {
-            transaction,
             kind,
             token: token.clone(),
             identity: MutationRequestIdentity {
@@ -243,12 +289,46 @@ impl ExportMutationBuilder {
                 command_digest: CommandDigest(command_digest(
                     &token,
                     operation_id,
-                    kind,
-                    canonical_command,
+                    &command,
                     &data_checksum,
                 )),
                 data_checksum,
             },
+            command,
+            #[cfg(test)]
+            test_transaction: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_transaction_for_test(
+        token: MutationFenceToken,
+        operation_id: [u8; SHA256_SIZE],
+        command: ExportMutationCommand,
+        transaction: Transaction,
+    ) -> Result<ExportMutation, ExportAuthorityError> {
+        validate_export(&token.export)?;
+        if operation_id == [0; SHA256_SIZE] {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        transaction.validate_export_scope(token.export.inode)?;
+        let kind = command.kind();
+        let data_checksum = command.data_checksum();
+        Ok(ExportMutation {
+            kind,
+            token: token.clone(),
+            identity: MutationRequestIdentity {
+                operation_id: OperationId(operation_id),
+                command_digest: CommandDigest(command_digest(
+                    &token,
+                    operation_id,
+                    &command,
+                    &data_checksum,
+                )),
+                data_checksum,
+            },
+            command,
+            test_transaction: Some(transaction),
         })
     }
 }
@@ -267,13 +347,14 @@ impl ExportMutation {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ExportMutationContext {
     pub(crate) kind: MutationKind,
     pub(crate) token: MutationFenceToken,
     pub(crate) export: ExportIdentity,
     pub(crate) identity: MutationRequestIdentity,
     pub(crate) _guard: tokio::sync::OwnedMutexGuard<()>,
+    pub(crate) tail_update: Option<TailUpdate>,
+    pub(crate) _inode_guard: Option<KeyedLockGuard<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -304,7 +385,10 @@ impl ExportAuthorityError {
         expect(dead_code, reason = "feature-staged until verified NBD adapter wiring")
     )]
     pub(crate) fn close_session(self) -> bool {
-        matches!(self, Self::StaleMutation | Self::CommitOutcomeUnknown)
+        matches!(
+            self,
+            Self::Conflict | Self::StaleMutation | Self::CommitOutcomeUnknown
+        )
     }
 }
 
@@ -316,17 +400,29 @@ impl ExportAuthorityError {
 pub(crate) struct ExportAuthorityStore {
     db: Arc<Db>,
     coordinator: WriteCoordinator,
+    inode_store: InodeStore,
+    extent_store: ExtentStore,
+    lock_manager: Arc<crate::fs::lock_manager::KeyedLockManager<u64>>,
     server_boot_id: String,
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     profile_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ExportAuthorityStore {
-    pub(crate) fn new(db: Arc<Db>, coordinator: WriteCoordinator) -> Self {
+    pub(crate) fn new(
+        db: Arc<Db>,
+        coordinator: WriteCoordinator,
+        inode_store: InodeStore,
+        extent_store: ExtentStore,
+        lock_manager: Arc<crate::fs::lock_manager::KeyedLockManager<u64>>,
+    ) -> Self {
         let server_boot_id = coordinator.export_server_boot_id().to_owned();
         Self {
             db,
             coordinator,
+            inode_store,
+            extent_store,
+            lock_manager,
             server_boot_id,
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             profile_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -395,7 +491,7 @@ impl ExportAuthorityStore {
     )]
     pub(crate) async fn commit_mutation(
         &self,
-        mutation: ExportMutation,
+        mut mutation: ExportMutation,
     ) -> Result<ExportMutationOutcome, ExportAuthorityError> {
         self.require_enabled()?;
         let guard = self.mutation_lock.clone().lock_owned().await;
@@ -417,15 +513,18 @@ impl ExportAuthorityStore {
                 .make_outcome_durable(guard, &key, &expected, current)
                 .await;
         }
+        let prepared = self.prepare_mutation(&mut mutation).await?;
         self.coordinator
             .commit_export_mutation(
-                mutation.transaction,
+                prepared.transaction,
                 ExportMutationContext {
                     kind: mutation.kind,
                     export: mutation.token.export.clone(),
                     token: mutation.token,
                     identity: mutation.identity,
                     _guard: guard,
+                    tail_update: prepared.tail_update,
+                    _inode_guard: prepared.inode_guard,
                 },
             )
             .await?;
@@ -443,23 +542,98 @@ impl ExportAuthorityStore {
         Ok(committed)
     }
 
+    async fn prepare_mutation(
+        &self,
+        mutation: &mut ExportMutation,
+    ) -> Result<PreparedExportMutation, ExportAuthorityError> {
+        #[cfg(test)]
+        if let Some(transaction) = mutation.test_transaction.take() {
+            return Ok(PreparedExportMutation {
+                transaction,
+                tail_update: None,
+                inode_guard: None,
+            });
+        }
+
+        let inode_guard = self.lock_manager.acquire(mutation.token.export.inode).await;
+        let inode = self
+            .inode_store
+            .get(mutation.token.export.inode)
+            .await
+            .map_err(|_| ExportAuthorityError::Invalid)?;
+        let file = match &inode {
+            crate::fs::inode::Inode::File(file) => file,
+            _ => return Err(ExportAuthorityError::Invalid),
+        };
+        if file.name.as_deref() != Some(mutation.token.export.name.as_slice()) {
+            return Err(ExportAuthorityError::Invalid);
+        }
+        let mut transaction = self
+            .db
+            .new_transaction()
+            .map_err(|_| ExportAuthorityError::Storage)?;
+        let tail_update = match &mutation.command {
+            ExportMutationCommand::Write { offset, data, .. } => {
+                let end = offset
+                    .checked_add(data.len() as u64)
+                    .ok_or(ExportAuthorityError::Invalid)?;
+                if end > file.size {
+                    return Err(ExportAuthorityError::Invalid);
+                }
+                Some(
+                    self.extent_store
+                        .write(
+                            &mut transaction,
+                            mutation.token.export.inode,
+                            *offset,
+                            data,
+                            file.size,
+                        )
+                        .await
+                        .map_err(|_| ExportAuthorityError::Storage)?,
+                )
+            }
+            ExportMutationCommand::Trim { offset, length, .. }
+            | ExportMutationCommand::WriteZeroes { offset, length, .. } => {
+                let end = offset
+                    .checked_add(*length)
+                    .ok_or(ExportAuthorityError::Invalid)?;
+                if end > file.size {
+                    return Err(ExportAuthorityError::Invalid);
+                }
+                self.extent_store
+                    .zero_range(
+                        &mut transaction,
+                        mutation.token.export.inode,
+                        *offset,
+                        *length,
+                        file.size,
+                    )
+                    .await
+                    .map_err(|_| ExportAuthorityError::Storage)?;
+                None
+            }
+            ExportMutationCommand::Flush => None,
+        };
+        transaction.validate_export_scope(mutation.token.export.inode)?;
+        Ok(PreparedExportMutation {
+            transaction,
+            tail_update,
+            inode_guard: Some(inode_guard),
+        })
+    }
+
     async fn fence_mutation_conflict(
         &self,
         token: &MutationFenceToken,
     ) -> Result<(), ExportAuthorityError> {
-        match self
-            .advance_fence(AdvanceFence {
+        self.coordinator
+            .fence_mutation_conflict(FenceMutationConflict {
                 workspace_id: token.workspace_id.clone(),
                 export: token.export.clone(),
-                expected_authority: Some(token.authority.clone()),
-                new_non_writable_authority: token.authority.clone(),
-                reject_through_placement_epoch: token.authority.placement_epoch,
+                session_id: token.session_id.clone(),
             })
             .await
-        {
-            Ok(_) | Err(ExportAuthorityError::Conflict) => Ok(()),
-            Err(error) => Err(error),
-        }
     }
 
     async fn make_outcome_durable(
@@ -604,8 +778,7 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; SHA256_SIZE] {
 fn command_digest(
     token: &MutationFenceToken,
     operation_id: [u8; SHA256_SIZE],
-    kind: MutationKind,
-    canonical_command: &[u8],
+    command: &ExportMutationCommand,
     data_checksum: &DataChecksum,
 ) -> [u8; SHA256_SIZE] {
     fn field(hash: &mut Sha256, bytes: &[u8]) {
@@ -632,14 +805,32 @@ fn command_digest(
     field(&mut hash, token.runtime_id.as_bytes());
     field(&mut hash, token.server_boot_id.as_bytes());
     hash.update(operation_id);
-    let kind_bytes = match kind {
-        MutationKind::Write { fua } => [1, u8::from(fua)],
-        MutationKind::Flush => [2, 0],
-        MutationKind::Trim { fua } => [3, u8::from(fua)],
-        MutationKind::WriteZeroes { fua } => [4, u8::from(fua)],
+    match command {
+        ExportMutationCommand::Write { offset, data, fua } => {
+            hash.update([1, u8::from(*fua)]);
+            hash.update(offset.to_be_bytes());
+            hash.update((data.len() as u64).to_be_bytes());
+        }
+        ExportMutationCommand::Flush => hash.update([2, 0]),
+        ExportMutationCommand::Trim {
+            offset,
+            length,
+            fua,
+        } => {
+            hash.update([3, u8::from(*fua)]);
+            hash.update(offset.to_be_bytes());
+            hash.update(length.to_be_bytes());
+        }
+        ExportMutationCommand::WriteZeroes {
+            offset,
+            length,
+            fua,
+        } => {
+            hash.update([4, u8::from(*fua)]);
+            hash.update(offset.to_be_bytes());
+            hash.update(length.to_be_bytes());
+        }
     };
-    hash.update(kind_bytes);
-    field(&mut hash, canonical_command);
     hash.update(data_checksum.0);
     hash.finalize().into()
 }
@@ -737,6 +928,7 @@ pub(crate) fn apply_transition(
     match transition {
         ExportAuthorityTransition::Activate(mut command) => {
             command.session.server_boot_id = server_boot_id.to_owned();
+            command.session.committed_through_sequence = 0;
             validate_authority(&command.authority)?;
             validate_session(&command.session, now)?;
             let desired = ExportAuthorityRecord {
@@ -1328,13 +1520,29 @@ mod tests {
         kind: MutationKind,
         ordinal: u8,
     ) -> ExportMutation {
-        ExportMutationBuilder::build(
+        let command = match kind {
+            MutationKind::Write { fua } => ExportMutationCommand::Write {
+                offset: u64::from(ordinal),
+                data: Bytes::from(vec![b'd', ordinal]),
+                fua,
+            },
+            MutationKind::Flush => ExportMutationCommand::Flush,
+            MutationKind::Trim { fua } => ExportMutationCommand::Trim {
+                offset: u64::from(ordinal),
+                length: 1,
+                fua,
+            },
+            MutationKind::WriteZeroes { fua } => ExportMutationCommand::WriteZeroes {
+                offset: u64::from(ordinal),
+                length: 1,
+                fua,
+            },
+        };
+        ExportMutationBuilder::from_transaction_for_test(
             token(record),
             [ordinal; SHA256_SIZE],
-            &[b'c', ordinal],
-            &[b'd', ordinal],
+            command,
             transaction,
-            kind,
         )
         .unwrap()
     }
@@ -2416,6 +2624,25 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, ExportAuthorityError::StaleMutation);
+        let replacement = reopened
+            .export_authority
+            .activate(ActivateExport {
+                workspace_id: active.workspace_id.clone(),
+                export: active.export.clone(),
+                authority: authority(4, 7),
+                session: session("session-after-reopen", "capability-after-reopen", u64::MAX),
+            })
+            .await
+            .unwrap();
+        assert_eq!(replacement.authority.placement_epoch, 4);
+        assert_eq!(
+            replacement
+                .active_session
+                .as_ref()
+                .unwrap()
+                .committed_through_sequence,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2482,13 +2709,15 @@ mod tests {
         let make = |command: u8, value: &'static [u8], operation: u8| {
             let mut transaction = Transaction::new();
             transaction.put_bytes(&key, Bytes::from_static(value));
-            ExportMutationBuilder::build(
+            ExportMutationBuilder::from_transaction_for_test(
                 token(&active),
                 [operation; SHA256_SIZE],
-                &[command],
-                value,
+                ExportMutationCommand::Write {
+                    offset: u64::from(command),
+                    data: Bytes::from_static(value),
+                    fua: false,
+                },
                 transaction,
-                MutationKind::Write { fua: false },
             )
             .unwrap()
         };
@@ -2534,13 +2763,15 @@ mod tests {
         assert_eq!(
             fs.export_authority
                 .commit_mutation(
-                    ExportMutationBuilder::build(
+                    ExportMutationBuilder::from_transaction_for_test(
                         token(&active),
                         [51; SHA256_SIZE],
-                        b"blocked",
-                        b"blocked",
+                        ExportMutationCommand::Write {
+                            offset: 0,
+                            data: Bytes::from_static(b"blocked"),
+                            fua: false,
+                        },
                         blocked,
-                        MutationKind::Write { fua: false },
                     )
                     .unwrap(),
                 )
@@ -2664,13 +2895,15 @@ mod tests {
             let key = crate::fs::key_codec::KeyCodec::new().extent_key(active.export.inode, 800);
             let mut transaction = Transaction::new();
             transaction.put_bytes(&key, Bytes::from_static(b"fua-data"));
-            ExportMutationBuilder::build(
+            ExportMutationBuilder::from_transaction_for_test(
                 token(&active),
                 [54; SHA256_SIZE],
-                b"write-fua-800",
-                b"fua-data",
+                ExportMutationCommand::Write {
+                    offset: 800,
+                    data: Bytes::from_static(b"fua-data"),
+                    fua: true,
+                },
                 transaction,
-                MutationKind::Write { fua: true },
             )
             .unwrap()
         };
@@ -2731,13 +2964,15 @@ mod tests {
         let mut transaction = Transaction::new();
         transaction.put_bytes(&other_key, Bytes::from_static(b"other-export"));
         assert!(matches!(
-            ExportMutationBuilder::build(
+            ExportMutationBuilder::from_transaction_for_test(
                 token(&active),
                 [55; SHA256_SIZE],
-                b"wrong-inode",
-                b"other-export",
+                ExportMutationCommand::Write {
+                    offset: 0,
+                    data: Bytes::from_static(b"other-export"),
+                    fua: false,
+                },
                 transaction,
-                MutationKind::Write { fua: false },
             ),
             Err(ExportAuthorityError::Invalid)
         ));
@@ -2804,6 +3039,27 @@ mod tests {
         assert_eq!(active.export, export(77));
     }
 
+    #[test]
+    fn activate_always_resets_caller_sequence_to_zero() {
+        let mut command = activate_command(authority(3, 5));
+        command.session.committed_through_sequence = u64::MAX;
+        let active = apply_transition(
+            None,
+            ExportAuthorityTransition::Activate(command),
+            NOW,
+            BOOT,
+        )
+        .unwrap();
+        assert_eq!(
+            active
+                .active_session
+                .as_ref()
+                .unwrap()
+                .committed_through_sequence,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn mutation_outcome_copied_under_another_operation_key_is_corrupt() {
         let fs = new_export_fs().await;
@@ -2843,5 +3099,306 @@ mod tests {
             fs.export_authority.lookup_mutation_durable(&expected).await,
             Err(ExportAuthorityError::Corrupt)
         );
+    }
+
+    async fn real_export_fs() -> (ZeroFS, ExportAuthorityRecord) {
+        let fs = new_export_fs().await;
+        let (inode, _) = fs
+            .create(
+                &crate::fs::test_util::test_creds(),
+                0,
+                b"disk-a",
+                &crate::fs::types::SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &crate::fs::types::AuthContext::default(),
+            inode,
+            0,
+            &Bytes::from(vec![0x11; 4096]),
+        )
+        .await
+        .unwrap();
+        let active = fs
+            .export_authority
+            .activate(activate_command_for(authority(3, 5), export(inode)))
+            .await
+            .unwrap();
+        (fs, active)
+    }
+
+    #[tokio::test]
+    async fn typed_commands_build_and_commit_their_exact_filesystem_effect() {
+        let (fs, active) = real_export_fs().await;
+        let write = ExportMutationBuilder::build(
+            token(&active),
+            [0x61; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 8,
+                data: Bytes::from_static(b"rhizome"),
+                fua: true,
+            },
+        )
+        .unwrap();
+        let write_outcome = fs.export_authority.commit_mutation(write).await.unwrap();
+        assert_eq!(write_outcome.mutation.sequence, 1);
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                8,
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"rhizome");
+
+        let trim = ExportMutationBuilder::build(
+            token(&active),
+            [0x62; SHA256_SIZE],
+            ExportMutationCommand::Trim {
+                offset: 9,
+                length: 3,
+                fua: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority
+                .commit_mutation(trim)
+                .await
+                .unwrap()
+                .mutation
+                .sequence,
+            2
+        );
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                8,
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"r\0\0\0ome");
+
+        let zeroes = ExportMutationBuilder::build(
+            token(&active),
+            [0x63; SHA256_SIZE],
+            ExportMutationCommand::WriteZeroes {
+                offset: 12,
+                length: 3,
+                fua: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority
+                .commit_mutation(zeroes)
+                .await
+                .unwrap()
+                .mutation
+                .sequence,
+            3
+        );
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                8,
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"r\0\0\0\0\0\0");
+
+        let flush = ExportMutationBuilder::build(
+            token(&active),
+            [0x64; SHA256_SIZE],
+            ExportMutationCommand::Flush,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.export_authority
+                .commit_mutation(flush)
+                .await
+                .unwrap()
+                .mutation
+                .sequence,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_replay_never_prepares_or_reapplies_the_old_effect() {
+        let (fs, active) = real_export_fs().await;
+        let original = || {
+            ExportMutationBuilder::build(
+                token(&active),
+                [0x65; SHA256_SIZE],
+                ExportMutationCommand::Write {
+                    offset: 0,
+                    data: Bytes::from_static(b"first"),
+                    fua: false,
+                },
+            )
+            .unwrap()
+        };
+        let first = fs
+            .export_authority
+            .commit_mutation(original())
+            .await
+            .unwrap();
+        let later = ExportMutationBuilder::build(
+            token(&active),
+            [0x66; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"later"),
+                fua: false,
+            },
+        )
+        .unwrap();
+        fs.export_authority.commit_mutation(later).await.unwrap();
+        assert_eq!(
+            fs.export_authority
+                .commit_mutation(original())
+                .await
+                .unwrap(),
+            first
+        );
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                0,
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"later");
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_is_durably_fenced_on_old_operation_digest_conflict() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        fs.export_authority
+            .commit_mutation(mutation_for(
+                &active,
+                Transaction::new(),
+                MutationKind::Write { fua: false },
+                0x67,
+            ))
+            .await
+            .unwrap();
+        let refreshed = fs
+            .export_authority
+            .refresh(RefreshExport {
+                workspace_id: active.workspace_id.clone(),
+                expected_export: active.export.clone(),
+                expected_authority: active.authority.clone(),
+                session_id: "session-a".into(),
+                expected_capability_id: "capability-a".into(),
+                replacement_authority: authority(3, 6),
+                replacement_capability_id: "capability-b".into(),
+                replacement_expires_at_unix_millis: u64::MAX,
+            })
+            .await
+            .unwrap();
+        let conflicting = ExportMutationBuilder::from_transaction_for_test(
+            token(&active),
+            [0x67; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 9,
+                data: Bytes::from_static(b"different"),
+                fua: false,
+            },
+            Transaction::new(),
+        )
+        .unwrap();
+        let error = fs
+            .export_authority
+            .commit_mutation(conflicting)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ExportAuthorityError::Conflict);
+        assert!(error.close_session());
+        let fenced = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fenced.active_session.is_none());
+        assert_eq!(
+            fenced.rejected_through_placement_epoch,
+            refreshed.authority.placement_epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_fence_unknown_outcomes_require_authority_readback() {
+        let fs = new_export_fs().await;
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        fs.export_authority
+            .commit_mutation(mutation_for(
+                &active,
+                Transaction::new(),
+                MutationKind::Write { fua: false },
+                0x68,
+            ))
+            .await
+            .unwrap();
+        let conflict = || {
+            ExportMutationBuilder::from_transaction_for_test(
+                token(&active),
+                [0x68; SHA256_SIZE],
+                ExportMutationCommand::Write {
+                    offset: 10,
+                    data: Bytes::from_static(b"conflict"),
+                    fua: false,
+                },
+                Transaction::new(),
+            )
+            .unwrap()
+        };
+
+        fs.write_coordinator.dst_fail_next_workspace_durable_flush();
+        assert_eq!(
+            fs.export_authority.commit_mutation(conflict()).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        let durable_before_retry = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(durable_before_retry.active_session.is_some());
+
+        fs.write_coordinator.dst_drop_next_workspace_durable_reply();
+        assert_eq!(
+            fs.export_authority.commit_mutation(conflict()).await,
+            Err(ExportAuthorityError::CommitOutcomeUnknown)
+        );
+        let durable = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(durable.active_session.is_none());
+        assert_eq!(durable.rejected_through_placement_epoch, 3);
     }
 }

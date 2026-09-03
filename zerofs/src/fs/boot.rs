@@ -219,6 +219,9 @@ impl ZeroFS {
         let export_authority = crate::fs::export_authority::ExportAuthorityStore::new(
             db.clone(),
             write_coordinator.clone(),
+            inode_store.clone(),
+            extent_store.clone(),
+            lock_manager.clone(),
         );
 
         // Route the data plane's GC/compaction seg-count txns through the single

@@ -39,15 +39,19 @@ are written in the same SlateDB batch as the data, so they share one point of no
 return. Empty FLUSH operations still perform that atomic authority/outcome write
 and, like FUA operations, require a durable flush.
 
-A sealed crate-private builder accepts the complete fence token and computes a
-domain-separated SHA-256 command digest over its Workspace, export, authority,
-session, boot, operation ID, mutation kind, canonical command, and data
-checksum. It rejects transactions touching an inode other than the immutable
-export device. The coordinator uses a dedicated
+A sealed crate-private builder accepts only the complete fence token, operation
+ID, and a typed WRITE/TRIM/WRITE_ZEROES/FLUSH command. The authority store checks
+durable replay before preparing the exact ExtentStore transaction and segment
+deltas; callers cannot supply a parallel transaction, command byte string, or
+payload checksum. Its domain-separated SHA-256 identity covers Workspace,
+export, authority, session, boot, operation ID, typed mutation fields, and WRITE
+data. The coordinator uses a dedicated
 `ExportMutation` request rather than a side channel on ordinary transactions.
 Same-operation/same-digest retries return the stored outcome without applying
-data again. A same-operation conflicting digest durably fences the active
-session. Outcomes remain addressable after later commands, and current versus
+or preparing data again. A same-operation conflicting digest enters a typed
+coordinator fence that reads and durably closes the current matching session;
+it does not depend on a stale presenting authority version. Outcomes remain
+addressable after later commands, and current versus
 object-storage-durable lookup is explicit.
 
 Stale authority returns `StaleMutation`; an error after the local point of no
@@ -66,8 +70,8 @@ profiles until strict capability verification and NBD session negotiation are
 connected to every mutating command.
 
 The remaining NBD adapter must create operation IDs from a connection
-incarnation plus command ordinal/cookie, supply the exact canonical command and
-WRITE payload to the builder, and route every real mutating handler through this
+incarnation plus command ordinal/cookie, construct the exact typed command, and
+route every real mutating handler through this
 path. It must also protect the bound `.nbd` directory entry from replacement and
 define typed outcome retention/GC. Until those pieces and strict capability
 verification exist, the feature remains ineligible for an NBD or release
@@ -77,6 +81,12 @@ Profile enablement itself is durable authority. A boot write or flush with an
 unknown outcome leaves the in-process profile disabled; authority and mutation
 methods remain unavailable until an exact retry durably commits the current
 boot identity.
+
+The first authority transition after restart normalizes an old-boot active
+session inside the coordinator's final write permit, advances reject-through,
+and may atomically activate a strictly higher placement epoch. There is no
+startup scan. Activation always resets the session sequence to zero; only the
+coordinator increments it.
 
 ## Verification
 
