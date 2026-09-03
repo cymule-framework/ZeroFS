@@ -135,6 +135,11 @@ Profile enablement scans the narrow reserved version-1 prefix and fails with
 never treats old state as an empty database or performs an implicit reset.
 Deployments must use a fresh shard or a future typed one-shot migration.
 
+Implementation checkpoint `19fd69e` contains both the raw extent-key fencing
+candidate and the schema-gate ordering/readback tests, despite its narrower Git
+subject. Review and qualification must therefore use its full diff, not infer
+scope from the subject line.
+
 Block mutation lengths are bounded to the NBD `u32` command width. Admission
 rejects any range whose mathematical final extent cannot be represented in
 `u64`, before ExtentStore performs extent arithmetic.
