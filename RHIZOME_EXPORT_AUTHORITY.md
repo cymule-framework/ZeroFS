@@ -101,7 +101,9 @@ exist, the feature remains ineligible for an NBD or release profile.
 Ordinary-write protection uses a conservative derived deny index owned by the
 single coordinator. Its first use scans and strictly decodes the complete v2
 forward, reverse-name, and reverse-inode prefixes; corrupt initialization blocks
-writes. Successful first activation inserts the binding, while an uncertain
+all writes. Malformed rows and scan errors poison the index; decodable partial
+or mismatched graphs are conservatively unioned to protect every represented
+physical identity without blocking unrelated data. Successful first activation inserts the binding, while an uncertain
 authority apply invalidates the index for reconstruction. Steady-state final
 checks are constant-time per transaction candidate rather than Actor-count scans.
 

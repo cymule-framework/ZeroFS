@@ -120,6 +120,8 @@ pub struct WriteCoordinator {
     authority_time_floor: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(any(test, dst))]
     workspace_durable_test_hook: Arc<WorkspaceDurableTestHook>,
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    export_binding_index_rebuilds: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(any(test, dst))]
@@ -184,6 +186,8 @@ struct ExportBindingIndex {
     poisoned: bool,
     inodes: HashSet<u64>,
     entries: HashSet<(u64, bytes::Bytes)>,
+    #[cfg(test)]
+    rebuilds: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(feature = "rhizome-export-authority-core")]
@@ -234,6 +238,8 @@ impl WriteCoordinator {
         let export_server_boot_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
         #[cfg(feature = "rhizome-export-authority-core")]
         let authority_time_floor = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(all(feature = "rhizome-export-authority-core", test))]
+        let export_binding_index_rebuilds = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(any(test, dst))]
         let workspace_durable_test_hook = Arc::new(WorkspaceDurableTestHook::default());
         let ctx = WorkerContext {
@@ -253,7 +259,11 @@ impl WriteCoordinator {
             #[cfg(feature = "rhizome-export-authority-core")]
             authority_time_floor: authority_time_floor.clone(),
             #[cfg(feature = "rhizome-export-authority-core")]
-            export_binding_index: ExportBindingIndex::default(),
+            export_binding_index: ExportBindingIndex {
+                #[cfg(test)]
+                rebuilds: export_binding_index_rebuilds.clone(),
+                ..ExportBindingIndex::default()
+            },
             #[cfg(any(test, dst))]
             workspace_durable_test_hook: workspace_durable_test_hook.clone(),
         };
@@ -267,6 +277,8 @@ impl WriteCoordinator {
             authority_time_floor,
             #[cfg(any(test, dst))]
             workspace_durable_test_hook,
+            #[cfg(all(feature = "rhizome-export-authority-core", test))]
+            export_binding_index_rebuilds,
         }
     }
 
@@ -360,6 +372,12 @@ impl WriteCoordinator {
     pub(crate) fn dst_advance_authority_time_floor(&self, unix_millis: u64) {
         self.authority_time_floor
             .fetch_max(unix_millis, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    pub(crate) fn dst_export_binding_index_rebuilds(&self) -> u64 {
+        self.export_binding_index_rebuilds
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
@@ -892,7 +910,6 @@ async fn worker_loop(
         // the replication admission gate.
         #[cfg(feature = "rhizome-export-authority-core")]
         if replicating
-            && !export_binding_metadata_keys.is_empty()
             && let Err(error) = reject_bound_export_metadata_mutations(
                 &ctx.db,
                 &ctx.key_codec,
@@ -1610,8 +1627,29 @@ async fn ensure_export_binding_index(
     }
     let mut rebuilt = ExportBindingIndex {
         initialized: true,
+        #[cfg(test)]
+        rebuilds: index.rebuilds.clone(),
         ..ExportBindingIndex::default()
     };
+    #[cfg(test)]
+    rebuilt
+        .rebuilds
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut legacy = db
+        .scan_prefix(key_codec.legacy_export_v1_prefix(), None, 4 * 1024)
+        .await
+        .map_err(|_| FsError::IoError)?;
+    if legacy
+        .next()
+        .await
+        .transpose()
+        .map_err(|_| FsError::IoError)?
+        .is_some()
+    {
+        rebuilt.poisoned = true;
+        *index = rebuilt;
+        return Err(FsError::InvalidData);
+    }
     let mut forward = db
         .scan_prefix(key_codec.export_authority_prefix(), None, 4 * 1024)
         .await
@@ -2471,8 +2509,9 @@ mod tests {
     #[tokio::test]
     async fn export_authority_profile_fails_before_any_ha_ship_or_local_apply() {
         use crate::fs::export_authority::{
-            ActivateExport, AuthorityVersion, ExportAuthorityError, ExportIdentity,
-            ExportMutationBuilder, ExportSessionState, MutationFenceToken,
+            ActivateExport, AuthorityVersion, ExportAuthorityError, ExportAuthorityRecord,
+            ExportIdentity, ExportMutationBuilder, ExportSessionState, MutationFenceToken,
+            encode_record, encode_reverse_binding, reverse_binding_for, reverse_binding_keys,
         };
 
         let receiver = ReplicationReceiver::new(
@@ -2574,10 +2613,103 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let retained = ExportAuthorityRecord {
+            workspace_id: "workspace-retained".into(),
+            export: export.clone(),
+            authority: AuthorityVersion {
+                actor: "tenants/t/actors/retained".into(),
+                actor_generation: 1,
+                home_cell: "cells/c".into(),
+                home_revision: 1,
+                authority_epoch: 1,
+                placement_epoch: 1,
+                assignment_revision: 1,
+            },
+            rejected_through_placement_epoch: 1,
+            binding_initialized: true,
+            active_session: None,
+        };
+        let binding = reverse_binding_for(&retained);
+        let (name_key, inode_key) = reverse_binding_keys(&binding);
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                codec().export_authority_key(&retained.workspace_id),
+                encode_record(&retained).unwrap(),
+            )
+            .await
+            .unwrap();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                name_key.clone(),
+                encode_reverse_binding(&binding, &name_key).unwrap(),
+            )
+            .await
+            .unwrap();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                inode_key.clone(),
+                encode_reverse_binding(&binding, &inode_key).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut raw_bound = Transaction::new();
+        raw_bound.put_bytes(&data_key, Bytes::from_static(b"must-never-ship"));
+        assert_eq!(
+            fs.write_coordinator.commit(raw_bound).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert!(raw_db.get(&data_key).await.unwrap().is_none());
         let shipped = receiver_control
             .inspect_standby_for_tests(|tail, _| tail.batches_in_order().count())
             .await;
         assert_eq!(shipped, 0, "authority rejection must happen before ship");
+    }
+
+    #[cfg(feature = "rhizome-export-authority-core")]
+    #[tokio::test]
+    async fn malformed_binding_graph_blocks_candidate_free_ha_ship() {
+        let receiver = ReplicationReceiver::new(
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            "malformed-binding-standby".to_string(),
+        );
+        let receiver_control = receiver.control();
+        let endpoint = serve_receiver(receiver).await;
+        let (replicator, control) = Replicator::new(endpoint.clone(), writer_epoch(7));
+        control
+            .set_sender_for_tests(Some(connect_sender(&endpoint).await))
+            .await;
+        let lease = crate::replication::Lease::new();
+        lease.renew(std::time::Duration::from_secs(30));
+        let (fs, _) = make_leased_replicating_fs_with_raw(lease, replicator).await;
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                codec().export_authority_key("workspace-corrupt"),
+                Bytes::from_static(b"malformed"),
+            )
+            .await
+            .unwrap();
+
+        let op_id = [0x91; 16];
+        let mut candidate_free = Transaction::new();
+        candidate_free.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Error {
+                errno: libc::EIO as u32,
+            },
+        );
+        assert_eq!(
+            fs.write_coordinator.commit(candidate_free).await,
+            Err(FsError::InvalidData)
+        );
+        assert!(fs.dedup.get(&op_id).is_none());
+        let shipped = receiver_control
+            .inspect_standby_for_tests(|tail, _| tail.batches_in_order().count())
+            .await;
+        assert_eq!(
+            shipped, 0,
+            "poison must be detected before replication ship"
+        );
     }
 
     #[tokio::test]

@@ -3714,8 +3714,10 @@ mod tests {
     #[tokio::test]
     async fn forward_binding_fences_raw_mutations_when_reverse_rows_are_missing() {
         for missing in 0..3 {
-            let fs = new_export_fs().await;
-            let active = fs
+            let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+                Arc::new(slatedb::object_store::memory::InMemory::new());
+            let first = open_fs(object_store.clone()).await.unwrap();
+            let active = first
                 .export_authority
                 .activate(activate_command(authority(3, 5)))
                 .await
@@ -3723,17 +3725,23 @@ mod tests {
             let codec = crate::fs::key_codec::KeyCodec::new();
             let (name_key, inode_key) = reverse_binding_keys(&reverse_binding_for(&active));
             if missing != 1 {
-                fs.db
+                first
+                    .db
                     .inject_reserved_authority_delete_for_test(name_key.clone())
                     .await
                     .unwrap();
             }
             if missing != 0 {
-                fs.db
+                first
+                    .db
                     .inject_reserved_authority_delete_for_test(inode_key.clone())
                     .await
                     .unwrap();
             }
+            first.flush_coordinator.flush().await.unwrap();
+            first.db.close().await.unwrap();
+            drop(first);
+            let fs = open_fs(object_store).await.unwrap();
             let protected = [
                 codec.inode_key(active.export.inode),
                 codec.extent_key(active.export.inode, 0),
@@ -3768,31 +3776,40 @@ mod tests {
     #[tokio::test]
     async fn retained_reverse_rows_fence_raw_mutations_when_forward_is_missing() {
         for retained in 0..3 {
-            let fs = new_export_fs().await;
-            let active = fs
+            let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+                Arc::new(slatedb::object_store::memory::InMemory::new());
+            let first = open_fs(object_store.clone()).await.unwrap();
+            let active = first
                 .export_authority
                 .activate(activate_command(authority(3, 5)))
                 .await
                 .unwrap();
             let codec = crate::fs::key_codec::KeyCodec::new();
             let (name_key, inode_key) = reverse_binding_keys(&reverse_binding_for(&active));
-            fs.db
+            first
+                .db
                 .inject_reserved_authority_delete_for_test(
                     codec.export_authority_key(&active.workspace_id),
                 )
                 .await
                 .unwrap();
             if retained == 0 {
-                fs.db
+                first
+                    .db
                     .inject_reserved_authority_delete_for_test(inode_key)
                     .await
                     .unwrap();
             } else if retained == 1 {
-                fs.db
+                first
+                    .db
                     .inject_reserved_authority_delete_for_test(name_key)
                     .await
                     .unwrap();
             }
+            first.flush_coordinator.flush().await.unwrap();
+            first.db.close().await.unwrap();
+            drop(first);
+            let fs = open_fs(object_store).await.unwrap();
             let protected = [
                 codec.inode_key(active.export.inode),
                 codec.extent_key(active.export.inode, 0),
@@ -3822,6 +3839,69 @@ mod tests {
             }
             assert_eq!(fs.export_authority.dst_prepared_mutations(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn deny_index_scans_once_inserts_activation_and_stays_conservative() {
+        let fs = new_export_fs().await;
+        assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let attack_key = codec.extent_key(active.export.inode, 777);
+        let mut attack = Transaction::new();
+        attack.put_bytes(&attack_key, Bytes::from_static(b"blocked"));
+        assert_eq!(
+            fs.write_coordinator.commit(attack).await,
+            Err(crate::fs::errors::FsError::OperationNotPermitted)
+        );
+        assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
+
+        let (name_key, inode_key) = reverse_binding_keys(&reverse_binding_for(&active));
+        for key in [
+            codec.export_authority_key(&active.workspace_id),
+            name_key,
+            inode_key,
+        ] {
+            fs.db
+                .inject_reserved_authority_delete_for_test(key)
+                .await
+                .unwrap();
+        }
+        let mut retry = Transaction::new();
+        retry.put_bytes(&attack_key, Bytes::from_static(b"still-blocked"));
+        assert_eq!(
+            fs.write_coordinator.commit(retry).await,
+            Err(crate::fs::errors::FsError::OperationNotPermitted)
+        );
+        assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_binding_graph_poisons_the_index_without_repeated_scans() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                codec.export_authority_key("workspace-corrupt"),
+                Bytes::from_static(b"malformed"),
+            )
+            .await
+            .unwrap();
+        let unbound_key = codec.extent_key(999, 0);
+        for value in [b"first".as_slice(), b"second".as_slice()] {
+            let mut transaction = Transaction::new();
+            transaction.put_bytes(&unbound_key, Bytes::copy_from_slice(value));
+            assert_eq!(
+                fs.write_coordinator.commit(transaction).await,
+                Err(crate::fs::errors::FsError::InvalidData)
+            );
+        }
+        assert_eq!(fs.write_coordinator.dst_export_binding_index_rebuilds(), 1);
+        assert!(fs.db.get_bytes(&unbound_key).await.unwrap().is_none());
     }
 
     #[tokio::test]
