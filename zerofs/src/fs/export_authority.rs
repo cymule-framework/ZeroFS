@@ -110,15 +110,50 @@ pub(crate) struct AdvanceFence {
     pub reject_through_placement_epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FenceMutationConflict {
-    pub workspace_id: String,
-    pub export: ExportIdentity,
-    pub session_id: String,
-    pub server_boot_id: String,
-    pub actor: String,
-    pub actor_generation: u64,
-    pub placement_epoch: u64,
+pub(super) struct FenceMutationConflict {
+    committed: ExportMutationOutcome,
+    attempted: ExportMutationExpectation,
+}
+
+impl FenceMutationConflict {
+    fn new(
+        committed: ExportMutationOutcome,
+        attempted: ExportMutationExpectation,
+    ) -> Result<Self, ExportAuthorityError> {
+        if committed.workspace_id != attempted.workspace_id
+            || committed.export != attempted.export
+            || committed.authority.actor != attempted.authority.actor
+            || committed.authority.actor_generation != attempted.authority.actor_generation
+            || committed.authority.placement_epoch != attempted.authority.placement_epoch
+            || committed.session_id != attempted.session_id
+            || committed.server_boot_id != attempted.server_boot_id
+            || committed.mutation.operation_id != attempted.mutation.operation_id
+            || ensure_outcome(&committed, &attempted) != Err(ExportAuthorityError::Conflict)
+        {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+        Ok(Self {
+            committed,
+            attempted,
+        })
+    }
+
+    pub(super) async fn verify_current(&self, db: &Db) -> Result<(), ExportAuthorityError> {
+        let key = mutation_outcome_key(&self.attempted);
+        let current = read_outcome_current(db, &key, &self.attempted)
+            .await?
+            .ok_or(ExportAuthorityError::Corrupt)?;
+        if current != self.committed
+            || ensure_outcome(&current, &self.attempted) != Err(ExportAuthorityError::Conflict)
+        {
+            return Err(ExportAuthorityError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(super) fn attempted(&self) -> &ExportMutationExpectation {
+        &self.attempted
+    }
 }
 
 pub(crate) type ExportAdmissionGuard = KeyedLockGuard<String>;
@@ -419,6 +454,8 @@ pub(crate) struct ExportAuthorityStore {
     entered_after_admission: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     release_after_admission: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    prepared_mutations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ExportAuthorityStore {
@@ -445,6 +482,8 @@ impl ExportAuthorityStore {
             entered_after_admission: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             release_after_admission: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            prepared_mutations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -537,7 +576,8 @@ impl ExportAuthorityStore {
         let key = mutation_outcome_key(&expected);
         if let Some(current) = read_outcome_current(&self.db, &key, &expected).await? {
             if ensure_outcome(&current, &expected).is_err() {
-                self.fence_mutation_conflict(&mutation.token, guard).await?;
+                let conflict = FenceMutationConflict::new(current, expected)?;
+                self.fence_mutation_conflict(conflict, guard).await?;
                 return Err(ExportAuthorityError::Conflict);
             }
             if !expected.kind.requires_durability() {
@@ -611,6 +651,14 @@ impl ExportAuthorityStore {
         if file.name.as_deref() != Some(mutation.token.export.name.as_slice()) {
             return Err(ExportAuthorityError::Invalid);
         }
+        // Re-read durable process/writer authority at the physical staging
+        // boundary, after every potentially blocking local lock. The first
+        // check reserves local transition order; this one catches a competing
+        // process that superseded the boot in between.
+        self.validate_admission(&mutation.token).await?;
+        #[cfg(test)]
+        self.prepared_mutations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut transaction = self
             .db
             .new_transaction()
@@ -703,24 +751,19 @@ impl ExportAuthorityStore {
         self.release_after_admission.notify_one();
     }
 
+    #[cfg(test)]
+    fn dst_prepared_mutations(&self) -> u64 {
+        self.prepared_mutations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn fence_mutation_conflict(
         &self,
-        token: &MutationFenceToken,
+        conflict: FenceMutationConflict,
         guard: ExportAdmissionGuard,
     ) -> Result<(), ExportAuthorityError> {
         self.coordinator
-            .fence_mutation_conflict(
-                FenceMutationConflict {
-                    workspace_id: token.workspace_id.clone(),
-                    export: token.export.clone(),
-                    session_id: token.session_id.clone(),
-                    server_boot_id: token.server_boot_id.clone(),
-                    actor: token.authority.actor.clone(),
-                    actor_generation: token.authority.actor_generation,
-                    placement_epoch: token.authority.placement_epoch,
-                },
-                guard,
-            )
+            .fence_mutation_conflict(conflict, guard)
             .await
     }
 
@@ -3545,6 +3588,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflict_fence_reproves_the_exact_outcome_at_final_permit() {
+        let fs = Arc::new(new_export_fs().await);
+        let active = fs
+            .export_authority
+            .activate(activate_command(authority(3, 5)))
+            .await
+            .unwrap();
+        let original = fs
+            .export_authority
+            .commit_mutation(mutation_for(
+                &active,
+                Transaction::new(),
+                MutationKind::Write { fua: false },
+                0x69,
+            ))
+            .await
+            .unwrap();
+        let conflicting = ExportMutationBuilder::from_transaction_for_test(
+            token(&active),
+            [0x69; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 11,
+                data: Bytes::from_static(b"conflicting-command"),
+                fua: false,
+            },
+            Transaction::new(),
+        )
+        .unwrap();
+        let expected = conflicting.expectation();
+        fs.write_coordinator.dst_pause_next_conflict_after_permit();
+        let task = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.export_authority.commit_mutation(conflicting).await }
+        });
+        fs.write_coordinator.dst_wait_conflict_after_permit().await;
+
+        let mut replacement = original;
+        replacement.mutation.command_digest = CommandDigest([0xa5; SHA256_SIZE]);
+        let key = mutation_outcome_key(&expected);
+        fs.db
+            .inject_reserved_authority_value_for_test(key, encode_outcome(&replacement).unwrap())
+            .await
+            .unwrap();
+        fs.write_coordinator.dst_release_conflict_after_permit();
+        assert_eq!(task.await.unwrap(), Err(ExportAuthorityError::Corrupt));
+        let authority = fs
+            .export_authority
+            .get("workspace-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(authority.active_session.is_some());
+    }
+
+    #[tokio::test]
     async fn durable_fence_rejects_repeated_large_writes_before_any_object_store_cost() {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -3560,6 +3658,7 @@ mod tests {
             })
             .await
             .unwrap();
+        let prepared_before = fs.export_authority.dst_prepared_mutations();
         let before = object_inventory(&object_store).await;
         let data = Bytes::from(vec![0x5a; crate::fs::store::extent::SEAL_THRESHOLD + 1]);
         for ordinal in [0x71, 0x72, 0x73] {
@@ -3578,7 +3677,11 @@ mod tests {
                 Err(ExportAuthorityError::StaleMutation)
             );
         }
-        tokio::task::yield_now().await;
+        assert_eq!(
+            fs.export_authority.dst_prepared_mutations(),
+            prepared_before,
+            "a durably fenced request must not enter ExtentStore preparation"
+        );
         assert_eq!(object_inventory(&object_store).await, before);
     }
 
@@ -3643,6 +3746,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(fenced.active_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_boot_supersession_after_early_gate_blocks_physical_prepare() {
+        let (fs, active) = real_export_fs().await;
+        let fs = Arc::new(fs);
+        let prepared_before = fs.export_authority.dst_prepared_mutations();
+        fs.export_authority.dst_pause_next_after_admission();
+        let mutation = ExportMutationBuilder::build(
+            token(&active),
+            [0x7c; SHA256_SIZE],
+            ExportMutationCommand::Write {
+                offset: 0,
+                data: Bytes::from_static(b"must-not-stage"),
+                fua: false,
+            },
+        )
+        .unwrap();
+        let task = tokio::spawn({
+            let fs = fs.clone();
+            async move { fs.export_authority.commit_mutation(mutation).await }
+        });
+        fs.export_authority.dst_wait_after_admission().await;
+        fs.db
+            .inject_reserved_authority_value_for_test(
+                crate::fs::key_codec::KeyCodec::new().export_boot_key(),
+                Bytes::from_static(b"external-process-boot"),
+            )
+            .await
+            .unwrap();
+        fs.export_authority.dst_release_after_admission();
+        assert_eq!(
+            task.await.unwrap(),
+            Err(ExportAuthorityError::StaleMutation)
+        );
+        assert_eq!(
+            fs.export_authority.dst_prepared_mutations(),
+            prepared_before,
+            "external durable boot supersession must win before ExtentStore preparation"
+        );
+        let (bytes, _) = fs
+            .read_file(
+                &crate::fs::types::AuthContext::default(),
+                active.export.inode,
+                0,
+                14,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), &[0x11; 14]);
     }
 
     #[tokio::test]

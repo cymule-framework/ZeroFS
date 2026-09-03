@@ -66,8 +66,13 @@ attribution intact.
   add a startup export scan. Activation resets sequence to zero; sequence is
   coordinator-owned.
 - Operation-ID digest conflict uses the typed coordinator conflict fence. It
-  must durably close the current matching session and must never treat an
-  unproven authority Conflict as successful fencing.
+  must carry the exact committed outcome plus attempted command identity,
+  re-read that outcome at the final write permit, prove same operation and
+  different digest, then durably close the current matching session. It must
+  never treat an unproven authority Conflict as successful fencing.
+- Stale-cost tests use synchronous preparation counters as the primary witness;
+  compressed payload size and an unjoined background PUT are not proof that
+  ExtentStore preparation was skipped.
 - Raw `Db` mutation methods are crate-private, and every public `Transaction`
   commit rejects the export-authority prefix and process-boot key. Only typed
   coordinator requests may mutate those reserved keys; do not reopen a direct

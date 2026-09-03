@@ -51,7 +51,9 @@ data. The coordinator uses a dedicated
 Same-operation/same-digest retries return the stored outcome without applying
 or preparing data again. A same-operation conflicting digest enters a typed
 coordinator fence that reads and durably closes the current matching session;
-it does not depend on a stale presenting authority version. Outcomes remain
+the request carries the exact observed outcome and attempted identity, and the
+worker re-reads the immutable outcome at its final write permit before fencing.
+It does not depend on a stale presenting authority version. Outcomes remain
 addressable after later commands, and current versus
 object-storage-durable lookup is explicit.
 

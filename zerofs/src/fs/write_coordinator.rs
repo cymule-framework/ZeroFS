@@ -137,6 +137,12 @@ struct WorkspaceDurableTestHook {
     entered_authority_after_permit: tokio::sync::Notify,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
     release_authority_after_permit: tokio::sync::Notify,
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    pause_conflict_after_permit: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    entered_conflict_after_permit: tokio::sync::Notify,
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    release_conflict_after_permit: tokio::sync::Notify,
 }
 
 /// Commit worker dependencies.
@@ -268,7 +274,7 @@ impl WriteCoordinator {
     }
 
     #[cfg(feature = "rhizome-export-authority-core")]
-    pub(crate) async fn fence_mutation_conflict(
+    pub(super) async fn fence_mutation_conflict(
         &self,
         conflict: FenceMutationConflict,
         guard: ExportAdmissionGuard,
@@ -354,6 +360,28 @@ impl WriteCoordinator {
     pub(crate) fn dst_release_authority_after_permit(&self) {
         self.workspace_durable_test_hook
             .release_authority_after_permit
+            .notify_one();
+    }
+
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    pub(crate) fn dst_pause_next_conflict_after_permit(&self) {
+        self.workspace_durable_test_hook
+            .pause_conflict_after_permit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    pub(crate) async fn dst_wait_conflict_after_permit(&self) {
+        self.workspace_durable_test_hook
+            .entered_conflict_after_permit
+            .notified()
+            .await;
+    }
+
+    #[cfg(all(feature = "rhizome-export-authority-core", test))]
+    pub(crate) fn dst_release_conflict_after_permit(&self) {
+        self.workspace_durable_test_hook
+            .release_conflict_after_permit
             .notify_one();
     }
 
@@ -1271,12 +1299,28 @@ async fn commit_mutation_conflict_fence(
     if ctx.replicator.is_some() {
         return Err(ExportAuthorityError::Storage);
     }
-    let key = ctx.key_codec.export_authority_key(&conflict.workspace_id);
     let permit = ctx
         .db
         .acquire_write_permit()
         .await
         .map_err(|_| ExportAuthorityError::Storage)?;
+    #[cfg(test)]
+    if ctx
+        .workspace_durable_test_hook
+        .pause_conflict_after_permit
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        ctx.workspace_durable_test_hook
+            .entered_conflict_after_permit
+            .notify_one();
+        ctx.workspace_durable_test_hook
+            .release_conflict_after_permit
+            .notified()
+            .await;
+    }
+    conflict.verify_current(&ctx.db).await?;
+    let attempted = conflict.attempted();
+    let key = ctx.key_codec.export_authority_key(&attempted.workspace_id);
     let boot = ctx
         .db
         .get_bytes(&ctx.key_codec.export_boot_key())
@@ -1285,19 +1329,19 @@ async fn commit_mutation_conflict_fence(
     if boot.as_deref() != Some(ctx.export_server_boot_id.as_bytes()) {
         return Err(ExportAuthorityError::Conflict);
     }
-    let mut record = read_record_current(&ctx.db, &key, &conflict.workspace_id)
+    let mut record = read_record_current(&ctx.db, &key, &attempted.workspace_id)
         .await?
         .ok_or(ExportAuthorityError::NotFound)?;
-    if record.export != conflict.export {
+    if record.export != attempted.export {
         return Err(ExportAuthorityError::Conflict);
     }
     match record.active_session.as_ref() {
         Some(session)
-            if session.session_id == conflict.session_id
-                && session.server_boot_id == conflict.server_boot_id
-                && record.authority.actor == conflict.actor
-                && record.authority.actor_generation == conflict.actor_generation
-                && record.authority.placement_epoch == conflict.placement_epoch =>
+            if session.session_id == attempted.session_id
+                && session.server_boot_id == attempted.server_boot_id
+                && record.authority.actor == attempted.authority.actor
+                && record.authority.actor_generation == attempted.authority.actor_generation
+                && record.authority.placement_epoch == attempted.authority.placement_epoch =>
         {
             record.rejected_through_placement_epoch = record
                 .rejected_through_placement_epoch
