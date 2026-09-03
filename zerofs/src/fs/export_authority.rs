@@ -2208,6 +2208,14 @@ async fn read_nbd_install_graph_durable(
     let outcome_bytes = values.pop().ok_or(ExportAuthorityError::Corrupt)?;
     match (outcome_bytes, install_bytes, reservation_bytes) {
         (None, None, None) => Ok(None),
+        (None, None, Some(reservation)) => {
+            let reservation = decode_nbd_connection_reservation(&reservation, &reservation_key)?;
+            if same_nbd_install_request(&reservation, expected) {
+                Err(ExportAuthorityError::Corrupt)
+            } else {
+                Err(ExportAuthorityError::Conflict)
+            }
+        }
         (Some(outcome), Some(install), Some(reservation)) => {
             let outcome = decode_nbd_install_outcome(&outcome, &outcome_key, expected)?;
             let install = decode_nbd_session_install(&install, &install_key)?;
