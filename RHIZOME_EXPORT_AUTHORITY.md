@@ -118,6 +118,54 @@ and may atomically activate a strictly higher placement epoch. There is no
 startup scan. Activation always resets the session sequence to zero; only the
 coordinator increments it.
 
+## NBD session contract boundary
+
+The staged session core mirrors the authoritative data in Rhizome's unreleased
+`InstallNBDSession` and `GetNBDConnection` protobuf candidate without importing
+protobuf descriptors or field numbers into ZeroFS. The mapping is closed:
+
+| Rhizome contract data | ZeroFS domain data |
+| --- | --- |
+| request ID and canonical request digest | `request_id`, `VerifiedNbdInstallDigest` |
+| Workspace, session, complete AuthorityVersion, installed capability, expiry | `MutationFenceToken` |
+| Node-allocated connection ID | `expected_connection_id` / `connection_id` |
+| connector boot, PID/start, peer UID/GID, Node and runtime | `NbdConnectorIdentity` |
+| bind target and captured listener identity | `NbdSocketTarget`, `NbdSocketIdentity` |
+| exact export and closed NBD profile | `NbdExportIdentity`, `NbdProtocolProfile` |
+| guarded writer boot, shard and routing revision | `NbdServerBootIdentity`, `storage_routing_revision` |
+| activation receipt digest and commit times | exact digest and millisecond timestamps |
+| successful GO flags and connection ordinal | `NbdConnectionExpectation`, `NbdConnectionReceipt` |
+
+Signed capabilities, protobuf parsing, UUID string normalization, request-digest
+construction, and receipt signing deliberately stay outside this crate. The
+only Install constructor remains test-only until the normative CDDL registry
+and exact fixtures can supply a strictly verified domain value. In particular,
+the internal bincode storage format is never hashed as a command identity and
+cannot substitute for the missing CDDL preimage.
+
+Install first commits `Pending`; only then may the supervisor atomically bind
+and capture the socket identity. Completion revalidates the current guarded
+server boot, full Actor/session authority, both reverse bindings, and the exact
+physical export mapping under the final write permit. The first accepted FD is
+then durably claimed before any NBD handshake or option byte is processed. The
+adapter must stop accepting before dispatching that claim and retain the same
+open file description plus its in-memory lifecycle owner through unknown-result
+readback. An exact durable claim may continue on that FD without another write.
+An absent/conflicting claim, lost FD, or restarted process requires fence and
+cold rebuild; the durable tuple never authorizes stream reconstruction.
+
+All related durable rows are read from one SlateDB remote-durable snapshot
+while holding the same per-Workspace admission reservation. Install outcome and
+record must both exist at one sequence. A successful connection additionally
+requires the exact receipt and consumed Install at that sequence. Partial graphs
+are corruption, including after reopen; independent point reads are not a valid
+receipt.
+
+This slice retains Install, claim/burn, and connection rows indefinitely. It
+has no delete, tombstone, retirement, or GC command, so it makes no bounded
+retention claim. A future typed retirement protocol must preserve unknown-result
+readback and retained reverse-binding safety before any row can be collected.
+
 Before the authority profile can initialize its durable boot identity, the
 supervisor must supply a process-lifetime guard for the exact configured shard.
 On Linux the guard resolves a SHA-256-derived lock name with rustix `openat`

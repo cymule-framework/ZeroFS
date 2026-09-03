@@ -142,6 +142,24 @@ attribution intact.
 - This slice is not wired to the public NBD server. Do not claim NBD fencing
   conformance until negotiation installs verified session state and every real
   WRITE/FUA/FLUSH/TRIM/WRITE_ZEROES handler uses the token-bearing commit path.
+- Read every multi-row NBD Install/connection graph under the per-Workspace
+  admission guard from one SlateDB remote-durable snapshot. Missing halves,
+  a consumed Install without its connection receipt, or a receipt without the
+  exact consumed Install are corruption; never assemble authority from point
+  reads at different sequences.
+- Install completion must revalidate the current guarded server boot, full
+  Actor/session authority, both immutable reverse bindings, and the physical
+  export mapping at its final write permit. A stale or replaced export may
+  replay an already immutable terminal outcome, but cannot publish a new one.
+- The NBD domain types mirror every authoritative field of the unreleased
+  Rhizome protobuf candidate, while protobuf parsing, UUID text normalization,
+  capability verification, request-digest construction, and receipt signing
+  remain outside this crate. Do not create a bincode/protobuf hash as command
+  identity. Keep the production Install constructor unavailable until the
+  normative CDDL registry and fixtures provide the strict verified input.
+- NBD Install, claim/burn, and connection rows are retained indefinitely in
+  this slice. No absence is a tombstone and no delete/GC path exists; add a
+  typed retirement protocol before promising bounded retention.
 - The first Rhizome NBD profile is one host-local root-owned Unix socket per
   export. Do not expose TCP, unauthenticated LIST, or `CAN_MULTI_CONN`; reuse the
   upstream NBD and nbd-proto mechanics behind the verified session adapter.

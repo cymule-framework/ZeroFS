@@ -1938,8 +1938,13 @@ async fn commit_nbd_session_burn(
     let result = apply_nbd_session_burn(&mut install, command)?;
     if was_burned {
         drop(permit);
-        flush_nbd_session_commit(ctx).await?;
-        return Ok(result);
+        let durable = read_nbd_session_install_durable(&ctx.db, &install_key)
+            .await?
+            .ok_or(ExportAuthorityError::CommitOutcomeUnknown)?;
+        if durable == install {
+            return Ok(result);
+        }
+        return Err(ExportAuthorityError::CommitOutcomeUnknown);
     }
     let mut batch = WriteBatch::new();
     batch.put_bytes(install_key, encode_nbd_session_install(&install)?);

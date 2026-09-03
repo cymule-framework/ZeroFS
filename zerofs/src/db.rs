@@ -625,6 +625,22 @@ impl Db {
         self.get_bytes_at(key, DurabilityLevel::Remote).await
     }
 
+    /// Capture one read-only database sequence for a related durable read set.
+    ///
+    /// Callers must still select [`DurabilityLevel::Remote`] on every snapshot
+    /// read. The snapshot fixes the sequence boundary so a multi-row authority
+    /// graph cannot be assembled from different database states.
+    #[cfg(feature = "rhizome-export-authority-core")]
+    pub(crate) async fn durable_snapshot(&self) -> Result<Arc<slatedb::DbSnapshot>> {
+        self.check_lease()?;
+        let snapshot = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.snapshot().await?,
+            SlateDbHandle::ReadOnly(_) => return Err(FsError::ReadOnlyFilesystem.into()),
+        };
+        self.check_lease()?;
+        Ok(snapshot)
+    }
+
     async fn get_bytes_at(
         &self,
         key: &Bytes,
