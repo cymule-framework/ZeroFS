@@ -293,8 +293,10 @@ attribution intact.
   after it acquires that lock. If bounded reap fails, abort without S3 cleanup
   rather than detach a possible writer.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
-  reads, assert zero object-store PUTs, and drop the reader. Never open an RW
-  writer, call materialize, or close/flush during recovery.
+  reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
+  poller, then assert zero object-store PUTs and drop the filesystem. Never open
+  an RW writer, call materialize, invoke RW `Db::close` or ZeroFS close, or run
+  any flush that may publish a manifest during recovery.
 - Each Foundation scenario uses its own child and exact UUID-prefixed S3
   namespace. Enforce the pre-run empty inventory, 512-object/64-MiB cap,
   exact-prefix deletion, final empty inventory, and kill/join cleanup before

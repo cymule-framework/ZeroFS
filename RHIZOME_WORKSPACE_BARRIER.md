@@ -197,7 +197,10 @@ Every recovery opens a SlateDB `DbReader`/read-only ZeroFS handle, performs only
 remote-durable operation/head/receipt and extent reads, asserts the object-store
 PUT count remains zero, explicitly closes and joins the reader poller, and then
 drops the filesystem handle. It never opens an RW writer,
-calls `materialize`, retries a barrier, or invokes `close`/flush.
+calls `materialize`, retries a barrier, or invokes RW `Db::close`, ZeroFS close,
+or any flush that may publish a manifest. The only permitted close is
+`DbReader::close` on the `FollowLatest` reader, used solely to cancel and join
+its non-writing poller before the zero-write assertion.
 
 The pinned SlateDB commit `20c14bbe9cb22405acc5b5067028c7b6d159baba`
 defaults `DbReader` to `ManagedCheckpoint`, whose open and refresh paths publish
