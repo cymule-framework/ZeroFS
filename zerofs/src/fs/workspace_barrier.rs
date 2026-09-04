@@ -2492,42 +2492,41 @@ mod tests {
         loop {
             match std::fs::File::open(&marker) {
                 Ok(mut file) => {
-                    match rustix::fs::flock(
+                    let locked = match rustix::fs::flock(
                         &file,
                         rustix::fs::FlockOperation::NonBlockingLockShared,
                     ) {
-                        Ok(()) => {}
-                        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                            continue;
-                        }
+                        Ok(()) => true,
+                        Err(error) if error == rustix::io::Errno::WOULDBLOCK => false,
                         Err(error) => panic!("lock durable handshake: {error}"),
+                    };
+                    if locked {
+                        let mut contents = String::new();
+                        file.read_to_string(&mut contents).unwrap();
+                        let fields = parse_closed_record(
+                            &contents,
+                            &[
+                                "schema",
+                                "run_id",
+                                "scenario",
+                                "point",
+                                "pid",
+                                "request_digest",
+                                "barrier_id",
+                                "effect_claim_digest",
+                                "claim_record_digest",
+                                "included_write_sequence",
+                                "receipt_digest",
+                            ],
+                        );
+                        assert_eq!(fields["schema"], "1");
+                        assert_eq!(fields["scenario"], scenario);
+                        assert_eq!(fields["point"], scenario);
+                        assert_eq!(fields["pid"], child_pid.to_string());
+                        assert_eq!(fields["included_write_sequence"], "1");
+                        rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock).unwrap();
+                        return fields;
                     }
-                    let mut contents = String::new();
-                    file.read_to_string(&mut contents).unwrap();
-                    let fields = parse_closed_record(
-                        &contents,
-                        &[
-                            "schema",
-                            "run_id",
-                            "scenario",
-                            "point",
-                            "pid",
-                            "request_digest",
-                            "barrier_id",
-                            "effect_claim_digest",
-                            "claim_record_digest",
-                            "included_write_sequence",
-                            "receipt_digest",
-                        ],
-                    );
-                    assert_eq!(fields["schema"], "1");
-                    assert_eq!(fields["scenario"], scenario);
-                    assert_eq!(fields["point"], scenario);
-                    assert_eq!(fields["pid"], child_pid.to_string());
-                    assert_eq!(fields["included_write_sequence"], "1");
-                    rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock).unwrap();
-                    return fields;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => panic!("read handshake: {error}"),
