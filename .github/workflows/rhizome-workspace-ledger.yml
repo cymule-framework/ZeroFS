@@ -28,6 +28,12 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy,rustfmt
+      - name: Check Foundation barrier evidence scripts
+        run: |
+          bash -n scripts/run-rhizome-barrier-foundation.sh
+          bash -n scripts/collect-rhizome-barrier-foundation.sh
+          bash -n scripts/verify-rhizome-barrier-sealed-retry.sh
+          shellcheck scripts/run-rhizome-barrier-foundation.sh scripts/collect-rhizome-barrier-foundation.sh scripts/verify-rhizome-barrier-sealed-retry.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p zerofs --features rhizome-export-authority-core --all-targets -- -D warnings

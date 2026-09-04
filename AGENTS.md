@@ -335,7 +335,8 @@ attribution intact.
   an exact external before/after inventory must remain byte-identical. Bind the
   versioned `verify-rhizome-barrier-sealed-retry.sh` hash and file identity in
   the runner preflight, then use it after collection; its stdout is external
-  evidence and must never be written into the sealed run tree. Any partial
+  evidence and must never be written into the sealed run tree. Keep all three
+  scripts under the exact CI `bash -n` and ShellCheck gate. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
