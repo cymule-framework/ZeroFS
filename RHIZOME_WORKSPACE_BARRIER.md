@@ -246,19 +246,22 @@ retry logs, and seals them with a manifest and readback receipt. Only after the
 two scripts have failed without changing the source tree and the external report
 is durable does the finalizer atomically switch canonical status to the already
 sealed PASS inode. A partial finalizer leaves the source non-PASS and its external
-directory permanently retained until that final rename PONR. If the rename
-succeeds but its following directory fsync reports an unknown outcome, the next
-invocation performs only exact readback: under the same lock it requires the
+directory permanently retained until that final rename PONR. The injected
+unknown case performs both the rename and a successful evidence-directory fsync,
+then loses the response; it never calls a visibility-only page-cache readback a
+durable result. The next invocation performs only exact readback: under the same lock it requires the
 canonical status and presealed PASS source to be the same inode and verifies the
 complete immutable source plus external retry-root identity, receipts, manifests
 and modes. An exact match converges to success without another rename or either
-retry. The explicit post-rename fsync-error mode exists only to exercise that
-unknown-outcome/readback path before qualification. All three scripts fail
+retry. The explicit post-fsync response-loss mode exists only to exercise that
+unknown-outcome/readback path before qualification. A real fsync error remains
+non-terminal and is not handled by this read-only branch. All three scripts fail
 closed and a partial pre-PONR run is permanently unusable. The CI-only,
 explicitly opted-in `test-rhizome-barrier-finalizer-ponr.sh` builds a synthetic
-sealed graph, proves an in-place same-inode/same-size runner rewrite is rejected,
-injects the post-rename fsync error, then invokes the same finalizer again and
-requires its read-only convergence path to succeed.
+sealed graph, proves mode/link violations and an in-place same-inode/same-size
+runner rewrite are rejected, injects response loss after rename plus successful
+directory fsync, then invokes the same finalizer again and requires its read-only
+convergence path to succeed.
 
 The closed scenarios are:
 

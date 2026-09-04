@@ -343,8 +343,10 @@ attribution intact.
   fsync unknown outcome, a new invocation may only hold the same lock and read
   back the exact PASS inode plus the complete immutable source and external
   receipt/manifest/root-identity graph; an exact match returns success without
-  any rewrite or script retry. Preserve the explicit post-rename fsync-error
-  test mode and exercise it followed by this read-only convergence before
+  any rewrite or script retry. The injected unknown outcome must occur only
+  after a successful evidence-directory fsync and represents response loss,
+  never a simulated fsync failure. Preserve that explicit post-fsync
+  response-loss mode and exercise it followed by read-only convergence before
   qualifying the harness. External records must not be deleted or written into
   the sealed run tree.
   Pre-create only the root:root 0700
@@ -353,8 +355,9 @@ attribution intact.
   with 0400 files.
   Keep the three production scripts and the explicitly opted-in synthetic PONR
   test under the exact CI `bash -n` and ShellCheck gate; CI must execute the
-  same-inode/same-size locator rewrite rejection and the rename-success/
-  fsync-error/read-only-convergence test as root. Any partial
+  closed mode/link graph and same-inode/same-size locator rewrite rejection,
+  plus the rename-and-fsync-success/response-loss/read-only-convergence test as
+  root. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest

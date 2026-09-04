@@ -17,8 +17,8 @@ RETRY_ROOT="$RETRY_PARENT/$RUN_ID"
 RUNNER=$(readlink -f "$2")
 COLLECTOR=$(readlink -f "$3")
 SELF=$(readlink -f "$0")
-POST_RENAME_FSYNC_FAULT=${RHIZOME_BARRIER_FINALIZER_TEST_POST_RENAME_FSYNC_ERROR:-0}
-[[ $POST_RENAME_FSYNC_FAULT == 0 || $POST_RENAME_FSYNC_FAULT == 1 ]]
+AFTER_STATUS_FSYNC_RESPONSE_LOSS=${RHIZOME_BARRIER_FINALIZER_TEST_AFTER_STATUS_FSYNC_RESPONSE_LOSS:-0}
+[[ $AFTER_STATUS_FSYNC_RESPONSE_LOSS == 0 || $AFTER_STATUS_FSYNC_RESPONSE_LOSS == 1 ]]
 
 [[ $(stat -c '%a:%U:%G' "$RUN_ROOT") == 500:root:root ]]
 [[ $(stat -c '%a:%U:%G' "$EVIDENCE_ROOT") == 500:root:root ]]
@@ -44,9 +44,9 @@ EVIDENCE_ROOT_DEVICE_INODE=$(stat -Lc '%d:%i' "$FINALIZER_OWNER_FD_PATH")
 STATUS_STATE=$(cat "$EVIDENCE_ROOT/status")
 [[ $STATUS_STATE == SEALED_AWAITING_RETRY_VERIFICATION || $STATUS_STATE == PASS ]]
 
-python3 - "$RUN_ROOT" "$EVIDENCE_ROOT" <<'PY'
-import os,sys
-run,evidence=sys.argv[1:]
+python3 - "$RUN_ROOT" "$EVIDENCE_ROOT" "$STATUS_STATE" <<'PY'
+import os,stat,sys
+run,evidence,status=sys.argv[1:]
 scenarios=('before-data-cut','after-0x0d-apply','manifest-applied-before-response','after-manifest-publish')
 expected_run={f'{scenario}.{suffix}' for scenario in scenarios for suffix in ('context','claim','handshake','exit','recovery')}
 assert set(os.listdir(run))==expected_run
@@ -58,6 +58,25 @@ expected_terminal={'preflight-selection','unit-journal.jsonl','invocation-journa
                    'post-terminal-inventory','pre-exit-manifest-check','run-manifest-check','receipt',
                    'status-pass.receipt','status-sealed-awaiting-retry.receipt','SHA256SUMS'}
 assert set(os.listdir(os.path.join(evidence,'terminal')))==expected_terminal
+terminal=os.path.join(evidence,'terminal')
+for root in (run,evidence):
+    for current,dirs,files in os.walk(root,followlinks=False):
+        current_info=os.lstat(current)
+        assert stat.S_ISDIR(current_info.st_mode) and stat.S_IMODE(current_info.st_mode)==0o500
+        assert current_info.st_uid==0 and current_info.st_gid==0
+        for name in dirs:
+            info=os.lstat(os.path.join(current,name))
+            assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode)==0o500
+            assert info.st_uid==0 and info.st_gid==0
+        for name in files:
+            path=os.path.join(current,name); info=os.lstat(path)
+            assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode)==0o400
+            assert info.st_uid==0 and info.st_gid==0
+            sealed_pair=(os.path.join(evidence,'status'),os.path.join(terminal,'status-sealed-awaiting-retry.receipt'))
+            pass_pair=(os.path.join(evidence,'status'),os.path.join(terminal,'status-pass.receipt'))
+            if status=='SEALED_AWAITING_RETRY_VERIFICATION': expected_links=2 if path in sealed_pair else 1
+            else: expected_links=2 if path in pass_pair else 1
+            assert info.st_nlink==expected_links,(path,info.st_nlink,expected_links)
 PY
 
 for path in "$SELF" "$RUNNER" "$COLLECTOR"; do
@@ -161,20 +180,20 @@ def record(name,fields):
     assert set(values)==set(fields); return values,raw
 attempt_fields=('schema','run_id','finalizer_pid','finalizer_pid_start_time_ticks','finalizer_linux_boot_id',
                 'finalizer_cgroup','evidence_root_device_inode','retry_root_device_inode','verifier_sha256',
-                'verifier_device_inode_size','source_final_seal_sha256','post_rename_fsync_fault_armed','attempted_at_utc')
+                'verifier_device_inode_size','source_final_seal_sha256','after_status_fsync_response_loss_armed','attempted_at_utc')
 attempt,_=record('attempt.receipt',attempt_fields)
 assert attempt['schema']=='1' and attempt['run_id']==run and int(attempt['finalizer_pid'])>1
 assert int(attempt['finalizer_pid_start_time_ticks'])>0 and uuid.UUID(attempt['finalizer_linux_boot_id'])
 assert attempt['evidence_root_device_inode']==evidence and attempt['retry_root_device_inode']==retry_root
 assert attempt['verifier_sha256']==verifier_sha and attempt['verifier_device_inode_size']==verifier_id
 assert attempt['source_final_seal_sha256']==source_seal
-assert attempt['post_rename_fsync_fault_armed'] in ('0','1')
+assert attempt['after_status_fsync_response_loss_armed'] in ('0','1')
 assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',attempt['attempted_at_utc'])
 retry_fields=('schema','run_id','verdict','evidence_root_device_inode','retry_root_device_inode',
               'source_final_seal_sha256','runner_retry_exit','collector_retry_exit','before_inventory_sha256',
               'after_inventory_sha256','runner_retry_log_sha256','collector_retry_log_sha256','runner_sha256',
               'runner_device_inode_size','collector_sha256','collector_device_inode_size','verifier_sha256',
-              'verifier_device_inode_size','post_rename_fsync_fault_armed')
+              'verifier_device_inode_size','after_status_fsync_response_loss_armed')
 retry,retry_raw=record('retry.receipt',retry_fields)
 assert retry['schema']=='1' and retry['run_id']==run and retry['verdict']=='RETRIES_REJECTED_TREE_UNCHANGED'
 assert retry['evidence_root_device_inode']==evidence and retry['retry_root_device_inode']==retry_root
@@ -188,7 +207,7 @@ assert open(os.path.join(root,'before.inventory'),'rb').read()==open(os.path.joi
 assert retry['runner_sha256']==runner_sha and retry['runner_device_inode_size']==runner_id
 assert retry['collector_sha256']==collector_sha and retry['collector_device_inode_size']==collector_id
 assert retry['verifier_sha256']==verifier_sha and retry['verifier_device_inode_size']==verifier_id
-assert retry['post_rename_fsync_fault_armed']==attempt['post_rename_fsync_fault_armed']
+assert retry['after_status_fsync_response_loss_armed']==attempt['after_status_fsync_response_loss_armed']
 manifest_raw=open(os.path.join(root,'SHA256SUMS'),'rb').read(); manifest_sha=hashlib.sha256(manifest_raw).hexdigest()
 manifest={}
 for line in manifest_raw.decode().splitlines():
@@ -201,7 +220,7 @@ for path,digest in manifest.items(): assert hashlib.sha256(open(path,'rb').read(
 final_fields=('schema','run_id','verdict','evidence_root_device_inode','retry_root_device_inode',
               'retry_manifest_sha256','retry_manifest_readback','retry_receipt_sha256',
               'source_final_seal_sha256','status_pass_receipt_sha256','verifier_sha256',
-              'post_rename_fsync_fault_armed')
+              'after_status_fsync_response_loss_armed')
 final,_=record('FINAL.receipt',final_fields)
 assert final=={'schema':'1','run_id':run,'verdict':'VERIFIED_AWAITING_STATUS',
               'evidence_root_device_inode':evidence,'retry_root_device_inode':retry_root,
@@ -209,7 +228,7 @@ assert final=={'schema':'1','run_id':run,'verdict':'VERIFIED_AWAITING_STATUS',
               'retry_receipt_sha256':hashlib.sha256(retry_raw).hexdigest(),
               'source_final_seal_sha256':source_seal,'status_pass_receipt_sha256':status_pass,
               'verifier_sha256':verifier_sha,
-              'post_rename_fsync_fault_armed':attempt['post_rename_fsync_fault_armed']}
+              'after_status_fsync_response_loss_armed':attempt['after_status_fsync_response_loss_armed']}
 PY
 }
 
@@ -240,10 +259,10 @@ ATTEMPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 python3 - "$RETRY_ROOT/attempt.receipt" "$RUN_ID" "$$" "$FINALIZER_START" "$FINALIZER_BOOT" \
     "$FINALIZER_CGROUP" "$EVIDENCE_ROOT_DEVICE_INODE" "$RETRY_ROOT_DEVICE_INODE" \
     "$(field sealed_retry_verifier_sha256)" "$(field sealed_retry_verifier_device_inode_size)" \
-    "$SOURCE_FINAL_SEAL_SHA" "$POST_RENAME_FSYNC_FAULT" "$ATTEMPTED_AT" <<'PY'
+    "$SOURCE_FINAL_SEAL_SHA" "$AFTER_STATUS_FSYNC_RESPONSE_LOSS" "$ATTEMPTED_AT" <<'PY'
 import os,sys
 path,run,pid,start,boot,cgroup,evidence,retry_root,digest,identity,source_seal,fault,when=sys.argv[1:]
-data=f'schema=1\nrun_id={run}\nfinalizer_pid={pid}\nfinalizer_pid_start_time_ticks={start}\nfinalizer_linux_boot_id={boot}\nfinalizer_cgroup={cgroup}\nevidence_root_device_inode={evidence}\nretry_root_device_inode={retry_root}\nverifier_sha256={digest}\nverifier_device_inode_size={identity}\nsource_final_seal_sha256={source_seal}\npost_rename_fsync_fault_armed={fault}\nattempted_at_utc={when}\n'.encode()
+data=f'schema=1\nrun_id={run}\nfinalizer_pid={pid}\nfinalizer_pid_start_time_ticks={start}\nfinalizer_linux_boot_id={boot}\nfinalizer_cgroup={cgroup}\nevidence_root_device_inode={evidence}\nretry_root_device_inode={retry_root}\nverifier_sha256={digest}\nverifier_device_inode_size={identity}\nsource_final_seal_sha256={source_seal}\nafter_status_fsync_response_loss_armed={fault}\nattempted_at_utc={when}\n'.encode()
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
 try:
     view=memoryview(data)
@@ -256,12 +275,12 @@ PY
 sync -f "$RETRY_ROOT"
 python3 - "$RETRY_ROOT/attempt.receipt" "$RUN_ID" "$$" "$FINALIZER_START" "$FINALIZER_BOOT" \
     "$FINALIZER_CGROUP" "$EVIDENCE_ROOT_DEVICE_INODE" "$RETRY_ROOT_DEVICE_INODE" "$(field sealed_retry_verifier_sha256)" \
-    "$(field sealed_retry_verifier_device_inode_size)" "$SOURCE_FINAL_SEAL_SHA" "$POST_RENAME_FSYNC_FAULT" <<'PY'
+    "$(field sealed_retry_verifier_device_inode_size)" "$SOURCE_FINAL_SEAL_SHA" "$AFTER_STATUS_FSYNC_RESPONSE_LOSS" <<'PY'
 import re,sys
 path,run,pid,start,boot,cgroup,evidence,retry_root,digest,identity,source,fault=sys.argv[1:]
 expected={'schema','run_id','finalizer_pid','finalizer_pid_start_time_ticks','finalizer_linux_boot_id',
           'finalizer_cgroup','evidence_root_device_inode','retry_root_device_inode','verifier_sha256','verifier_device_inode_size',
-          'source_final_seal_sha256','post_rename_fsync_fault_armed','attempted_at_utc'}
+          'source_final_seal_sha256','after_status_fsync_response_loss_armed','attempted_at_utc'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
@@ -273,7 +292,7 @@ assert values['finalizer_cgroup']==cgroup and values['evidence_root_device_inode
 assert values['retry_root_device_inode']==retry_root
 assert values['verifier_sha256']==digest and values['verifier_device_inode_size']==identity
 assert values['source_final_seal_sha256']==source
-assert values['post_rename_fsync_fault_armed']==fault
+assert values['after_status_fsync_response_loss_armed']==fault
 assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',values['attempted_at_utc'])
 PY
 
@@ -360,7 +379,7 @@ collector_sha256=$(field terminal_collector_sha256)
 collector_device_inode_size=$(field terminal_collector_device_inode_size)
 verifier_sha256=$(field sealed_retry_verifier_sha256)
 verifier_device_inode_size=$(field sealed_retry_verifier_device_inode_size)
-post_rename_fsync_fault_armed=$POST_RENAME_FSYNC_FAULT
+after_status_fsync_response_loss_armed=$AFTER_STATUS_FSYNC_RESPONSE_LOSS
 EOF
 chmod 0600 "$RETRY_ROOT/retry.receipt.pending"
 sync -f "$RETRY_ROOT/retry.receipt.pending"
@@ -373,14 +392,14 @@ python3 - "$RETRY_ROOT/retry.receipt" "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$
     "$RUNNER_LOG_SHA" "$COLLECTOR_LOG_SHA" "$(field runner_sha256)" "$(field runner_device_inode_size)" \
     "$(field terminal_collector_sha256)" "$(field terminal_collector_device_inode_size)" \
     "$(field sealed_retry_verifier_sha256)" "$(field sealed_retry_verifier_device_inode_size)" \
-    "$POST_RENAME_FSYNC_FAULT" <<'PY'
+    "$AFTER_STATUS_FSYNC_RESPONSE_LOSS" <<'PY'
 import sys
 path,run,evidence,retry_root,source,runner_exit,collector_exit,before,after,runner_log,collector_log,runner_sha,runner_id,collector_sha,collector_id,verifier_sha,verifier_id,fault=sys.argv[1:]
 expected={'schema','run_id','verdict','evidence_root_device_inode','retry_root_device_inode','source_final_seal_sha256',
           'runner_retry_exit','collector_retry_exit','before_inventory_sha256','after_inventory_sha256',
           'runner_retry_log_sha256','collector_retry_log_sha256','runner_sha256','runner_device_inode_size',
           'collector_sha256','collector_device_inode_size','verifier_sha256','verifier_device_inode_size',
-          'post_rename_fsync_fault_armed'}
+          'after_status_fsync_response_loss_armed'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
@@ -395,7 +414,7 @@ assert values=={'schema':'1','run_id':run,'verdict':'RETRIES_REJECTED_TREE_UNCHA
                 'runner_sha256':runner_sha,'runner_device_inode_size':runner_id,
                 'collector_sha256':collector_sha,'collector_device_inode_size':collector_id,
                 'verifier_sha256':verifier_sha,'verifier_device_inode_size':verifier_id,
-                'post_rename_fsync_fault_armed':fault}
+                'after_status_fsync_response_loss_armed':fault}
 PY
 find "$RETRY_ROOT" -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.pending' -print0 | \
     sort -z | xargs -0 sha256sum >"$RETRY_ROOT/SHA256SUMS.pending"
@@ -420,7 +439,7 @@ retry_receipt_sha256=$RETRY_RECEIPT_SHA
 source_final_seal_sha256=$SOURCE_FINAL_SEAL_SHA
 status_pass_receipt_sha256=$STATUS_PASS_SHA
 verifier_sha256=$(field sealed_retry_verifier_sha256)
-post_rename_fsync_fault_armed=$POST_RENAME_FSYNC_FAULT
+after_status_fsync_response_loss_armed=$AFTER_STATUS_FSYNC_RESPONSE_LOSS
 EOF
 chmod 0600 "$RETRY_ROOT/FINAL.receipt.pending"
 sync -f "$RETRY_ROOT/FINAL.receipt.pending"
@@ -430,12 +449,12 @@ unlink "$RETRY_ROOT/FINAL.receipt.pending"
 sync -f "$RETRY_ROOT"
 python3 - "$RETRY_ROOT/FINAL.receipt" "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$RETRY_ROOT_DEVICE_INODE" \
     "$RETRY_MANIFEST_SHA" "$RETRY_RECEIPT_SHA" "$SOURCE_FINAL_SEAL_SHA" "$STATUS_PASS_SHA" \
-    "$(field sealed_retry_verifier_sha256)" "$POST_RENAME_FSYNC_FAULT" <<'PY'
+    "$(field sealed_retry_verifier_sha256)" "$AFTER_STATUS_FSYNC_RESPONSE_LOSS" <<'PY'
 import sys
 path,run,evidence,retry_root,manifest,retry,source,status,verifier,fault=sys.argv[1:]
 expected={'schema','run_id','verdict','evidence_root_device_inode','retry_root_device_inode','retry_manifest_sha256',
           'retry_manifest_readback','retry_receipt_sha256','source_final_seal_sha256',
-          'status_pass_receipt_sha256','verifier_sha256','post_rename_fsync_fault_armed'}
+          'status_pass_receipt_sha256','verifier_sha256','after_status_fsync_response_loss_armed'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
@@ -446,7 +465,7 @@ assert values=={'schema':'1','run_id':run,'verdict':'VERIFIED_AWAITING_STATUS',
                 'retry_manifest_sha256':manifest,
                 'retry_manifest_readback':'verified','retry_receipt_sha256':retry,
                 'source_final_seal_sha256':source,'status_pass_receipt_sha256':status,
-                'verifier_sha256':verifier,'post_rename_fsync_fault_armed':fault}
+                'verifier_sha256':verifier,'after_status_fsync_response_loss_armed':fault}
 PY
 
 [[ $(find "$RETRY_ROOT" -type f -name '*.pending' | wc -l) == 0 ]]
@@ -470,7 +489,7 @@ sync -f "$EVIDENCE_ROOT"
 [[ $(cat "$EVIDENCE_ROOT/status.pass.pending") == PASS ]]
 [[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT/status.pass.pending") == "$(stat -Lc '%d:%i' "$TERMINAL/status-pass.receipt")" ]]
 mv -T "$EVIDENCE_ROOT/status.pass.pending" "$EVIDENCE_ROOT/status"
-if [[ $POST_RENAME_FSYNC_FAULT == 1 ]]; then
+sync -f "$EVIDENCE_ROOT"
+if [[ $AFTER_STATUS_FSYNC_RESPONSE_LOSS == 1 ]]; then
     exit 74
 fi
-sync -f "$EVIDENCE_ROOT"

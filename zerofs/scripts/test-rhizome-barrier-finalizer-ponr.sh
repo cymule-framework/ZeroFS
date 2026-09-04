@@ -87,6 +87,23 @@ for root in (run_root,evidence):
     os.chmod(root,0o500)
 PY
 
+# Closed source-tree mode and link-count violations are rejected before the
+# external finalizer attempt directory can be created.
+chmod 0600 "$EVIDENCE_ROOT/test.log"
+set +e
+"$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector" >/dev/null 2>&1
+MODE_EXIT=$?
+set -e
+[[ $MODE_EXIT != 0 && ! -e $RETRY_PARENT/$RUN_ID ]]
+chmod 0400 "$EVIDENCE_ROOT/test.log"
+ln "$EVIDENCE_ROOT/test.log" "$SCRIPT_ROOT/foreign-hardlink"
+set +e
+"$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector" >/dev/null 2>&1
+LINK_EXIT=$?
+set -e
+[[ $LINK_EXIT != 0 && ! -e $RETRY_PARENT/$RUN_ID ]]
+rm -f "$SCRIPT_ROOT/foreign-hardlink"
+
 # A same-inode, same-size locator rewrite must be rejected by content readback,
 # even though every device/inode/size comparison still matches preflight.
 RUNNER_IDENTITY=$(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner")
@@ -100,7 +117,7 @@ with open(path,'r+b',buffering=0) as target:
 PY
 [[ $(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner") == "$RUNNER_IDENTITY" ]]
 set +e
-"$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector"
+"$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector" >/dev/null 2>&1
 MUTATION_EXIT=$?
 set -e
 [[ $MUTATION_EXIT != 0 ]]
@@ -116,7 +133,7 @@ rm -f "$SCRIPT_ROOT/runner.saved"
 [[ $(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner") == "$RUNNER_IDENTITY" ]]
 
 set +e
-RHIZOME_BARRIER_FINALIZER_TEST_POST_RENAME_FSYNC_ERROR=1 \
+RHIZOME_BARRIER_FINALIZER_TEST_AFTER_STATUS_FSYNC_RESPONSE_LOSS=1 \
     "$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector"
 FIRST_EXIT=$?
 set -e
