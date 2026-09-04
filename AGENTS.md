@@ -327,9 +327,9 @@ attribution intact.
   after its final S3 inventory, bind a non-empty exact systemd invocation
   journal to the preflight cgroup, and prove cgroup absence before terminal
   PASS. Publish an immutable PASS body, then a complete recursive manifest and
-  its read-back-bound final seal; only that final seal may be terminal PASS
-  authority. The convenience `status` pathname may transition to the already
-  sealed PASS inode only afterward. Before that transition, make every retained
+  its read-back-bound `SEALED_AWAITING_STATUS` final seal. Neither the PASS body
+  nor that seal alone is terminal success. Before the canonical `status`
+  pathname may atomically transition to the already sealed PASS inode, make every retained
   file root:root 0400, the run/terminal directories 0500, and then the evidence
   root 0500. A post-PASS runner/collector retry must fail before any write and
   an exact external before/after inventory must remain byte-identical. Bind the

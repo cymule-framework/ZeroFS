@@ -231,9 +231,10 @@ Invocation/cgroup; revalidates the live RustFS process, unit and listener before
 and after the final empty S3 inventory; and proves the transient cgroup is absent.
 Only then does it publish an immutable PASS body, the recursive evidence
 manifest, verify that manifest, and publish a final seal binding the manifest,
-terminal manifest, PASS body, and collector attempt. That final seal is the
-terminal PASS authority. The convenience status path is changed to a hard link
-of the already sealed PASS body only after the final seal is durable and every
+terminal manifest, PASS body, and collector attempt. The seal remains
+`SEALED_AWAITING_STATUS`; neither it nor the non-canonical PASS body is terminal
+success. The canonical status path is changed to a hard link of the already
+sealed PASS body only after the final seal is durable and every
 retained file is root:root 0400, the run/terminal directories are 0500, and the
 evidence root is 0500. A qualification collection must then retry both scripts
 with the preflight-bound versioned

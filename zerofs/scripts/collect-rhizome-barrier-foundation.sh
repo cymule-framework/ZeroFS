@@ -482,7 +482,7 @@ supervisor_cgroup=$SUPERVISOR_CGROUP
 cgroup_absent=true
 surviving_run_processes=0
 scenario_exit_receipts=4
-verdict=PASS
+verdict=BEHAVIOR_PASS_AWAITING_FINAL_SEAL
 runner_exit=$(cat "$EVIDENCE_ROOT/exit-code")
 preflight_receipt_sha256=$(sha256sum "$PREFLIGHT_FD_PATH" | cut -d' ' -f1)
 pre_exit_manifest_sha256=$(sha256sum "$EVIDENCE_ROOT/SHA256SUMS" | cut -d' ' -f1)
@@ -542,7 +542,7 @@ TERMINAL_MANIFEST_SHA=$(sha256sum "$TERMINAL/SHA256SUMS" | cut -d' ' -f1)
 cat >FINAL-SEAL.receipt.pending <<EOF
 schema=1
 run_id=$RUN_ID
-verdict=PASS
+verdict=SEALED_AWAITING_STATUS
 evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
 mode_profile=root-read-only-v1
 final_manifest_sha256=$FINAL_MANIFEST_SHA
@@ -567,7 +567,7 @@ for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
     values[key]=value
 assert set(values)==expected
-assert values=={'schema':'1','run_id':run,'verdict':'PASS','evidence_root_device_inode':evidence,
+assert values=={'schema':'1','run_id':run,'verdict':'SEALED_AWAITING_STATUS','evidence_root_device_inode':evidence,
                 'mode_profile':'root-read-only-v1','final_manifest_sha256':manifest,
                 'final_manifest_readback':'verified','terminal_manifest_sha256':terminal,
                 'status_pass_receipt_sha256':status,'collector_attempt_receipt_sha256':attempt}
