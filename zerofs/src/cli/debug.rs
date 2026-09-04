@@ -116,11 +116,12 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
 
     let actual_db_path = path_from_url.to_string();
 
-    crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path).await?;
-
-    let bucket =
-        crate::bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-            .await?;
+    let bucket = super::init::resolve_bucket_identity_after_storage_preflight(
+        &object_store,
+        &actual_db_path,
+        super::server::DatabaseMode::ReadWrite,
+    )
+    .await?;
 
     let cache_config = CacheConfig {
         root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),

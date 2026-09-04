@@ -75,10 +75,10 @@ A replica rejects every mutating operation at the database layer, before it reac
 
 ### A fresh volume cannot start read-only
 
-The wrapped encryption key is created on first start and stored in the object store. A read-only instance cannot write it, so the first start of a volume must be read-write. Starting with `--read-only` against an uninitialized volume fails with:
+The bucket identity and wrapped encryption key are created on the first read-write start and stored in the object store. A read-only instance cannot create either object, so the first start of a volume must be read-write. Starting with `--read-only` against an uninitialized volume fails at the first missing object:
 
 ```text
-Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first.
+Failed to resolve existing bucket identity
 ```
 
 ### Exactly one writer

@@ -704,7 +704,7 @@ impl StartupContext {
     }
 }
 
-async fn resolve_bucket_identity_after_storage_preflight(
+pub(super) async fn resolve_bucket_identity_after_storage_preflight(
     object_store: &Arc<dyn object_store::ObjectStore>,
     actual_db_path: &str,
     db_mode: DatabaseMode,
