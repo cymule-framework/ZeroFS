@@ -28,6 +28,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
 
 pub(crate) const CREATE_BARRIER_KIND: i32 = 4;
 const RECORD_VERSION: u8 = 1;
@@ -187,7 +189,13 @@ pub(crate) struct WorkspaceBarrierStore {
     coordinator: WriteCoordinator,
     operations: crate::fs::workspace_operation::WorkspaceOperationLedger,
     admission_locks: Arc<crate::fs::lock_manager::KeyedLockManager<String>>,
+    #[cfg(test)]
+    after_claim_hook: Arc<std::sync::Mutex<Option<BarrierAfterClaimHook>>>,
 }
+
+#[cfg(test)]
+type BarrierAfterClaimHook =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), BarrierError>> + Send>> + Send + Sync>;
 
 impl WorkspaceBarrierStore {
     pub(crate) fn new(
@@ -201,7 +209,15 @@ impl WorkspaceBarrierStore {
             coordinator,
             operations,
             admission_locks,
+            #[cfg(test)]
+            after_claim_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dst_set_after_claim_hook(&self, hook: BarrierAfterClaimHook) {
+        let mut installed = self.after_claim_hook.lock().unwrap();
+        assert!(installed.replace(hook).is_none());
     }
 
     pub(crate) async fn materialize(
@@ -262,6 +278,12 @@ impl WorkspaceBarrierStore {
                 .await?
                 .map(|receipt| BarrierMaterializeResult::Materialized(Box::new(receipt)))
                 .ok_or(BarrierError::CommitOutcomeUnknown);
+        }
+        #[cfg(test)]
+        let after_claim = self.after_claim_hook.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(hook) = after_claim {
+            hook().await?;
         }
 
         let request = WorkspaceBarrierRequest {
@@ -975,6 +997,126 @@ pub(crate) fn genesis_matches(
     Ok(())
 }
 
+#[cfg(test)]
+static FOUNDATION_MANIFEST_CRASH_CONTEXT: std::sync::Mutex<
+    Option<(BarrierCommand, u64, BarrierDurabilityReceipt)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn arm_foundation_manifest_crash(receipt: &BarrierDurabilityReceipt) {
+    let command = command_from_receipt(receipt);
+    let mut context = FOUNDATION_MANIFEST_CRASH_CONTEXT.lock().unwrap();
+    assert!(
+        context
+            .replace((command, receipt.included_write_sequence, receipt.clone(),))
+            .is_none(),
+        "Foundation manifest crash context already armed"
+    );
+}
+
+#[cfg(test)]
+pub(crate) async fn foundation_manifest_applied_before_response() {
+    let (command, included_write_sequence, receipt) = FOUNDATION_MANIFEST_CRASH_CONTEXT
+        .lock()
+        .unwrap()
+        .take()
+        .expect("manifest blocker requires an exact barrier receipt context");
+    foundation_process_crash_point(
+        "manifest-applied-before-response",
+        &command,
+        included_write_sequence,
+        Some(&receipt),
+    )
+    .await;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) async fn foundation_process_crash_point(
+    point: &str,
+    command: &BarrierCommand,
+    included_write_sequence: u64,
+    receipt: Option<&BarrierDurabilityReceipt>,
+) {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let Ok(configured) = std::env::var("RHIZOME_BARRIER_FAULT_CRASH_POINT") else {
+        return;
+    };
+    if configured != point {
+        return;
+    }
+    let run_id = std::env::var("RHIZOME_BARRIER_FAULT_RUN_ID")
+        .expect("fault run id must accompany crash point");
+    let uuid = uuid::Uuid::parse_str(&run_id).expect("fault run id must be a UUID");
+    assert_eq!(uuid.get_version_num(), 4);
+    assert_eq!(uuid.to_string(), run_id);
+    let scenario = std::env::var("RHIZOME_BARRIER_FAULT_SCENARIO")
+        .expect("fault scenario must accompany crash point");
+    assert_eq!(scenario, point);
+    let run_root = std::path::PathBuf::from(format!(
+        "/opt/rhizome/validation/zerofs-barrier-fault/runs/{run_id}"
+    ));
+    let configured_root = std::path::PathBuf::from(
+        std::env::var("RHIZOME_BARRIER_FAULT_RUN_ROOT")
+            .expect("fault run root must accompany crash point"),
+    );
+    assert_eq!(configured_root, run_root);
+    assert_eq!(
+        std::fs::canonicalize(&configured_root).unwrap(),
+        configured_root
+    );
+    let metadata = std::fs::symlink_metadata(&configured_root).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.gid(), 0);
+    assert_eq!(metadata.mode() & 0o7777, 0o700);
+
+    let marker = configured_root.join(format!("{scenario}.handshake"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)
+        .unwrap();
+    let hex = |bytes: &[u8]| {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut out, "{byte:02x}").unwrap();
+        }
+        out
+    };
+    let receipt_digest = receipt
+        .map(|value| hex(&value.receipt_digest))
+        .unwrap_or_else(|| "none".into());
+    file.write_all(
+        format!(
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\nrequest_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
+            std::process::id(),
+            hex(command.request_digest.as_bytes()),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    std::fs::File::open(&configured_root)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+pub(crate) async fn foundation_process_crash_point(
+    _point: &str,
+    _command: &BarrierCommand,
+    _included_write_sequence: u64,
+    _receipt: Option<&BarrierDurabilityReceipt>,
+) {
+}
+
 /// Deterministic head/receipt codec model used by the repository DST binary.
 /// It constructs no verified production command or signed receipt.
 #[cfg(dst)]
@@ -1089,6 +1231,7 @@ pub fn dst_workspace_barrier_codec_model(seed: u64) {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
@@ -1225,8 +1368,28 @@ mod tests {
         let test_key = [0u8; 32];
         let transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default()).unwrap();
+        let db_path = Path::from("workspace-barrier-reopen");
+        let publication = crate::manifest_publication::ManifestPublication::new();
+        let slatedb_store: Arc<dyn ObjectStore> =
+            Arc::new(crate::manifest_publication::ManifestPublicationStore::new(
+                object_store.clone(),
+                db_path.clone(),
+                publication.clone(),
+            ));
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            flush_interval: None,
+            l0_sst_size_bytes: crate::manifest_publication::COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: crate::manifest_publication::COORDINATED_MAX_UNFLUSHED_BYTES,
+            l0_max_ssts: 256,
+            l0_max_ssts_per_key: 256,
+            compactor_options: None,
+            garbage_collector_options: None,
+            ..Default::default()
+        };
         let db = Arc::new(
-            DbBuilder::new(Path::from("workspace-barrier-reopen"), object_store.clone())
+            DbBuilder::new(db_path, slatedb_store)
+                .with_settings(settings)
                 .with_block_transformer(transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -1240,8 +1403,44 @@ mod tests {
             CompressionConfig::default(),
         )
         .unwrap();
-        ZeroFS::new_with_slatedb(
+        let fs = ZeroFS::new_with_slatedb(
             SlateDbHandle::ReadWrite(db),
+            u64::MAX,
+            None,
+            false,
+            object_store,
+            segment_codec,
+        )
+        .await
+        .unwrap();
+        fs.flush_coordinator.set_manifest_publication(publication);
+        fs
+    }
+
+    async fn open_persistent_read_only(object_store: Arc<dyn ObjectStore>) -> ZeroFS {
+        let test_key = [0u8; 32];
+        let transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default()).unwrap();
+        let reader = Arc::new(
+            slatedb::DbReader::builder(
+                Path::from("workspace-barrier-reopen"),
+                object_store.clone(),
+            )
+            .with_block_transformer(transformer)
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap(),
+        );
+        let segment_codec = FrameCodec::try_new(
+            &test_key,
+            crate::segment::SEGMENT_INFO,
+            CompressionConfig::default(),
+        )
+        .unwrap();
+        ZeroFS::new_with_slatedb(
+            SlateDbHandle::ReadOnly(arc_swap::ArcSwap::new(reader)),
             u64::MAX,
             None,
             false,
@@ -1466,6 +1665,78 @@ mod tests {
         .await;
         assert_eq!(receipt.included_write_sequence, 1);
         assert_eq!(receipt.head.committed_tail_position, 1);
+    }
+
+    #[tokio::test]
+    async fn after_claim_export_write_and_manifest_response_loss_converge() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (fault_store, faults) = crate::fault_store::FaultStore::new(inner);
+        let object_store: Arc<dyn ObjectStore> = fault_store;
+        let fs = open_persistent(object_store.clone()).await;
+        let (fs, token, genesis) = initialize_active(fs).await;
+        let payload = Bytes::from_static(b"export-data-after-barrier-claim");
+        let mutation_store = fs.export_authority.clone();
+        let mutation_token = token.clone();
+        let mutation_payload = payload.clone();
+        fs.workspace_barriers
+            .dst_set_after_claim_hook(Arc::new(move || {
+                let store = mutation_store.clone();
+                let token = mutation_token.clone();
+                let payload = mutation_payload.clone();
+                Box::pin(async move {
+                    let outcome = store
+                        .commit_mutation(
+                            ExportMutationBuilder::build(
+                                token,
+                                [0x71; 32],
+                                ExportMutationCommand::Write {
+                                    offset: 0,
+                                    data: payload,
+                                    fua: false,
+                                },
+                            )
+                            .map_err(|_| BarrierError::Invalid)?,
+                        )
+                        .await
+                        .map_err(|_| BarrierError::Storage)?;
+                    (outcome.mutation.sequence == 1)
+                        .then_some(())
+                        .ok_or(BarrierError::Corrupt)
+                })
+            }));
+        let armed_faults = faults.clone();
+        fs.write_coordinator
+            .dst_set_barrier_after_apply_hook(Arc::new(move |_| {
+                armed_faults.fail_manifest_puts_after_apply(1);
+            }));
+        let command = command(
+            "barrier-manifest-response-loss",
+            &token,
+            head_digest(&initial_head(&genesis).head),
+        );
+        let receipt = materialize(&fs, command.clone()).await;
+        assert_eq!(receipt.included_write_sequence, 1);
+        assert_eq!(faults.manifest_response_loss_count(), 1);
+        assert!(faults.manifest_put_count() >= 2);
+        drop(fs);
+
+        let reopened = open_persistent_read_only(object_store).await;
+        assert_eq!(
+            reopened
+                .workspace_barriers
+                .lookup_materialized(&command)
+                .await
+                .unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            reopened
+                .extent_store
+                .read(genesis.export.inode, 0, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload
+        );
     }
 
     #[tokio::test]
@@ -1732,6 +2003,477 @@ mod tests {
         out
     }
 
+    const FOUNDATION_FAULT_CHILD: &str = "RHIZOME_BARRIER_FAULT_CHILD";
+    const FOUNDATION_FAULT_TEST: &str =
+        "fs::workspace_barrier::tests::foundation_rustfs_process_fault_matrix";
+    const FOUNDATION_FAULT_SCENARIOS: [&str; 4] = [
+        "before-data-cut",
+        "after-0x0d-apply",
+        "manifest-applied-before-response",
+        "after-manifest-publish",
+    ];
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct FoundationFaultContext {
+        request_id: String,
+        request_digest: [u8; 32],
+        token: MutationFenceToken,
+        expected_head_digest: HeadDigest,
+        storage_shard_id: String,
+        storage_routing_revision: u64,
+        export_inode: u64,
+        payload: Vec<u8>,
+        mutation_operation_id: [u8; 32],
+    }
+
+    impl FoundationFaultContext {
+        fn command(&self) -> BarrierCommand {
+            BarrierCommand {
+                operation: WorkspaceOperationKey::new(
+                    self.token.workspace_id.clone(),
+                    CREATE_BARRIER_KIND,
+                    self.request_id.clone(),
+                ),
+                request_digest: CanonicalRequestDigest::new(self.request_digest),
+                token: self.token.clone(),
+                expected_head_digest: self.expected_head_digest,
+                storage_shard_id: self.storage_shard_id.clone(),
+                storage_routing_revision: self.storage_routing_revision,
+            }
+        }
+    }
+
+    fn foundation_fault_run() -> (String, std::path::PathBuf, String) {
+        use std::os::unix::fs::MetadataExt;
+
+        let run_id = std::env::var("RHIZOME_BARRIER_FAULT_RUN_ID").unwrap();
+        let parsed = uuid::Uuid::parse_str(&run_id).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.to_string(), run_id);
+        let expected_root = std::path::PathBuf::from(format!(
+            "/opt/rhizome/validation/zerofs-barrier-fault/runs/{run_id}"
+        ));
+        let configured_root =
+            std::path::PathBuf::from(std::env::var("RHIZOME_BARRIER_FAULT_RUN_ROOT").unwrap());
+        assert_eq!(configured_root, expected_root);
+        assert_eq!(
+            std::fs::canonicalize(&configured_root).unwrap(),
+            configured_root
+        );
+        let metadata = std::fs::symlink_metadata(&configured_root).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.gid(), 0);
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        let expected_prefix = format!("rhizome/zerofs-barrier-fault/{run_id}");
+        assert_eq!(
+            std::env::var("RHIZOME_BARRIER_S3_PREFIX").unwrap(),
+            expected_prefix
+        );
+        (run_id, configured_root, expected_prefix)
+    }
+
+    fn foundation_fault_store(prefix: &str) -> Arc<dyn ObjectStore> {
+        let bucket = std::env::var("RHIZOME_BARRIER_S3_BUCKET").unwrap();
+        let raw = slatedb::object_store::aws::AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_virtual_hosted_style_request(false)
+            .build()
+            .unwrap();
+        Arc::new(slatedb::object_store::prefix::PrefixStore::new(
+            raw,
+            Path::from(prefix),
+        ))
+    }
+
+    fn scenario_prefix(base: &str, scenario: &str) -> String {
+        assert!(FOUNDATION_FAULT_SCENARIOS.contains(&scenario));
+        format!("{base}/{scenario}")
+    }
+
+    fn context_path(root: &std::path::Path, scenario: &str) -> std::path::PathBuf {
+        root.join(format!("{scenario}.context"))
+    }
+
+    fn recovery_path(root: &std::path::Path, scenario: &str) -> std::path::PathBuf {
+        root.join(format!("{scenario}.recovery"))
+    }
+
+    fn write_new_durable(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    fn read_fault_context(root: &std::path::Path, scenario: &str) -> FoundationFaultContext {
+        let bytes = std::fs::read(context_path(root, scenario)).unwrap();
+        codec().deserialize(&bytes).unwrap()
+    }
+
+    fn persist_fault_context(
+        root: &std::path::Path,
+        scenario: &str,
+        context: &FoundationFaultContext,
+    ) {
+        write_new_durable(
+            &context_path(root, scenario),
+            &codec().serialize(context).unwrap(),
+        );
+    }
+
+    fn install_after_claim_write(fs: &ZeroFS, context: &FoundationFaultContext) {
+        let store = fs.export_authority.clone();
+        let token = context.token.clone();
+        let payload = Bytes::copy_from_slice(&context.payload);
+        let operation_id = context.mutation_operation_id;
+        fs.workspace_barriers
+            .dst_set_after_claim_hook(Arc::new(move || {
+                let store = store.clone();
+                let token = token.clone();
+                let payload = payload.clone();
+                Box::pin(async move {
+                    let outcome = store
+                        .commit_mutation(
+                            ExportMutationBuilder::build(
+                                token,
+                                operation_id,
+                                ExportMutationCommand::Write {
+                                    offset: 0,
+                                    data: payload,
+                                    fua: false,
+                                },
+                            )
+                            .map_err(|_| BarrierError::Invalid)?,
+                        )
+                        .await
+                        .map_err(|_| BarrierError::Storage)?;
+                    (outcome.mutation.sequence == 1)
+                        .then_some(())
+                        .ok_or(BarrierError::Corrupt)
+                })
+            }));
+    }
+
+    async fn foundation_fault_crash_child(scenario: &str) {
+        let (_, root, base_prefix) = foundation_fault_run();
+        assert_eq!(
+            std::env::var("RHIZOME_BARRIER_FAULT_CRASH_POINT").unwrap(),
+            scenario
+        );
+        let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
+        let (fault_store, faults) = crate::fault_store::FaultStore::new(raw_store);
+        let object_store: Arc<dyn ObjectStore> = fault_store;
+        assert!(listed_objects(&object_store).await.is_empty());
+        let fs = open_persistent(object_store).await;
+        let (fs, token, genesis) = initialize_active(fs).await;
+        let request_id = format!("barrier-{scenario}");
+        let mut operation_id: [u8; 32] =
+            Sha256::digest(format!("mutation-{scenario}").as_bytes()).into();
+        operation_id[0] |= 1;
+        let context = FoundationFaultContext {
+            request_digest: Sha256::digest(request_id.as_bytes()).into(),
+            request_id,
+            token,
+            expected_head_digest: head_digest(&initial_head(&genesis).head),
+            storage_shard_id: "test-shard-a".into(),
+            storage_routing_revision: 1,
+            export_inode: genesis.export.inode,
+            payload: b"rhizome-export-data-after-durable-barrier-claim".to_vec(),
+            mutation_operation_id: operation_id,
+        };
+        persist_fault_context(&root, scenario, &context);
+        install_after_claim_write(&fs, &context);
+        if scenario == "manifest-applied-before-response" {
+            let armed_faults = faults.clone();
+            fs.write_coordinator
+                .dst_set_barrier_after_apply_hook(Arc::new(move |receipt| {
+                    arm_foundation_manifest_crash(receipt);
+                    armed_faults.block_manifest_after_apply();
+                }));
+        }
+        let result = fs
+            .workspace_barriers
+            .materialize(VerifiedBarrierInput::for_test(context.command()).unwrap())
+            .await;
+        panic!("crash child returned before SIGKILL: {result:?}");
+    }
+
+    async fn foundation_fault_recovery_child(scenario: &str) {
+        let (_, root, base_prefix) = foundation_fault_run();
+        let context = read_fault_context(&root, scenario);
+        let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
+        let (fault_store, recovery_io) = crate::fault_store::FaultStore::new(raw_store);
+        let object_store: Arc<dyn ObjectStore> = fault_store;
+        let fs = open_persistent_read_only(object_store).await;
+        let command = context.command();
+        let lookup = fs
+            .workspace_barriers
+            .lookup_materialized(&command)
+            .await
+            .unwrap();
+        let operation = fs
+            .workspace_operations
+            .lookup(&command.operation, command.request_digest)
+            .await
+            .unwrap();
+        let WorkspaceOperationLookup::Known(operation) = operation else {
+            panic!("durable barrier claim is absent");
+        };
+        let WorkspaceOperationState::EffectDispatched(_) = operation.state else {
+            panic!("crash recovery must retain the exact effect-dispatch claim");
+        };
+        let bytes = fs
+            .extent_store
+            .read(context.export_inode, 0, context.payload.len() as u64)
+            .await
+            .unwrap();
+        let (outcome, receipt_digest, included_sequence, payload_state) = match scenario {
+            "before-data-cut" => {
+                assert!(lookup.is_none());
+                assert_eq!(bytes, Bytes::from(vec![0; context.payload.len()]));
+                ("unknown", "none".to_string(), 0, "absent")
+            }
+            "after-0x0d-apply" => {
+                assert!(lookup.is_none());
+                assert_eq!(bytes.as_ref(), context.payload.as_slice());
+                ("unknown", "none".to_string(), 0, "durable")
+            }
+            "manifest-applied-before-response" | "after-manifest-publish" => {
+                let receipt = lookup.expect("published manifest must expose exact barrier");
+                assert_eq!(receipt.included_write_sequence, 1);
+                assert_eq!(bytes.as_ref(), context.payload.as_slice());
+                (
+                    "materialized",
+                    lower_hex(&receipt.receipt_digest),
+                    receipt.included_write_sequence,
+                    "durable",
+                )
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(recovery_io.put_count(), 0);
+        write_new_durable(
+            &recovery_path(&root, scenario),
+            format!(
+                "schema=1\nscenario={scenario}\noutcome={outcome}\nrequest_digest={}\nincluded_write_sequence={included_sequence}\nreceipt_digest={receipt_digest}\npayload={payload_state}\nrecovery_puts=0\n",
+                lower_hex(&context.request_digest),
+            )
+            .as_bytes(),
+        );
+        drop(fs);
+    }
+
+    struct KillJoinChild(Option<std::process::Child>);
+
+    impl KillJoinChild {
+        fn child(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().unwrap()
+        }
+
+        fn kill_and_wait(&mut self) -> std::process::ExitStatus {
+            let mut child = self.0.take().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap()
+        }
+
+        fn wait(&mut self) -> std::process::ExitStatus {
+            self.0.take().unwrap().wait().unwrap()
+        }
+    }
+
+    impl Drop for KillJoinChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn spawn_fault_child(mode: &str, scenario: &str) -> KillJoinChild {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(FOUNDATION_FAULT_TEST)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(FOUNDATION_FAULT_CHILD, mode)
+            .env("RHIZOME_BARRIER_FAULT_SCENARIO", scenario)
+            .env("RHIZOME_BARRIER_FAULT_CRASH_POINT", scenario)
+            .spawn()
+            .unwrap();
+        KillJoinChild(Some(child))
+    }
+
+    fn wait_for_fault_handshake(
+        root: &std::path::Path,
+        scenario: &str,
+        child: &mut std::process::Child,
+    ) -> String {
+        let child_pid = child.id();
+        let marker = root.join(format!("{scenario}.handshake"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match std::fs::read_to_string(&marker) {
+                Ok(contents) => {
+                    assert!(contents.contains(&format!("scenario={scenario}\n")));
+                    assert!(contents.contains(&format!("point={scenario}\n")));
+                    assert!(contents.contains(&format!("pid={child_pid}\n")));
+                    assert!(contents.contains("included_write_sequence=1\n"));
+                    return contents;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read handshake: {error}"),
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("fault child exited before handshake: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for exact crash handshake"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn handshake_value<'a>(handshake: &'a str, field: &str) -> &'a str {
+        handshake
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}=")))
+            .expect("handshake field is present")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires an explicitly configured isolated Foundation RustFS run"]
+    #[tokio::test]
+    async fn foundation_rustfs_process_fault_matrix() {
+        use futures::FutureExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Ok(mode) = std::env::var(FOUNDATION_FAULT_CHILD) {
+            let scenario = std::env::var("RHIZOME_BARRIER_FAULT_SCENARIO").unwrap();
+            assert!(FOUNDATION_FAULT_SCENARIOS.contains(&scenario.as_str()));
+            match mode.as_str() {
+                "crash" => foundation_fault_crash_child(&scenario).await,
+                "recover" => foundation_fault_recovery_child(&scenario).await,
+                _ => panic!("unsupported Foundation fault child mode"),
+            }
+            return;
+        }
+
+        let (_, root, base_prefix) = foundation_fault_run();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let base_store = foundation_fault_store(&base_prefix);
+        assert!(listed_objects(&base_store).await.is_empty());
+
+        let run = std::panic::AssertUnwindSafe(async {
+            for scenario in FOUNDATION_FAULT_SCENARIOS {
+                let mut crash = spawn_fault_child("crash", scenario);
+                let handshake = wait_for_fault_handshake(&root, scenario, crash.child());
+                let context = read_fault_context(&root, scenario);
+                assert!(handshake.contains(&format!(
+                    "request_digest={}\n",
+                    lower_hex(&context.request_digest)
+                )));
+                match scenario {
+                    "before-data-cut" => {
+                        assert!(handshake.contains("receipt_digest=none\n"));
+                    }
+                    _ => assert!(!handshake.contains("receipt_digest=none\n")),
+                }
+                let status = crash.kill_and_wait();
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+                let mut recovery = spawn_fault_child("recover", scenario);
+                let recovery_status = recovery.wait();
+                assert!(recovery_status.success());
+                let recovery_result =
+                    std::fs::read_to_string(recovery_path(&root, scenario)).unwrap();
+                assert!(recovery_result.contains(&format!("scenario={scenario}\n")));
+                assert!(recovery_result.contains("recovery_puts=0\n"));
+                match scenario {
+                    "before-data-cut" => {
+                        assert!(recovery_result.contains("outcome=unknown\n"));
+                        assert!(recovery_result.contains("payload=absent\n"));
+                    }
+                    "after-0x0d-apply" => {
+                        assert!(recovery_result.contains("outcome=unknown\n"));
+                        assert!(recovery_result.contains("payload=durable\n"));
+                    }
+                    "manifest-applied-before-response" | "after-manifest-publish" => {
+                        assert!(recovery_result.contains("outcome=materialized\n"));
+                        assert!(recovery_result.contains("included_write_sequence=1\n"));
+                        assert!(recovery_result.contains("payload=durable\n"));
+                        assert!(recovery_result.contains(&format!(
+                            "receipt_digest={}\n",
+                            handshake_value(&handshake, "receipt_digest")
+                        )));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let inventory = listed_objects(&base_store).await;
+            assert!(inventory.len() <= 512);
+            let total_bytes = {
+                let mut total = 0u64;
+                for location in &inventory {
+                    total = total
+                        .checked_add(base_store.head(location).await.unwrap().size)
+                        .unwrap();
+                }
+                total
+            };
+            assert!(total_bytes <= 64 * 1024 * 1024);
+        })
+        .catch_unwind()
+        .await;
+
+        for object in listed_objects(&base_store).await {
+            base_store.delete(&object).await.unwrap();
+        }
+        assert!(
+            listed_objects(&base_store).await.is_empty(),
+            "Foundation fault prefix must be empty after exact cleanup"
+        );
+        let mut names = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .into_string()
+                    .expect("artifact names are UTF-8")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut expected = FOUNDATION_FAULT_SCENARIOS
+            .iter()
+            .flat_map(|scenario| {
+                [
+                    format!("{scenario}.context"),
+                    format!("{scenario}.handshake"),
+                    format!("{scenario}.recovery"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(names, expected);
+        if let Err(payload) = run {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     /// Explicitly invoked against the retained Foundation RustFS endpoint.
     /// This is a clean-close/cold-reopen smoke, not a SIGKILL or response-loss
     /// qualification. Credentials remain in the object_store standard AWS
@@ -1757,12 +2499,44 @@ mod tests {
 
         let fs = open_persistent(prefixed.clone()).await;
         let (fs, token, genesis) = initialize_active(fs).await;
+        let payload = Bytes::from_static(b"rhizome-foundation-rustfs-export-data");
+        let mutation_store = fs.export_authority.clone();
+        let mutation_token = token.clone();
+        let mutation_payload = payload.clone();
+        fs.workspace_barriers
+            .dst_set_after_claim_hook(Arc::new(move || {
+                let store = mutation_store.clone();
+                let token = mutation_token.clone();
+                let payload = mutation_payload.clone();
+                Box::pin(async move {
+                    let mutation = store
+                        .commit_mutation(
+                            ExportMutationBuilder::build(
+                                token,
+                                [0x53; 32],
+                                ExportMutationCommand::Write {
+                                    offset: 0,
+                                    data: payload,
+                                    fua: false,
+                                },
+                            )
+                            .map_err(|_| BarrierError::Invalid)?,
+                        )
+                        .await
+                        .map_err(|_| BarrierError::Storage)?;
+                    if mutation.mutation.sequence != 1 {
+                        return Err(BarrierError::Corrupt);
+                    }
+                    Ok(())
+                })
+            }));
         let command = command(
             "barrier-foundation-rustfs",
             &token,
             head_digest(&initial_head(&genesis).head),
         );
         let receipt = materialize(&fs, command.clone()).await;
+        assert_eq!(receipt.included_write_sequence, 1);
         complete_barrier(&fs, command.clone(), receipt.clone()).await;
         fs.flush_coordinator.close().await.unwrap();
         drop(fs);
@@ -1775,6 +2549,14 @@ mod tests {
                 .await
                 .unwrap(),
             Some(receipt.clone())
+        );
+        assert_eq!(
+            reopened
+                .extent_store
+                .read(genesis.export.inode, 0, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload
         );
         reopened.flush_coordinator.close().await.unwrap();
         drop(reopened);

@@ -267,3 +267,19 @@ attribution intact.
   credential environment, process-scoped TLS trust, exact-prefix cleanup, and
   an empty final inventory. Never cite it as SIGKILL, response-loss, NBD,
   Firecracker, production signer, or external-S3 qualification.
+- The Linux-only Foundation barrier fault matrix is test-only and must remain
+  default-ignored. Its real export Write must occur after the durable 0x0A
+  dispatch claim through the one-shot after-claim hook; a pre-materialize Write
+  is invalid evidence because PENDING/claim globally flush it first.
+- Process crash decisions require an exact durable handshake from the named
+  coordinator/object-store boundary and child PID followed by SIGKILL+join;
+  never use sleeps, PUT ordinals, logs, or function-return failpoints to guess a
+  crash window. The manifest response-loss boundary must block after the real
+  inner manifest PUT succeeds and before SlateDB observes a response.
+- Cold fault recovery is read-only: use DbReader and remote-durable graph/data
+  reads, assert zero object-store PUTs, and drop the reader. Never open an RW
+  writer, call materialize, or close/flush during recovery.
+- Each Foundation scenario uses its own child and exact UUID-prefixed S3
+  namespace. Enforce the pre-run empty inventory, 512-object/64-MiB cap,
+  exact-prefix deletion, final empty inventory, and kill/join cleanup before
+  any real effect. Do not execute an unreviewed harness.

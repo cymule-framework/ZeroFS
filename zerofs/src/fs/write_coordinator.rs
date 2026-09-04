@@ -69,6 +69,9 @@ type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
+#[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+type BarrierAfterApplyHook = Arc<dyn Fn(&BarrierDurabilityReceipt) + Send + Sync>;
+
 enum SequencingGuard {
     Workspace {
         _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -229,6 +232,8 @@ struct WorkspaceDurableTestHook {
     entered_barrier_after_cut: tokio::sync::Notify,
     #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
     release_barrier_after_cut: tokio::sync::Notify,
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    barrier_after_apply_hook: std::sync::Mutex<Option<BarrierAfterApplyHook>>,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
     pause_export_after_permit: std::sync::atomic::AtomicBool,
     #[cfg(all(feature = "rhizome-export-authority-core", test))]
@@ -843,6 +848,16 @@ impl WriteCoordinator {
         self.workspace_durable_test_hook
             .release_barrier_after_cut
             .notify_one();
+    }
+
+    #[cfg(all(feature = "rhizome-workspace-barrier-core", test))]
+    pub(crate) fn dst_set_barrier_after_apply_hook(&self, hook: BarrierAfterApplyHook) {
+        let mut installed = self
+            .workspace_durable_test_hook
+            .barrier_after_apply_hook
+            .lock()
+            .unwrap();
+        assert!(installed.replace(hook).is_none());
     }
 
     /// Wait until every commit submitted before this call has finished,
@@ -1863,6 +1878,14 @@ async fn commit_workspace_barrier(
     // This is the single data cut. Segment sealing finishes before the
     // manifest PUT, and the returned status snapshot names that exact durable
     // manifest. No retry is permitted after the durable dispatch claim.
+    #[cfg(test)]
+    crate::fs::workspace_barrier::foundation_process_crash_point(
+        "before-data-cut",
+        &request.command,
+        included_write_sequence,
+        None,
+    )
+    .await;
     ctx.flush_coordinator
         .flush()
         .await
@@ -2003,10 +2026,36 @@ async fn commit_workspace_barrier(
         .write_with_options(batch, &WriteOptions::default())
         .await
         .map_err(|_| BarrierError::CommitOutcomeUnknown)?;
+    #[cfg(test)]
+    if let Some(hook) = ctx
+        .workspace_durable_test_hook
+        .barrier_after_apply_hook
+        .lock()
+        .unwrap()
+        .take()
+    {
+        hook(&receipt);
+    }
+    #[cfg(test)]
+    crate::fs::workspace_barrier::foundation_process_crash_point(
+        "after-0x0d-apply",
+        &request.command,
+        included_write_sequence,
+        Some(&receipt),
+    )
+    .await;
     ctx.flush_coordinator
         .flush()
         .await
         .map_err(|_| BarrierError::CommitOutcomeUnknown)?;
+    #[cfg(test)]
+    crate::fs::workspace_barrier::foundation_process_crash_point(
+        "after-manifest-publish",
+        &request.command,
+        included_write_sequence,
+        Some(&receipt),
+    )
+    .await;
 
     let durable_receipt = ctx
         .db

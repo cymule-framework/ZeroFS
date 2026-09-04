@@ -139,3 +139,67 @@ Even when it passes against RustFS, this test proves only a clean-close/cold-
 reopen integration smoke for that exact endpoint and prefix. It contains no
 SIGKILL, power-loss, response-loss, NBD, Firecracker, production capability, or
 signed receipt evidence and must not be cited for those properties.
+
+## Export-data and process-fault harness candidate
+
+The ignored Linux-only
+`fs::workspace_barrier::tests::foundation_rustfs_process_fault_matrix` advances
+the next evidence gate without changing the production surface. It runs only
+with an operator-created root-owned `0700` run directory whose basename is the
+same canonical UUIDv4 used by the exact
+`rhizome/zerofs-barrier-fault/<uuid>` S3 prefix. Partial or mismatched
+configuration fails before an object-store mutation.
+
+The harness uses production-coordinated SlateDB settings: WAL, periodic flush,
+compactor, and garbage collector are disabled; automatic size flush thresholds
+are moved to the coordinated maxima; the writer store is wrapped by the shared
+`ManifestPublicationStore`; and ZeroFS's `FlushCoordinator` owns the only
+seal-plus-manifest barrier.
+
+A test-only one-shot hook runs only after the barrier's 0x0A effect-dispatch
+claim is remote durable. It commits one real buffered export `Write` through the
+typed `ExportMutationBuilder`, requires coordinator sequence 1, and then lets
+the barrier continue. Thus earlier PENDING/claim flushes cannot make the
+barrier's data cut a no-op. The resulting receipt must include write sequence 1,
+and cold recovery verifies the exact payload from the segment store.
+
+Each process-crash scenario has its own child process and S3 sub-prefix. A
+root-only durable context plus an exact handshake binds run/scenario, child PID,
+request digest, included sequence, and expected receipt digest. The parent
+kills only after reading that handshake and must observe `SIGKILL`; a child
+guard kills and joins on every parent failure path.
+
+The closed scenarios are:
+
+- `before-data-cut`: after the real buffered Write and complete admission, but
+  before the sole barrier flush; read-only recovery requires the durable 0x0A
+  claim, no 0x0D materialization, and an absent payload;
+- `after-0x0d-apply`: after the atomic current/version/receipt batch applies
+  locally but before its manifest flush; read-only recovery requires the claim,
+  no 0x0D materialization, and the payload made durable by the earlier data cut;
+- `manifest-applied-before-response`: a test-only object-store decorator is
+  armed only after the 0x0D local apply, delegates the next exact manifest PUT
+  to real S3, emits the handshake only after that PUT succeeds, and then blocks
+  without returning to SlateDB until SIGKILL;
+- `after-manifest-publish`: after the final flush returns but before caller
+  readback/reply; recovery requires the exact materialization and payload.
+
+Every recovery opens a SlateDB `DbReader`/read-only ZeroFS handle, performs only
+remote-durable operation/head/receipt and extent reads, asserts the object-store
+PUT count remains zero, and drops the reader. It never opens an RW writer,
+calls `materialize`, retries a barrier, or invokes `close`/flush.
+
+The parent bounds the retained S3 inventory to 512 objects and 64 MiB, deletes
+only paths returned through its exact `PrefixStore`, and requires the final
+prefix to be empty. Context, handshake, and recovery records are intentionally
+retained in the operator run directory for later evidence hashing.
+
+The ordinary unit suite separately verifies an applied manifest response error
+against a real coordinated SlateDB stack and exact read-only recovery. That is
+algorithm evidence only; the process harness's post-apply blocker is the
+Foundation response-loss/SIGKILL boundary.
+
+This harness remains **unexecuted** until its exact source commit passes both
+storage/unknown-outcome and authority/fencing review. Even after a pass it is
+not NBD FLUSH, Firecracker, production COSE/receipt, external-production-S3,
+power-loss, HA, release, or Actor READY evidence.

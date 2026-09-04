@@ -27,6 +27,13 @@ pub struct FaultControls {
     fail_next_puts: AtomicUsize,
     /// Apply the next N `put` calls, then return a transient response error.
     fail_after_puts: AtomicUsize,
+    /// Apply the next N SlateDB manifest PUTs, then return a transient response
+    /// error. Non-manifest objects do not consume this budget.
+    fail_after_manifest_puts: AtomicUsize,
+    manifest_puts: AtomicUsize,
+    manifest_response_losses: AtomicUsize,
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    block_next_manifest_after_apply: AtomicBool,
     /// Return a body `truncate_bytes` short of the claimed length on the next N gets.
     truncate_next_gets: AtomicUsize,
     truncate_bytes: AtomicUsize,
@@ -47,6 +54,9 @@ impl FaultControls {
     pub fn fail_puts_after_apply(&self, n: usize) {
         self.fail_after_puts.store(n, Ordering::SeqCst);
     }
+    pub fn fail_manifest_puts_after_apply(&self, n: usize) {
+        self.fail_after_manifest_puts.store(n, Ordering::SeqCst);
+    }
     /// Make the next `n` gets return a body `by` bytes short of the claimed length.
     pub fn truncate_gets(&self, n: usize, by: usize) {
         self.truncate_bytes.store(by, Ordering::SeqCst);
@@ -57,6 +67,22 @@ impl FaultControls {
     }
     pub fn put_count(&self) -> usize {
         self.puts.load(Ordering::SeqCst)
+    }
+    pub fn manifest_put_count(&self) -> usize {
+        self.manifest_puts.load(Ordering::SeqCst)
+    }
+    pub fn manifest_response_loss_count(&self) -> usize {
+        self.manifest_response_losses.load(Ordering::SeqCst)
+    }
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    #[allow(dead_code)]
+    pub(crate) fn block_manifest_after_apply(&self) {
+        assert!(
+            !self
+                .block_next_manifest_after_apply
+                .swap(true, Ordering::SeqCst),
+            "manifest post-apply blocker already armed"
+        );
     }
 }
 
@@ -121,12 +147,32 @@ impl ObjectStore for FaultStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
+        let is_manifest = location.extension() == Some("manifest");
+        if is_manifest {
+            self.ctl.manifest_puts.fetch_add(1, Ordering::SeqCst);
+        }
         self.check_writable("put")?;
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }
         let result = self.inner.put_opts(location, payload, opts).await?;
-        if take_one(&self.ctl.fail_after_puts) {
+        #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+        if is_manifest
+            && self
+                .ctl
+                .block_next_manifest_after_apply
+                .swap(false, Ordering::SeqCst)
+        {
+            crate::fs::workspace_barrier::foundation_manifest_applied_before_response().await;
+        }
+        let generic_response_loss = take_one(&self.ctl.fail_after_puts);
+        let manifest_response_loss = is_manifest && take_one(&self.ctl.fail_after_manifest_puts);
+        if manifest_response_loss {
+            self.ctl
+                .manifest_response_losses
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if generic_response_loss || manifest_response_loss {
             return Err(Self::transient("put response"));
         }
         Ok(result)
@@ -280,6 +326,29 @@ mod tests {
         assert_eq!(
             store.get(&path).await.unwrap().bytes().await.unwrap().len(),
             100
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_response_loss_does_not_consume_on_other_puts() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        ctl.fail_manifest_puts_after_apply(1);
+        store
+            .put(&Path::from("segment/1"), b"segment".to_vec().into())
+            .await
+            .unwrap();
+        let manifest = Path::from("db/manifest/00000000000000000001.manifest");
+        assert!(
+            store
+                .put(&manifest, b"manifest".to_vec().into())
+                .await
+                .is_err()
+        );
+        assert_eq!(ctl.manifest_put_count(), 1);
+        assert_eq!(ctl.manifest_response_loss_count(), 1);
+        assert_eq!(
+            store.get(&manifest).await.unwrap().bytes().await.unwrap(),
+            bytes::Bytes::from_static(b"manifest")
         );
     }
 }
