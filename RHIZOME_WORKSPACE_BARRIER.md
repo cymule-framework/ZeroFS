@@ -200,7 +200,11 @@ collector itself; all three are required before the first S3 access.
 
 `zerofs/scripts/run-rhizome-barrier-foundation.sh` is the versioned inner
 systemd runner. Before the test can touch S3 it verifies the fresh root/evidence
-directories and durably burns the UUID with a no-replace attempt receipt. It
+directories, acquires a nonblocking process-lifetime flock on the stable
+evidence-root directory description, and durably burns the UUID with a
+no-replace attempt receipt. The attempt and preflight bind that directory's
+device/inode identity. A concurrent or repeated runner therefore exits before
+creating a pending artifact. It
 seals the clean source tree, exact test executable and build
 record, `rustc`/`cargo` binaries plus the complete sysroot file manifest, runner
 and terminal-collector hashes, Linux boot, supervisor cgroup, and RustFS PID,
@@ -217,7 +221,11 @@ manifest. `collect-rhizome-barrier-foundation.sh` verifies the runner/run
 manifests after the transient unit is collected. It independently holds stable
 collector, preflight, attempt, CA, backend executable and unit descriptions;
 publishes a root-level no-replace collector-attempt receipt before creating any
-terminal directory;
+terminal directory; and holds the same evidence-root flock while requiring the
+exact sealed runner inventory. Concurrent collection cannot race publication,
+and a repeated collector after terminal sealing exits before modifying the
+evidence tree. The final pre-seal inventory rejects every unknown or pending
+artifact.
 requires exact START/END records in a non-empty journal for the sealed systemd
 Invocation/cgroup; revalidates the live RustFS process, unit and listener before
 and after the final empty S3 inventory; and proves the transient cgroup is absent.

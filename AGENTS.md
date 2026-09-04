@@ -307,6 +307,14 @@ attribution intact.
   no-follow file descriptions before constructing an object-store client or
   issuing any S3 read; a matching exit pathname or digest alone is insufficient.
 - Use the versioned Foundation runner and terminal collector. The runner must
+  acquire one nonblocking process-lifetime flock on the stable evidence-root
+  directory description before inspecting freshness or publishing its attempt;
+  the collector uses the same lock and rejects the exact pre-collector
+  inventory before its first write. Bind that directory identity through the
+  runner attempt/preflight, collector attempt and final seal. A concurrent or
+  repeated runner/collector must fail before creating any file, and every
+  pre-seal inventory must reject unknown or pending artifacts.
+  The runner must
   seal complete pre-effect source/build/toolchain/collector and non-secret
   backend process-generation identity, recheck the backend generation after the
   matrix, hold stable file descriptions for its executable inputs, backend

@@ -33,9 +33,7 @@ EXPECTED_UNIT="zerofs-barrier-fault-$RUN_ID.service"
 [[ $RHIZOME_BARRIER_FAULT_RUN_ROOT == "$EXPECTED_ROOT" ]]
 [[ $RHIZOME_BARRIER_FAULT_EVIDENCE_ROOT == "$EXPECTED_EVIDENCE" ]]
 [[ $(stat -c '%a:%U:%G' "$EXPECTED_ROOT") == 700:root:root ]]
-[[ $(find "$EXPECTED_ROOT" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
 [[ $(stat -c '%a:%U:%G' "$EXPECTED_EVIDENCE") == 700:root:root ]]
-[[ $(find "$EXPECTED_EVIDENCE" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
 python3 - "$EXPECTED_ROOT" "$EXPECTED_EVIDENCE" <<'PY'
 import os,stat,sys
 for path in sys.argv[1:]:
@@ -47,6 +45,13 @@ for path in sys.argv[1:]:
         assert not stat.S_ISLNK(info.st_mode)
     assert stat.S_ISDIR(os.lstat(path).st_mode)
 PY
+exec {RUN_OWNER_FD}<"$EXPECTED_EVIDENCE"
+flock -n "$RUN_OWNER_FD"
+RUN_OWNER_FD_PATH="/proc/self/fd/$RUN_OWNER_FD"
+EVIDENCE_ROOT_DEVICE_INODE=$(stat -Lc '%d:%i' "$RUN_OWNER_FD_PATH")
+[[ $(stat -Lc '%d:%i' "$EXPECTED_EVIDENCE") == "$EVIDENCE_ROOT_DEVICE_INODE" ]]
+[[ $(find "$EXPECTED_ROOT" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
+[[ $(find "$EXPECTED_EVIDENCE" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
 
 SELF_START=$(python3 - $$ <<'PY'
 import sys
@@ -57,10 +62,10 @@ PY
 ATTEMPT_BOOT_ID=$(tr -d '\n' </proc/sys/kernel/random/boot_id)
 ATTEMPT="$EXPECTED_EVIDENCE/attempt.receipt"
 ATTEMPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-python3 - "$ATTEMPT.pending" "$RUN_ID" "$$" "$SELF_START" "$ATTEMPT_BOOT_ID" "$EXPECTED_UNIT" "$ATTEMPTED_AT" <<'PY'
+python3 - "$ATTEMPT.pending" "$RUN_ID" "$$" "$SELF_START" "$ATTEMPT_BOOT_ID" "$EXPECTED_UNIT" "$EVIDENCE_ROOT_DEVICE_INODE" "$ATTEMPTED_AT" <<'PY'
 import os,sys
-path,run,pid,start,boot,unit,when=sys.argv[1:]
-data=f'schema=1\nrun_id={run}\nrunner_pid={pid}\nrunner_pid_start_time_ticks={start}\nlinux_boot_id={boot}\nsupervisor_unit={unit}\nattempted_at_utc={when}\n'.encode()
+path,run,pid,start,boot,unit,evidence,when=sys.argv[1:]
+data=f'schema=1\nrun_id={run}\nrunner_pid={pid}\nrunner_pid_start_time_ticks={start}\nlinux_boot_id={boot}\nsupervisor_unit={unit}\nevidence_root_device_inode={evidence}\nattempted_at_utc={when}\n'.encode()
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
 try:
     view=memoryview(data)
@@ -272,6 +277,7 @@ cat >"$PREFLIGHT.pending" <<EOF
 schema=1
 run_id=$RUN_ID
 attempt_receipt_sha256=$(sha256sum "$ATTEMPT" | cut -d' ' -f1)
+evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
 source_commit=$SOURCE_COMMIT
 source_tree=$SOURCE_TREE
 source_clean=true
@@ -371,6 +377,8 @@ fi
 if [[ $(git -C "$SOURCE" rev-parse HEAD) != "$SOURCE_COMMIT" || \
       $(git -C "$SOURCE" rev-parse 'HEAD^{tree}') != "$SOURCE_TREE" || \
       $(git -C "$SOURCE" status --porcelain=v1 | wc -l) != 0 || \
+      $(stat -Lc '%d:%i' "$RUN_OWNER_FD_PATH") != "$EVIDENCE_ROOT_DEVICE_INODE" || \
+      $(stat -Lc '%d:%i' "$EXPECTED_EVIDENCE") != "$EVIDENCE_ROOT_DEVICE_INODE" || \
       $(sha256sum "$SELF_FD_PATH" | cut -d' ' -f1) != "$RUNNER_SHA" || \
       $(stat -Lc '%d:%i:%s' "$SELF_FD_PATH") != "$RUNNER_IDENTITY" || \
       $(stat -Lc '%d:%i:%s' "$SELF") != "$RUNNER_IDENTITY" || \
@@ -426,6 +434,7 @@ find "$EXPECTED_ROOT" -maxdepth 1 -type f -exec sync -f {} \;
 find "$EVIDENCE" -maxdepth 1 -type f ! -name SHA256SUMS ! -name RUN-SHA256SUMS -exec sync -f {} \;
 sync -f "$EXPECTED_ROOT"
 sync -f "$EVIDENCE"
+[[ $(find "$EXPECTED_ROOT" "$EVIDENCE" -type f -name '*.pending' | wc -l) == 0 ]]
 find "$EXPECTED_ROOT" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum >"$EVIDENCE/RUN-SHA256SUMS.pending"
 sync -f "$EVIDENCE/RUN-SHA256SUMS.pending"
 ln "$EVIDENCE/RUN-SHA256SUMS.pending" "$EVIDENCE/RUN-SHA256SUMS"

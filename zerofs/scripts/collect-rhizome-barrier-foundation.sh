@@ -25,6 +25,23 @@ for path in sys.argv[1:]:
         assert not stat.S_ISLNK(info.st_mode)
     assert stat.S_ISDIR(os.lstat(path).st_mode)
 PY
+exec {COLLECTOR_OWNER_FD}<"$EVIDENCE_ROOT"
+flock -n "$COLLECTOR_OWNER_FD"
+COLLECTOR_OWNER_FD_PATH="/proc/self/fd/$COLLECTOR_OWNER_FD"
+EVIDENCE_ROOT_DEVICE_INODE=$(stat -Lc '%d:%i' "$COLLECTOR_OWNER_FD_PATH")
+[[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT") == "$EVIDENCE_ROOT_DEVICE_INODE" ]]
+python3 - "$EVIDENCE_ROOT" <<'PY'
+import os,stat,sys
+root=sys.argv[1]
+expected={'attempt.receipt','preflight.receipt','toolchain-tree.sha256','test.log','exit-code',
+          'status','RUN-SHA256SUMS','SHA256SUMS'}
+actual=set(os.listdir(root)); assert actual==expected,(actual,expected)
+for name in actual:
+    info=os.lstat(os.path.join(root,name))
+    assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_gid==0
+    assert stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1
+assert open(os.path.join(root,'status')).read()=='BEHAVIOR_PASS_AWAITING_TERMINAL_COLLECTION\n'
+PY
 COLLECTOR=$(readlink -f "$0")
 exec {COLLECTOR_FD}<"$COLLECTOR"
 COLLECTOR_FD_PATH="/proc/self/fd/$COLLECTOR_FD"
@@ -49,10 +66,10 @@ PY
 COLLECTOR_BOOT=$(tr -d '\n' </proc/sys/kernel/random/boot_id)
 COLLECTOR_ATTEMPT="$EVIDENCE_ROOT/collector-attempt.receipt"
 COLLECTOR_ATTEMPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-python3 - "$COLLECTOR_ATTEMPT.pending" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" "$COLLECTOR_ATTEMPTED_AT" <<'PY'
+python3 - "$COLLECTOR_ATTEMPT.pending" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" "$EVIDENCE_ROOT_DEVICE_INODE" "$COLLECTOR_ATTEMPTED_AT" <<'PY'
 import os,sys
-path,run,pid,start,boot,digest,identity,when=sys.argv[1:]
-data=f'schema=1\nrun_id={run}\ncollector_pid={pid}\ncollector_pid_start_time_ticks={start}\nlinux_boot_id={boot}\ncollector_sha256={digest}\ncollector_device_inode_size={identity}\nattempted_at_utc={when}\n'.encode()
+path,run,pid,start,boot,digest,identity,evidence,when=sys.argv[1:]
+data=f'schema=1\nrun_id={run}\ncollector_pid={pid}\ncollector_pid_start_time_ticks={start}\nlinux_boot_id={boot}\ncollector_sha256={digest}\ncollector_device_inode_size={identity}\nevidence_root_device_inode={evidence}\nattempted_at_utc={when}\n'.encode()
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
 try:
     view=memoryview(data)
@@ -101,7 +118,7 @@ for path in (source,attempt):
     assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_gid==0
     assert stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1
 expected={
-'schema','run_id','attempt_receipt_sha256','source_commit','source_tree','source_clean','test_executable_sha256',
+'schema','run_id','attempt_receipt_sha256','evidence_root_device_inode','source_commit','source_tree','source_clean','test_executable_sha256',
 'test_executable_device_inode_size','test_executable_fd_number','build_record_sha256','build_record_device_inode_size','rustc_version','rustc_sha256',
 'rustc_device_inode_size','cargo_version','cargo_sha256','cargo_device_inode_size','toolchain_tree_sha256',
 'runner_sha256','runner_device_inode_size','runner_pid','runner_pid_start_time_ticks',
@@ -120,14 +137,15 @@ assert set(d)==expected
 attempt_fields={}; attempt_raw=open(attempt,'rb').read(); attempt_text=attempt_raw.decode(); assert attempt_text.endswith('\n')
 for line in attempt_text.splitlines():
     key,value=line.split('=',1)
-    assert key in {'schema','run_id','runner_pid','runner_pid_start_time_ticks','linux_boot_id','supervisor_unit','attempted_at_utc'}
+    assert key in {'schema','run_id','runner_pid','runner_pid_start_time_ticks','linux_boot_id','supervisor_unit','evidence_root_device_inode','attempted_at_utc'}
     assert key not in attempt_fields and value and '=' not in value
     attempt_fields[key]=value
-assert set(attempt_fields)=={'schema','run_id','runner_pid','runner_pid_start_time_ticks','linux_boot_id','supervisor_unit','attempted_at_utc'}
+assert set(attempt_fields)=={'schema','run_id','runner_pid','runner_pid_start_time_ticks','linux_boot_id','supervisor_unit','evidence_root_device_inode','attempted_at_utc'}
 assert d['schema']=='1' and d['run_id']==run and d['source_clean']=='true'
 assert attempt_fields['schema']=='1' and attempt_fields['run_id']==run
 assert attempt_fields['runner_pid']==d['runner_pid'] and attempt_fields['runner_pid_start_time_ticks']==d['runner_pid_start_time_ticks']
 assert attempt_fields['linux_boot_id']==d['linux_boot_id'] and attempt_fields['supervisor_unit']==d['supervisor_unit']
+assert attempt_fields['evidence_root_device_inode']==d['evidence_root_device_inode']
 assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',attempt_fields['attempted_at_utc'])
 assert hashlib.sha256(attempt_raw).hexdigest()==d['attempt_receipt_sha256']
 assert d['supervisor_unit']==f'zerofs-barrier-fault-{run}.service'
@@ -136,6 +154,7 @@ assert re.fullmatch(r'[0-9a-f]{32}',d['supervisor_invocation_id'])
 assert d['supervisor_main_pid']==d['runner_pid'] and int(d['runner_pid']) > 1
 assert d['supervisor_cgroup'].startswith('/') and '..' not in d['supervisor_cgroup'] and '//' not in d['supervisor_cgroup']
 assert d['supervisor_cgroup'].endswith('/'+d['supervisor_unit'])
+assert re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*',d['evidence_root_device_inode'])
 assert d['endpoint_origin']=='https://127.0.0.1:19000' and d['addressing']=='path'
 assert d['prefix']==f'rhizome/zerofs-barrier-fault/{run}' and d['credential_values_recorded']=='false'
 for key in ('attempt_receipt_sha256','test_executable_sha256','build_record_sha256','rustc_sha256','cargo_sha256',
@@ -148,6 +167,7 @@ for key in ('test_executable_device_inode_size','build_record_device_inode_size'
     assert re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*',d[key]),(key,d[key])
 open(output,'x').write('\n'.join(f'{key}={d[key]}' for key in (
 'run_id','attempt_receipt_sha256','supervisor_unit','supervisor_cgroup','supervisor_invocation_id',
+'evidence_root_device_inode',
 'terminal_collector_sha256','terminal_collector_device_inode_size','backend_unit','backend_main_pid',
 'backend_pid_start_time_ticks','backend_linux_boot_id','backend_invocation_id','backend_cgroup',
 'backend_fragment_path','backend_executable_device_inode','backend_listener_socket_inode',
@@ -162,17 +182,18 @@ field() { awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2) }' 
 INVOCATION_ID=$(field supervisor_invocation_id)
 SUPERVISOR_CGROUP=$(field supervisor_cgroup)
 EXPECTED_HASH=$(field terminal_collector_sha256)
+[[ $(field evidence_root_device_inode) == "$EVIDENCE_ROOT_DEVICE_INODE" ]]
 [[ $COLLECTOR_SHA == "$EXPECTED_HASH" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH") == "$(field terminal_collector_device_inode_size)" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR") == "$(field terminal_collector_device_inode_size)" ]]
 [[ $(sha256sum "$COLLECTOR_ATTEMPT_FD_PATH" | cut -d' ' -f1) == "$COLLECTOR_ATTEMPT_SHA" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_ATTEMPT_FD_PATH") == "$COLLECTOR_ATTEMPT_IDENTITY" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_ATTEMPT") == "$COLLECTOR_ATTEMPT_IDENTITY" ]]
-python3 - "$COLLECTOR_ATTEMPT_FD_PATH" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" <<'PY'
+python3 - "$COLLECTOR_ATTEMPT_FD_PATH" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" "$EVIDENCE_ROOT_DEVICE_INODE" <<'PY'
 import re,sys
-path,run,pid,start,boot,digest,identity=sys.argv[1:]
+path,run,pid,start,boot,digest,identity,evidence=sys.argv[1:]
 expected={'schema','run_id','collector_pid','collector_pid_start_time_ticks','linux_boot_id',
-          'collector_sha256','collector_device_inode_size','attempted_at_utc'}
+          'collector_sha256','collector_device_inode_size','evidence_root_device_inode','attempted_at_utc'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
@@ -181,6 +202,7 @@ assert set(values)==expected and values['schema']=='1' and values['run_id']==run
 assert values['collector_pid']==pid and values['collector_pid_start_time_ticks']==start
 assert values['linux_boot_id']==boot and values['collector_sha256']==digest
 assert values['collector_device_inode_size']==identity
+assert values['evidence_root_device_inode']==evidence
 assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',values['attempted_at_utc'])
 PY
 [[ $RUN_ATTEMPT_SHA == "$(field attempt_receipt_sha256)" ]]
@@ -399,6 +421,8 @@ open(output,'x').write('\n'.join(rows)+'\n')
 PY
 
 # Close every stable input and backend generation after the final S3 read.
+[[ $(stat -Lc '%d:%i' "$COLLECTOR_OWNER_FD_PATH") == "$EVIDENCE_ROOT_DEVICE_INODE" ]]
+[[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT") == "$EVIDENCE_ROOT_DEVICE_INODE" ]]
 [[ $(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1) == "$EXPECTED_HASH" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH") == "$(field terminal_collector_device_inode_size)" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR") == "$(field terminal_collector_device_inode_size)" ]]
@@ -449,6 +473,7 @@ sync -f "$TERMINAL"
 cat >"$TERMINAL/receipt.pending" <<EOF
 schema=1
 run_id=$RUN_ID
+evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
 invocation_id=$INVOCATION_ID
 unit=$UNIT
 unit_load_state=$UNIT_STATE
@@ -482,6 +507,22 @@ find "$TERMINAL" -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.pending' -pri
 chmod 0600 "$TERMINAL/SHA256SUMS"
 sync -f "$TERMINAL/SHA256SUMS"
 sync -f "$TERMINAL"
+python3 - "$EVIDENCE_ROOT" "$TERMINAL" "$RUN_ROOT" <<'PY'
+import os,stat,sys
+evidence,terminal,run=sys.argv[1:]
+expected_evidence={'attempt.receipt','preflight.receipt','toolchain-tree.sha256','test.log','exit-code',
+                   'status','RUN-SHA256SUMS','SHA256SUMS','collector-attempt.receipt','terminal'}
+actual_evidence=set(os.listdir(evidence)); assert actual_evidence==expected_evidence,(actual_evidence,expected_evidence)
+expected_terminal={'preflight-selection','unit-journal.jsonl','invocation-journal.jsonl','journal-validation',
+                   'post-terminal-inventory','pre-exit-manifest-check','run-manifest-check','receipt',
+                   'status-pass.receipt','SHA256SUMS'}
+actual_terminal=set(os.listdir(terminal)); assert actual_terminal==expected_terminal,(actual_terminal,expected_terminal)
+for root in (evidence,terminal,run):
+    for current,dirs,files in os.walk(root,followlinks=False):
+        assert not any(name.endswith('.pending') for name in dirs+files),(current,dirs,files)
+        for name in dirs+files:
+            info=os.lstat(os.path.join(current,name)); assert not stat.S_ISLNK(info.st_mode)
+PY
 [[ $(cat "$EVIDENCE_ROOT/status") == BEHAVIOR_PASS_AWAITING_TERMINAL_COLLECTION ]]
 cd "$EVIDENCE_ROOT"
 find . -type f ! -name status ! -name FINAL-SHA256SUMS ! -name 'FINAL-SHA256SUMS.pending' \
@@ -501,6 +542,7 @@ cat >FINAL-SEAL.receipt.pending <<EOF
 schema=1
 run_id=$RUN_ID
 verdict=PASS
+evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
 final_manifest_sha256=$FINAL_MANIFEST_SHA
 final_manifest_readback=verified
 terminal_manifest_sha256=$TERMINAL_MANIFEST_SHA
@@ -513,17 +555,17 @@ ln FINAL-SEAL.receipt.pending FINAL-SEAL.receipt
 sync -f "$EVIDENCE_ROOT"
 unlink FINAL-SEAL.receipt.pending
 sync -f "$EVIDENCE_ROOT"
-python3 - FINAL-SEAL.receipt "$RUN_ID" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
+python3 - FINAL-SEAL.receipt "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
 import sys
-path,run,manifest,terminal,status,attempt=sys.argv[1:]
-expected={'schema','run_id','verdict','final_manifest_sha256','final_manifest_readback',
+path,run,evidence,manifest,terminal,status,attempt=sys.argv[1:]
+expected={'schema','run_id','verdict','evidence_root_device_inode','final_manifest_sha256','final_manifest_readback',
           'terminal_manifest_sha256','status_pass_receipt_sha256','collector_attempt_receipt_sha256'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
     values[key]=value
 assert set(values)==expected
-assert values=={'schema':'1','run_id':run,'verdict':'PASS','final_manifest_sha256':manifest,
+assert values=={'schema':'1','run_id':run,'verdict':'PASS','evidence_root_device_inode':evidence,'final_manifest_sha256':manifest,
                 'final_manifest_readback':'verified','terminal_manifest_sha256':terminal,
                 'status_pass_receipt_sha256':status,'collector_attempt_receipt_sha256':attempt}
 PY
