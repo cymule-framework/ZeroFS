@@ -337,14 +337,23 @@ attribution intact.
   inventories, both retry logs, receipts, manifest and readback, and only then
   atomically replaces canonical status with the presealed PASS inode. It must
   compare both stable FDs and locator device/inode/size against preflight, not
-  hashes alone. A partial finalizer burns that run and never publishes PASS;
-  its external records must not be deleted or written into the sealed run tree.
+  hashes alone, and must also hash each locator before and after retry
+  execution. The canonical status rename is the finalizer PONR. Before it, a
+  partial finalizer burns that run and never publishes PASS. After a rename/
+  fsync unknown outcome, a new invocation may only hold the same lock and read
+  back the exact PASS inode plus the complete immutable source and external
+  receipt/manifest/root-identity graph; an exact match returns success without
+  any rewrite or script retry. Preserve the explicit post-rename fsync-error
+  test mode and exercise it followed by this read-only convergence before
+  qualifying the harness. External records must not be deleted or written into
+  the sealed run tree.
   Pre-create only the root:root 0700
   `/opt/rhizome/validation/zerofs-barrier-fault/retry-evidence` parent; the
   finalizer must atomically create the UUID child and finish it root:root 0500
   with 0400 files.
-  Keep all three
-  scripts under the exact CI `bash -n` and ShellCheck gate. Any partial
+  Keep the three production scripts and the explicitly opted-in synthetic PONR
+  test under the exact CI `bash -n` and ShellCheck gate; CI must execute the
+  rename-success/fsync-error/read-only-convergence test as root. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
