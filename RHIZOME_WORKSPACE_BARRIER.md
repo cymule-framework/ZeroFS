@@ -195,7 +195,8 @@ The closed scenarios are:
 
 Every recovery opens a SlateDB `DbReader`/read-only ZeroFS handle, performs only
 remote-durable operation/head/receipt and extent reads, asserts the object-store
-PUT count remains zero, and drops the reader. It never opens an RW writer,
+PUT count remains zero, explicitly closes and joins the reader poller, and then
+drops the filesystem handle. It never opens an RW writer,
 calls `materialize`, retries a barrier, or invokes `close`/flush.
 
 The pinned SlateDB commit `20c14bbe9cb22405acc5b5067028c7b6d159baba`
@@ -209,8 +210,8 @@ reader must bind a pre-existing immutable checkpoint/manifest identity rather
 than infer fixed-cut consistency from `FollowLatest`.
 
 The algorithm suite wraps only the recovery store in a fresh write counter and
-proves reader construction, exact claim/head/receipt lookup, payload lookup, and
-drop perform zero PUTs. A separate negative control keeps SlateDB's default
+proves reader construction, exact claim/head/receipt lookup, payload lookup,
+explicit poller close/join, and filesystem drop perform zero PUTs. A separate negative control keeps SlateDB's default
 `ManagedCheckpoint` behavior visible and rejects it as a recovery mode. At the
 pinned SlateDB revision that control records the one exact call as
 `put_opts managed-reader-negative-control/manifest/00000000000000000005.manifest`

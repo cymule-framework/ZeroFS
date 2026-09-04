@@ -1446,7 +1446,9 @@ mod tests {
         fs
     }
 
-    async fn open_persistent_read_only(object_store: Arc<dyn ObjectStore>) -> ZeroFS {
+    async fn open_persistent_read_only(
+        object_store: Arc<dyn ObjectStore>,
+    ) -> (ZeroFS, Arc<slatedb::DbReader>) {
         let test_key = [0u8; 32];
         let transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default()).unwrap();
@@ -1474,8 +1476,8 @@ mod tests {
             CompressionConfig::default(),
         )
         .unwrap();
-        ZeroFS::new_with_slatedb(
-            SlateDbHandle::ReadOnly(arc_swap::ArcSwap::new(reader)),
+        let fs = ZeroFS::new_with_slatedb(
+            SlateDbHandle::ReadOnly(arc_swap::ArcSwap::new(reader.clone())),
             u64::MAX,
             None,
             false,
@@ -1483,7 +1485,8 @@ mod tests {
             segment_codec,
         )
         .await
-        .unwrap()
+        .unwrap();
+        (fs, reader)
     }
 
     fn command(
@@ -1758,7 +1761,7 @@ mod tests {
         // Count only the recovery process's object-store calls. The inner fault
         // store above retains the writer-phase counters by design.
         let (read_only_store, recovery_io) = crate::fault_store::FaultStore::new(object_store);
-        let reopened = open_persistent_read_only(read_only_store).await;
+        let (reopened, reader) = open_persistent_read_only(read_only_store).await;
         assert_eq!(
             reopened
                 .workspace_barriers
@@ -1775,6 +1778,7 @@ mod tests {
                 .unwrap(),
             payload
         );
+        reader.close().await.unwrap();
         drop(reopened);
         assert_eq!(recovery_io.put_count(), 0);
         assert!(recovery_io.put_locations().is_empty());
@@ -2377,7 +2381,7 @@ mod tests {
         let (fault_store, recovery_io) = crate::fault_store::FaultStore::new(raw_store);
         recovery_io.set_put_limits(128, 16 * 1024 * 1024);
         let object_store: Arc<dyn ObjectStore> = fault_store;
-        let fs = open_persistent_read_only(object_store).await;
+        let (fs, reader) = open_persistent_read_only(object_store).await;
         let command = context.command();
         let claim_record = read_claim_record(&root, scenario);
         assert_eq!(claim_record["schema"], "1");
@@ -2443,7 +2447,10 @@ mod tests {
             }
             _ => unreachable!(),
         };
+        reader.close().await.unwrap();
+        drop(fs);
         assert_eq!(recovery_io.put_count(), 0);
+        assert!(recovery_io.put_locations().is_empty());
         write_new_durable(
             &recovery_path(&root, scenario),
             format!(
@@ -2452,7 +2459,6 @@ mod tests {
             )
             .as_bytes(),
         );
-        drop(fs);
     }
 
     struct KillJoinChild(Option<std::process::Child>);

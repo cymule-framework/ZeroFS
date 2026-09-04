@@ -241,7 +241,9 @@ attribution intact.
   checkpoint manifest and violates read-only recovery. This mode is valid only
   after the sole writer has been killed and joined and while no replacement
   writer may publish. A future concurrent reader needs an immutable pinned
-  checkpoint/manifest identity.
+  checkpoint/manifest identity. Retain the reader handle, explicitly close and
+  join its poller after recovery reads, then prove the fresh write trace remains
+  empty before publishing recovery evidence.
 - A barrier must publish PENDING and a unique durable effect-dispatch claim
   before its one seal+manifest flush. After that claim, an absent barrier record
   is UNKNOWN and no process may flush the same operation again.
