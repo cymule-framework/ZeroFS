@@ -178,6 +178,30 @@ recovery paths. If the guard cannot reap even after SIGKILL within its bounded
 cleanup window, the parent aborts rather than detach a possible writer and run
 S3 cleanup concurrently.
 
+After the exact child has been reaped with `SIGKILL`, the parent publishes one
+atomic no-replace, file-synced and directory-synced `<scenario>.exit` record.
+It binds the Linux boot ID, child PID and procfs start-time ticks, signal, wall
+and boot-time join observations, exact systemd unit and cgroup, the pre-effect
+preflight-receipt SHA-256, and the exact request, barrier, claim, handshake and
+receipt digests. Recovery cannot start before this exit receipt is durably
+readable. The operator must provide the exact supervisor unit/cgroup and a
+lowercase SHA-256 for a preflight receipt that already seals source, executable,
+toolchain binaries, non-secret backend generation/config identity, and the
+collector itself; all three are required before the first S3 access.
+
+`zerofs/scripts/run-rhizome-barrier-foundation.sh` is the versioned inner
+systemd runner. Before the test can touch S3 it verifies the fresh root/evidence
+directories, seals the clean source tree, exact test executable and build
+record, `rustc`/`cargo` binaries plus the complete sysroot file manifest, runner
+and terminal-collector hashes, Linux boot, supervisor cgroup, and RustFS PID,
+start time, invocation, cgroup, binary/unit/config label, endpoint and CA. It
+rechecks the same RustFS PID/start/invocation after the matrix. Status is excluded
+from the pre-exit file manifest so the final transition cannot invalidate that
+manifest. `collect-rhizome-barrier-foundation.sh` verifies the runner/run
+manifests after the transient unit is collected, seals both the unit-wide and
+exact-invocation journals plus cgroup absence, and only then publishes PASS.
+Both scripts fail closed and a partially created run is permanently unusable.
+
 The closed scenarios are:
 
 - `before-data-cut`: after the real buffered Write and complete admission, but
@@ -224,7 +248,7 @@ Every crash child uses a test-only object-store hard limit of 128 PUT attempts
 and 16 MiB before forwarding each write; multipart is rejected. The parent also
 checks the cumulative 512-object/64-MiB inventory before every new scenario and
 after the matrix, deletes only paths returned through its exact `PrefixStore`,
-and requires the final prefix to be empty. Context, claim, handshake, and
+and requires the final prefix to be empty. Context, claim, handshake, exit, and
 recovery records are intentionally retained in the operator run directory for
 later evidence hashing.
 
@@ -245,6 +269,19 @@ accidentally used SlateDB's default `ManagedCheckpoint`; the other three
 scenarios were not dispatched. The exact prefix was empty both before and after,
 the child was joined, and the run must never be resumed or promoted. A new run
 is forbidden until this `FollowLatest` fix has exact CI and both reviews.
+Its first runner hashed `status=STARTED` before replacing that file with the
+permanent failure marker, so the original manifest now has one known mismatch;
+the supplemental evidence records that mismatch rather than claiming intact
+original sealing.
+
+The successor source `241d2f74d2680c70f05271492fc3719ddcf5f581`
+passed exact CI and both code reviews. Foundation run
+`b6c3c96f-25d2-48d7-b4ca-6d4afd1d2df7` completed all four behavioral scenarios,
+but remains `BEHAVIOR_PASS_PROVENANCE_INCOMPLETE`: it did not publish durable
+per-scenario exit receipts and its sealed run preflight did not bind complete
+toolchain/backend process generations or the collector. It must never be reused
+or promoted. This successor exit-receipt contract is unexecuted pending fresh
+CI and review; only a new canonical UUID may exercise it.
 
 Even after a future pass this harness is
 not NBD FLUSH, Firecracker, production COSE/receipt, external-production-S3,

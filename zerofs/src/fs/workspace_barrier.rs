@@ -1095,6 +1095,14 @@ pub(crate) async fn foundation_process_crash_point(
     let receipt_digest = receipt
         .map(|value| hex(&value.receipt_digest))
         .unwrap_or_else(|| "none".into());
+    let preflight_receipt_sha256 =
+        std::env::var("RHIZOME_BARRIER_FAULT_PREFLIGHT_RECEIPT_SHA256").unwrap();
+    assert!(
+        preflight_receipt_sha256.len() == 64
+            && preflight_receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
     let directory = std::fs::File::open(&configured_root).unwrap();
     let pending_name = format!("{scenario}.handshake.pending");
     let final_name = format!("{scenario}.handshake");
@@ -1112,7 +1120,7 @@ pub(crate) async fn foundation_process_crash_point(
     let mut file = std::fs::File::from(fd);
     file.write_all(
         format!(
-            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\npreflight_receipt_sha256={preflight_receipt_sha256}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
             std::process::id(),
             hex(command.request_digest.as_bytes()),
             claim_field("barrier_id"),
@@ -1810,6 +1818,22 @@ mod tests {
         reader.close().await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foundation_exit_receipt_primitives_bind_process_and_publish_atomically() {
+        let process = read_linux_process_identity(std::process::id());
+        assert_eq!(process.pid, std::process::id());
+        assert!(process.start_time_ticks > 0);
+        assert!(!process.boot_id.is_empty());
+        assert!(process.cgroup.starts_with('/'));
+
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("scenario.exit");
+        write_new_durable_atomic_no_replace(&receipt, b"schema=1\n");
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"schema=1\n");
+        assert!(!directory.path().join("scenario.exit.pending").exists());
+    }
+
     #[tokio::test]
     async fn stale_epoch_cannot_publish_a_barrier_record() {
         let (fs, mut token, genesis) = active_workspace().await;
@@ -2157,6 +2181,20 @@ mod tests {
             std::env::var("RHIZOME_BARRIER_S3_PREFIX").unwrap(),
             expected_prefix
         );
+        assert_eq!(
+            std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_UNIT").unwrap(),
+            format!("zerofs-barrier-fault-{run_id}.service")
+        );
+        let supervisor_cgroup = std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_CGROUP").unwrap();
+        assert!(supervisor_cgroup.starts_with('/') && !supervisor_cgroup.contains('\n'));
+        let preflight_receipt_sha256 =
+            std::env::var("RHIZOME_BARRIER_FAULT_PREFLIGHT_RECEIPT_SHA256").unwrap();
+        assert!(
+            preflight_receipt_sha256.len() == 64
+                && preflight_receipt_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
         (run_id, configured_root, expected_prefix)
     }
 
@@ -2190,6 +2228,10 @@ mod tests {
         root.join(format!("{scenario}.recovery"))
     }
 
+    fn exit_path(root: &std::path::Path, scenario: &str) -> std::path::PathBuf {
+        root.join(format!("{scenario}.exit"))
+    }
+
     fn write_new_durable(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -2206,6 +2248,163 @@ mod tests {
             .unwrap()
             .sync_all()
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_new_durable_atomic_no_replace(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+
+        let parent = path.parent().unwrap();
+        let final_name = path.file_name().unwrap().to_str().unwrap();
+        let pending_name = format!("{final_name}.pending");
+        let directory = std::fs::File::open(parent).unwrap();
+        let fd = rustix::fs::openat(
+            &directory,
+            pending_name.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(fd);
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        rustix::fs::renameat_with(
+            &directory,
+            pending_name.as_str(),
+            &directory,
+            final_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .unwrap();
+        directory.sync_all().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LinuxProcessIdentity {
+        pid: u32,
+        start_time_ticks: u64,
+        boot_id: String,
+        cgroup: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_linux_process_identity(pid: u32) -> LinuxProcessIdentity {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let comm_end = stat.rfind(')').expect("proc stat command is closed");
+        let fields = stat[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+        let start_time_ticks = fields
+            .get(19)
+            .expect("proc stat contains start time")
+            .parse()
+            .unwrap();
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let parsed_boot = uuid::Uuid::parse_str(&boot_id).unwrap();
+        assert_eq!(parsed_boot.to_string(), boot_id);
+        let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let cgroup = cgroups
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("process belongs to one unified cgroup")
+            .to_owned();
+        assert!(cgroup.starts_with('/') && !cgroup.contains('\n'));
+        LinuxProcessIdentity {
+            pid,
+            start_time_ticks,
+            boot_id,
+            cgroup,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_crash_exit_receipt(
+        root: &std::path::Path,
+        run_id: &str,
+        scenario: &str,
+        process: &LinuxProcessIdentity,
+        status: &std::process::ExitStatus,
+        handshake: &std::collections::BTreeMap<String, String>,
+    ) {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(!std::path::Path::new(&format!("/proc/{}", process.pid)).exists());
+        let expected_unit = format!("zerofs-barrier-fault-{run_id}.service");
+        assert_eq!(
+            std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_UNIT").unwrap(),
+            expected_unit
+        );
+        let expected_cgroup = std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_CGROUP").unwrap();
+        assert_eq!(process.cgroup, expected_cgroup);
+        let handshake_bytes = std::fs::read(root.join(format!("{scenario}.handshake"))).unwrap();
+        let claim_bytes = std::fs::read(claim_path(root, scenario)).unwrap();
+        let joined = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let uptime = std::fs::read_to_string("/proc/uptime").unwrap();
+        let boot_seconds = uptime.split_whitespace().next().unwrap();
+        let (whole, fractional) = boot_seconds.split_once('.').unwrap_or((boot_seconds, "0"));
+        let mut millis = fractional
+            .as_bytes()
+            .iter()
+            .take(3)
+            .fold(0u64, |value, digit| value * 10 + u64::from(*digit - b'0'));
+        for _ in fractional.len().min(3)..3 {
+            millis *= 10;
+        }
+        let joined_at_boot_millis = whole.parse::<u64>().unwrap() * 1000 + millis;
+        let bytes = format!(
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npid={}\npid_start_time_ticks={}\nlinux_boot_id={}\nsignal={}\njoined_at_unix_seconds={}\njoined_at_unix_nanos={}\njoined_at_boot_millis={joined_at_boot_millis}\nsupervisor_unit={expected_unit}\nsupervisor_cgroup={}\npreflight_receipt_sha256={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nhandshake_digest={}\nincluded_write_sequence={}\nreceipt_digest={}\n",
+            process.pid,
+            process.start_time_ticks,
+            process.boot_id,
+            libc::SIGKILL,
+            joined.as_secs(),
+            joined.subsec_nanos(),
+            process.cgroup,
+            handshake["preflight_receipt_sha256"],
+            handshake["request_digest"],
+            handshake["barrier_id"],
+            handshake["effect_claim_digest"],
+            lower_hex(&Sha256::digest(&claim_bytes)),
+            lower_hex(&Sha256::digest(&handshake_bytes)),
+            handshake["included_write_sequence"],
+            handshake["receipt_digest"],
+        );
+        write_new_durable_atomic_no_replace(&exit_path(root, scenario), bytes.as_bytes());
+        let record = parse_closed_record(
+            &std::fs::read_to_string(exit_path(root, scenario)).unwrap(),
+            &[
+                "schema",
+                "run_id",
+                "scenario",
+                "pid",
+                "pid_start_time_ticks",
+                "linux_boot_id",
+                "signal",
+                "joined_at_unix_seconds",
+                "joined_at_unix_nanos",
+                "joined_at_boot_millis",
+                "supervisor_unit",
+                "supervisor_cgroup",
+                "preflight_receipt_sha256",
+                "request_digest",
+                "barrier_id",
+                "effect_claim_digest",
+                "claim_record_digest",
+                "handshake_digest",
+                "included_write_sequence",
+                "receipt_digest",
+            ],
+        );
+        assert_eq!(record["pid"], process.pid.to_string());
+        assert_eq!(record["signal"], libc::SIGKILL.to_string());
     }
 
     fn read_fault_context(root: &std::path::Path, scenario: &str) -> FoundationFaultContext {
@@ -2555,6 +2754,7 @@ mod tests {
                                 "scenario",
                                 "point",
                                 "pid",
+                                "preflight_receipt_sha256",
                                 "request_digest",
                                 "barrier_id",
                                 "effect_claim_digest",
@@ -2567,6 +2767,11 @@ mod tests {
                         assert_eq!(fields["scenario"], scenario);
                         assert_eq!(fields["point"], scenario);
                         assert_eq!(fields["pid"], child_pid.to_string());
+                        assert_eq!(
+                            fields["preflight_receipt_sha256"],
+                            std::env::var("RHIZOME_BARRIER_FAULT_PREFLIGHT_RECEIPT_SHA256")
+                                .unwrap()
+                        );
                         assert_eq!(fields["included_write_sequence"], "1");
                         rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock).unwrap();
                         return fields;
@@ -2614,6 +2819,7 @@ mod tests {
                 assert_inventory_bound(&base_store, 512, 64 * 1024 * 1024).await;
                 let mut crash = spawn_fault_child("crash", scenario);
                 let handshake = wait_for_fault_handshake(&root, scenario, crash.child());
+                let crash_process = read_linux_process_identity(crash.child().id());
                 let context = read_fault_context(&root, scenario);
                 let claim_record = read_claim_record(&root, scenario);
                 assert_eq!(handshake["run_id"], run_id);
@@ -2642,6 +2848,14 @@ mod tests {
                     std::time::Instant::now() + std::time::Duration::from_secs(120),
                 );
                 assert_eq!(status.signal(), Some(libc::SIGKILL));
+                persist_crash_exit_receipt(
+                    &root,
+                    &run_id,
+                    scenario,
+                    &crash_process,
+                    &status,
+                    &handshake,
+                );
 
                 let mut recovery = spawn_fault_child("recover", scenario);
                 let recovery_status = recovery
@@ -2702,6 +2916,7 @@ mod tests {
                     format!("{scenario}.context"),
                     format!("{scenario}.claim"),
                     format!("{scenario}.handshake"),
+                    format!("{scenario}.exit"),
                     format!("{scenario}.recovery"),
                 ]
             })

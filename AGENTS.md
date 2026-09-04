@@ -292,6 +292,19 @@ attribution intact.
   lock across no-replace publish and directory fsync, and parent may kill only
   after it acquires that lock. If bounded reap fails, abort without S3 cleanup
   rather than detach a possible writer.
+- After exact SIGKILL reap, publish one atomic no-replace, file/directory-synced
+  scenario exit receipt before recovery. Bind Linux boot ID, PID/start ticks,
+  signal, wall/boot join time, exact supervisor unit/cgroup, preflight receipt,
+  and request/barrier/claim/handshake/receipt digests. The preflight receipt must
+  already seal exact source/executable, toolchain binaries, non-secret RustFS
+  generation/config identity, and collector identity. Never reconstruct an exit
+  receipt after the process has disappeared.
+- Use the versioned Foundation runner and terminal collector. The runner must
+  seal complete pre-effect source/build/toolchain/collector and non-secret
+  backend process-generation identity, recheck the backend generation after the
+  matrix, and never hash a mutable status value into the pre-exit manifest. The
+  collector must seal unit and invocation journals plus cgroup absence before
+  terminal PASS. Any partial runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
   poller, then assert zero object-store PUTs and drop the filesystem. Never open
