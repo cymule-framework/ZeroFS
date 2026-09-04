@@ -261,7 +261,9 @@ explicitly opted-in `test-rhizome-barrier-finalizer-ponr.sh` builds a synthetic
 sealed graph, proves mode/link violations and an in-place same-inode/same-size
 runner rewrite are rejected, injects response loss after rename plus successful
 directory fsync, then invokes the same finalizer again and requires its read-only
-convergence path to succeed.
+convergence path to succeed. CI runs this root-only test in a private mount
+namespace with a bounded root-owned 0755 tmpfs at `/opt`; a hosted runner's
+writable global `/opt` must not weaken the production ancestor policy.
 
 The closed scenarios are:
 

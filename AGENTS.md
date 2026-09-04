@@ -357,7 +357,9 @@ attribution intact.
   test under the exact CI `bash -n` and ShellCheck gate; CI must execute the
   closed mode/link graph and same-inode/same-size locator rewrite rejection,
   plus the rename-and-fsync-success/response-loss/read-only-convergence test as
-  root. Any partial
+  root inside a private mount namespace whose `/opt` is a root-owned 0755
+  bounded tmpfs; do not weaken the production ancestor policy for a hosted
+  runner's writable `/opt`. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest

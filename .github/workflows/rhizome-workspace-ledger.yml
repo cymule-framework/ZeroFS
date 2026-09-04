@@ -35,7 +35,10 @@ jobs:
           bash -n scripts/verify-rhizome-barrier-sealed-retry.sh
           bash -n scripts/test-rhizome-barrier-finalizer-ponr.sh
           shellcheck scripts/run-rhizome-barrier-foundation.sh scripts/collect-rhizome-barrier-foundation.sh scripts/verify-rhizome-barrier-sealed-retry.sh scripts/test-rhizome-barrier-finalizer-ponr.sh
-          sudo env RHIZOME_BARRIER_ALLOW_PONR_SELF_TEST=1 bash scripts/test-rhizome-barrier-finalizer-ponr.sh scripts/run-rhizome-barrier-foundation.sh scripts/collect-rhizome-barrier-foundation.sh scripts/verify-rhizome-barrier-sealed-retry.sh
+          sudo unshare --mount --propagation private -- bash -c '
+            mount -t tmpfs -o mode=0755,nosuid,nodev,size=64m tmpfs /opt
+            RHIZOME_BARRIER_ALLOW_PONR_SELF_TEST=1 bash scripts/test-rhizome-barrier-finalizer-ponr.sh scripts/run-rhizome-barrier-foundation.sh scripts/collect-rhizome-barrier-foundation.sh scripts/verify-rhizome-barrier-sealed-retry.sh
+          '
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p zerofs --features rhizome-export-authority-core --all-targets -- -D warnings
