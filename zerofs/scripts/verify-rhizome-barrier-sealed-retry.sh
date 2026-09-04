@@ -155,6 +155,26 @@ finally:
     os.close(fd)
 PY
 sync -f "$RETRY_ROOT"
+python3 - "$RETRY_ROOT/attempt.receipt" "$RUN_ID" "$$" "$FINALIZER_START" "$FINALIZER_BOOT" \
+    "$FINALIZER_CGROUP" "$EVIDENCE_ROOT_DEVICE_INODE" "$(field sealed_retry_verifier_sha256)" \
+    "$(field sealed_retry_verifier_device_inode_size)" "$SOURCE_FINAL_SEAL_SHA" <<'PY'
+import re,sys
+path,run,pid,start,boot,cgroup,evidence,digest,identity,source=sys.argv[1:]
+expected={'schema','run_id','finalizer_pid','finalizer_pid_start_time_ticks','finalizer_linux_boot_id',
+          'finalizer_cgroup','evidence_root_device_inode','verifier_sha256','verifier_device_inode_size',
+          'source_final_seal_sha256','attempted_at_utc'}
+values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
+for line in text.splitlines():
+    key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
+    values[key]=value
+assert set(values)==expected
+assert values['schema']=='1' and values['run_id']==run and values['finalizer_pid']==pid
+assert values['finalizer_pid_start_time_ticks']==start and values['finalizer_linux_boot_id']==boot
+assert values['finalizer_cgroup']==cgroup and values['evidence_root_device_inode']==evidence
+assert values['verifier_sha256']==digest and values['verifier_device_inode_size']==identity
+assert values['source_final_seal_sha256']==source
+assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',values['attempted_at_utc'])
+PY
 
 inventory() {
     local output=$1
@@ -244,6 +264,31 @@ ln "$RETRY_ROOT/retry.receipt.pending" "$RETRY_ROOT/retry.receipt"
 sync -f "$RETRY_ROOT"
 unlink "$RETRY_ROOT/retry.receipt.pending"
 sync -f "$RETRY_ROOT"
+python3 - "$RETRY_ROOT/retry.receipt" "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" \
+    "$SOURCE_FINAL_SEAL_SHA" "$RUNNER_EXIT" "$COLLECTOR_EXIT" "$BEFORE_SHA" "$AFTER_SHA" \
+    "$RUNNER_LOG_SHA" "$COLLECTOR_LOG_SHA" "$(field runner_sha256)" "$(field runner_device_inode_size)" \
+    "$(field terminal_collector_sha256)" "$(field terminal_collector_device_inode_size)" \
+    "$(field sealed_retry_verifier_sha256)" "$(field sealed_retry_verifier_device_inode_size)" <<'PY'
+import sys
+path,run,evidence,source,runner_exit,collector_exit,before,after,runner_log,collector_log,runner_sha,runner_id,collector_sha,collector_id,verifier_sha,verifier_id=sys.argv[1:]
+expected={'schema','run_id','verdict','evidence_root_device_inode','source_final_seal_sha256',
+          'runner_retry_exit','collector_retry_exit','before_inventory_sha256','after_inventory_sha256',
+          'runner_retry_log_sha256','collector_retry_log_sha256','runner_sha256','runner_device_inode_size',
+          'collector_sha256','collector_device_inode_size','verifier_sha256','verifier_device_inode_size'}
+values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
+for line in text.splitlines():
+    key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
+    values[key]=value
+assert set(values)==expected
+assert values=={'schema':'1','run_id':run,'verdict':'RETRIES_REJECTED_TREE_UNCHANGED',
+                'evidence_root_device_inode':evidence,'source_final_seal_sha256':source,
+                'runner_retry_exit':runner_exit,'collector_retry_exit':collector_exit,
+                'before_inventory_sha256':before,'after_inventory_sha256':after,
+                'runner_retry_log_sha256':runner_log,'collector_retry_log_sha256':collector_log,
+                'runner_sha256':runner_sha,'runner_device_inode_size':runner_id,
+                'collector_sha256':collector_sha,'collector_device_inode_size':collector_id,
+                'verifier_sha256':verifier_sha,'verifier_device_inode_size':verifier_id}
+PY
 find "$RETRY_ROOT" -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.pending' -print0 | \
     sort -z | xargs -0 sha256sum >"$RETRY_ROOT/SHA256SUMS.pending"
 chmod 0600 "$RETRY_ROOT/SHA256SUMS.pending"
