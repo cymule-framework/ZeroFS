@@ -198,6 +198,24 @@ remote-durable operation/head/receipt and extent reads, asserts the object-store
 PUT count remains zero, and drops the reader. It never opens an RW writer,
 calls `materialize`, retries a barrier, or invokes `close`/flush.
 
+The pinned SlateDB commit `20c14bbe9cb22405acc5b5067028c7b6d159baba`
+defaults `DbReader` to `ManagedCheckpoint`, whose open and refresh paths publish
+checkpoint manifests. Recovery therefore selects `DbReaderMode::FollowLatest`
+explicitly; its upstream contract performs no object-store writes. The harness
+kills and joins the sole writer before opening this reader and permits no
+replacement writer during the bounded lookup, so the initially loaded durable
+manifest cannot drift during the recovery phase. A future concurrent production
+reader must bind a pre-existing immutable checkpoint/manifest identity rather
+than infer fixed-cut consistency from `FollowLatest`.
+
+The algorithm suite wraps only the recovery store in a fresh write counter and
+proves reader construction, exact claim/head/receipt lookup, payload lookup, and
+drop perform zero PUTs. A separate negative control keeps SlateDB's default
+`ManagedCheckpoint` behavior visible and rejects it as a recovery mode. At the
+pinned SlateDB revision that control records the one exact call as
+`put_opts managed-reader-negative-control/manifest/00000000000000000005.manifest`
+before reader close; the positive recovery trace remains empty.
+
 Every crash child uses a test-only object-store hard limit of 128 PUT attempts
 and 16 MiB before forwarding each write; multipart is rejected. The parent also
 checks the cumulative 512-object/64-MiB inventory before every new scenario and
@@ -216,7 +234,14 @@ against a real coordinated SlateDB stack and exact read-only recovery. That is
 algorithm evidence only; the process harness's post-apply blocker is the
 Foundation response-loss/SIGKILL boundary.
 
-This harness remains **unexecuted** until its exact source commit passes both
-storage/unknown-outcome and authority/fencing review. Even after a pass it is
+Foundation run `ec6b942e-a8dc-49ca-8d8b-0abcc4864921` against source
+`29f251d7c71f7543e7e30089862df69c4711dcc5` is permanent failed evidence. Its
+first `before-data-cut` recovery observed exactly one PUT because the harness
+accidentally used SlateDB's default `ManagedCheckpoint`; the other three
+scenarios were not dispatched. The exact prefix was empty both before and after,
+the child was joined, and the run must never be resumed or promoted. A new run
+is forbidden until this `FollowLatest` fix has exact CI and both reviews.
+
+Even after a future pass this harness is
 not NBD FLUSH, Firecracker, production COSE/receipt, external-production-S3,
 power-loss, HA, release, or Actor READY evidence.

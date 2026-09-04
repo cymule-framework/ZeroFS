@@ -236,6 +236,12 @@ attribution intact.
   `rhizome-workspace-barrier-core` mechanics candidate. Read
   `RHIZOME_WORKSPACE_BARRIER.md` before changing its 0x0A claim, 0x0D head/cut,
   manifest snapshot, or unknown-outcome protocol.
+- Crash recovery must open the pinned SlateDB reader explicitly in
+  `DbReaderMode::FollowLatest`; the default `ManagedCheckpoint` writes a
+  checkpoint manifest and violates read-only recovery. This mode is valid only
+  after the sole writer has been killed and joined and while no replacement
+  writer may publish. A future concurrent reader needs an immutable pinned
+  checkpoint/manifest identity.
 - A barrier must publish PENDING and a unique durable effect-dispatch claim
   before its one seal+manifest flush. After that claim, an absent barrier record
   is UNKNOWN and no process may flush the same operation again.

@@ -40,6 +40,8 @@ pub struct FaultControls {
     maximum_put_bytes: AtomicUsize,
     #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
     attempted_put_bytes: AtomicUsize,
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    put_locations: std::sync::Mutex<Vec<String>>,
     /// Return a body `truncate_bytes` short of the claimed length on the next N gets.
     truncate_next_gets: AtomicUsize,
     truncate_bytes: AtomicUsize,
@@ -98,6 +100,10 @@ impl FaultControls {
         self.maximum_puts.store(maximum_puts, Ordering::SeqCst);
         self.maximum_put_bytes
             .store(maximum_put_bytes, Ordering::SeqCst);
+    }
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    pub(crate) fn put_locations(&self) -> Vec<String> {
+        self.put_locations.lock().unwrap().clone()
     }
 }
 
@@ -161,6 +167,12 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+        self.ctl
+            .put_locations
+            .lock()
+            .unwrap()
+            .push(format!("put_opts {location}"));
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
         #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
         {

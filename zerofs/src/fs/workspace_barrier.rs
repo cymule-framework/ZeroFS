@@ -1278,7 +1278,7 @@ mod tests {
     };
     use futures::TryStreamExt;
     use slatedb::object_store::{ObjectStore, ObjectStoreExt, path::Path};
-    use slatedb::{BlockTransformer, DbBuilder};
+    use slatedb::{BlockTransformer, DbBuilder, DbReaderMode};
 
     async fn active_workspace() -> (ZeroFS, MutationFenceToken, GenesisDomainRecord) {
         let fs = ZeroFS::new_in_memory().await.unwrap();
@@ -1455,6 +1455,12 @@ mod tests {
                 Path::from("workspace-barrier-reopen"),
                 object_store.clone(),
             )
+            // ManagedCheckpoint is SlateDB's default reader mode, but opening it
+            // publishes a checkpoint manifest. Crash recovery is a strictly
+            // read-only inspection after the old writer has been killed and
+            // joined, so it must follow the latest already-durable manifest
+            // without creating or refreshing a checkpoint.
+            .with_reader_mode(DbReaderMode::FollowLatest)
             .with_block_transformer(transformer)
             .with_filter_policies(crate::fs::filter_policy::filter_policies())
             .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -1749,7 +1755,10 @@ mod tests {
         assert!(faults.manifest_put_count() >= 2);
         drop(fs);
 
-        let reopened = open_persistent_read_only(object_store).await;
+        // Count only the recovery process's object-store calls. The inner fault
+        // store above retains the writer-phase counters by design.
+        let (read_only_store, recovery_io) = crate::fault_store::FaultStore::new(object_store);
+        let reopened = open_persistent_read_only(read_only_store).await;
         assert_eq!(
             reopened
                 .workspace_barriers
@@ -1766,6 +1775,35 @@ mod tests {
                 .unwrap(),
             payload
         );
+        drop(reopened);
+        assert_eq!(recovery_io.put_count(), 0);
+        assert!(recovery_io.put_locations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_checkpoint_reader_is_not_a_read_only_recovery_mode() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::Db::open("managed-reader-negative-control", inner.clone())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let (counting_store, writes) = crate::fault_store::FaultStore::new(inner);
+        let reader = slatedb::DbReader::builder(
+            Path::from("managed-reader-negative-control"),
+            counting_store,
+        )
+        .build()
+        .await
+        .unwrap();
+
+        assert_eq!(writes.put_count(), 1);
+        assert_eq!(
+            writes.put_locations(),
+            ["put_opts managed-reader-negative-control/manifest/00000000000000000005.manifest"],
+            "the pinned SlateDB default reader must expose its exact checkpoint-manifest PUT"
+        );
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]
