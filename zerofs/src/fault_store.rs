@@ -295,6 +295,7 @@ impl ObjectStore for FaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
     use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
