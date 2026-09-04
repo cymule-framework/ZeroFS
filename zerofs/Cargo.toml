@@ -101,7 +101,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
     "logging",
 ] }
-redis = { version = "1.0", default-features = false, features = ["tokio-comp", "script"] }
 bytes = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"

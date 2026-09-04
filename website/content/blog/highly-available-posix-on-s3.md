@@ -22,7 +22,7 @@ og_description = "A leader, a standby, writer-epoch fencing, semi-synchronous re
 <p class="rv">The storage layer supplies the final boundary. Opening a database for writing conditionally updates its manifest, increments a <code>writer_epoch</code>, and fences the previous holder. The old leader's next manifest refresh or write observes the newer term and stops. Any SST files it uploaded in the meantime remain unreferenced and are later reclaimed by garbage collection. Only one writer epoch can commit durable state.</p>
 <p class="rv">A second mechanism controls who may serve. A conditional marker object beside the database moves through <code>Active</code>, <code>Claiming</code>, and <code>Opening</code>. Every transition names one generation and uses the exact object-store version it read. A candidate must win the marker claim, wait out the previous leader's bounded serving authority, open the database to publish a higher writer epoch, reconcile its tail, and become <code>Active</code> before accepting clients.</p>
 <div class="callout rv">
-  <p>Fencing and marker ownership use conditional writes, supported directly by S3, Azure Blob, and Google Cloud Storage. For S3-compatible stores without that primitive, ZeroFS can use Redis. At startup, each node also asks its peer which one is active instead of trusting its configured role.</p>
+  <p>Fencing and marker ownership use native conditional writes, supported directly by S3, Azure Blob, and Google Cloud Storage. S3-compatible stores must implement the same preconditions correctly. At startup, each node also asks its peer which one is active instead of trusting its configured role.</p>
 </div>
 
 <h2 class="rv" id="why-two-nodes-not-three">Why two nodes, not three</h2>

@@ -1098,7 +1098,8 @@ impl Settings {
         );
         toml_string.push_str("# default_region = \"us-east-1\"\n");
         toml_string.push_str("# allow_http = \"true\"  # For non-HTTPS endpoints\n");
-        toml_string.push_str("# conditional_put = \"redis://localhost:6379\"  # For S3-compatible stores without conditional put support\n");
+        toml_string
+            .push_str("# The S3 service must support native If-Match and If-None-Match writes.\n");
 
         toml_string.push_str("\n# Optional filesystem configuration\n");
         toml_string

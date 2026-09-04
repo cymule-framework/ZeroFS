@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::key_management;
+use crate::parse_object_store::parse_url_opts;
 use crate::secrets::EncryptionPassword;
 use crate::storage_class_object_store::with_storage_class;
 use slatedb::object_store::path::Path;
@@ -50,7 +51,7 @@ pub async fn change_password(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = object_store::parse_url_opts(
+    let (object_store, path_from_url) = parse_url_opts(
         &settings
             .storage
             .url
@@ -88,5 +89,32 @@ mod tests {
         assert!(validate_password("short").is_err());
         assert!(validate_password("CHANGEME").is_err());
         assert!(validate_password("goodpassword123").is_ok());
+    }
+
+    #[tokio::test]
+    async fn change_password_rejects_removed_redis_coordination_before_storage_access() {
+        let mut settings = Settings::generate_default();
+        settings.aws = Some(crate::config::AwsConfig(std::collections::HashMap::from([
+            (
+                "conditional_put".to_owned(),
+                "redis://localhost:6379".to_owned(),
+            ),
+            ("skip_signature".to_owned(), "true".to_owned()),
+            ("region".to_owned(), "us-east-1".to_owned()),
+        ])));
+
+        let error = change_password(
+            &settings,
+            EncryptionPassword::try_new("current-password").unwrap(),
+            EncryptionPassword::try_new("replacement-password").unwrap(),
+        )
+        .await
+        .expect_err("removed Redis coordination must fail before object-store access");
+        assert!(
+            error
+                .to_string()
+                .contains("requires native If-Match and If-None-Match"),
+            "{error}"
+        );
     }
 }

@@ -163,12 +163,10 @@ async fn check_test_object(
 }
 
 /// The provider answered a conditional write incorrectly (wrong result, not an
-/// error). Points at the `conditional_put` Redis coordinator, which enforces the
-/// CAS itself without the provider's precondition headers.
+/// error). Native conditional writes are a required storage capability.
 fn unsupported(detail: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "Storage provider does not correctly support the conditional writes ZeroFS requires: {detail}. Use a provider with full conditional-write support, or set a \
-         Redis coordinator (`conditional_put`) so ZeroFS enforces the CAS itself."
+        "Storage provider does not correctly support the native conditional writes ZeroFS requires: {detail}. Use a provider with full conditional-write support."
     )
 }
 
@@ -182,8 +180,8 @@ fn classify(op: &str, e: Error) -> ProbeError {
     };
     if unimplemented {
         ProbeError::Fatal(anyhow::anyhow!(
-            "Storage provider does not support conditional writes ({op}), required for fencing \
-             in ZeroFS. Use a provider that supports them, or set `conditional_put` (Redis).\n\n{e}"
+            "Storage provider does not support native conditional writes ({op}), required for fencing \
+             in ZeroFS. Use a provider that supports them.\n\n{e}"
         ))
     } else {
         let retryable = !matches!(
@@ -209,7 +207,7 @@ fn classify(op: &str, e: Error) -> ProbeError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -231,19 +229,18 @@ mod tests {
             .expect("InMemory supports both conditional-write modes");
     }
 
-    /// A store that supports put-if-not-exists but silently ignores `If-Match` on
-    /// `Update` (overwrites regardless of version). This is the failure that
-    /// passed the old Create-only probe and then livelocked the SlateDB boundary
-    /// in production.
+    /// Closed failure behaviors for each conditional-write phase.
     #[derive(Debug, Clone, Copy)]
-    enum UpdateBehavior {
+    pub(crate) enum UpdateBehavior {
+        IgnoreIfNoneMatch,
         IgnoreIfMatch,
+        RejectCurrentIfMatch,
         FailBeforeApplyOnce,
         FailAfterApplyOnce,
     }
 
     #[derive(Debug)]
-    struct TestStore {
+    pub(crate) struct TestStore {
         inner: Arc<dyn ObjectStore>,
         behavior: UpdateBehavior,
         failed_once: AtomicBool,
@@ -251,13 +248,21 @@ mod tests {
     }
 
     impl TestStore {
-        fn new(behavior: UpdateBehavior) -> Self {
+        pub(crate) fn new(behavior: UpdateBehavior) -> Self {
             Self {
                 inner: Arc::new(InMemory::new()),
                 behavior,
                 failed_once: AtomicBool::new(false),
                 initial_put_paths: Mutex::new(Vec::new()),
             }
+        }
+
+        pub(crate) fn inner(&self) -> &Arc<dyn ObjectStore> {
+            &self.inner
+        }
+
+        pub(crate) fn observed_overwrite_paths(&self) -> Vec<Path> {
+            self.initial_put_paths.lock().unwrap().clone()
         }
 
         fn transient_error() -> Error {
@@ -291,8 +296,19 @@ mod tests {
 
             let is_update = matches!(&opts.mode, PutMode::Update(_));
             match self.behavior {
+                UpdateBehavior::IgnoreIfNoneMatch if matches!(&opts.mode, PutMode::Create) => {
+                    opts.mode = PutMode::Overwrite;
+                }
                 UpdateBehavior::IgnoreIfMatch if is_update => {
                     opts.mode = PutMode::Overwrite;
+                }
+                UpdateBehavior::RejectCurrentIfMatch
+                    if is_update && !self.failed_once.swap(true, Ordering::SeqCst) =>
+                {
+                    return Err(Error::Precondition {
+                        path: location.to_string(),
+                        source: "current ETag rejected".into(),
+                    });
                 }
                 UpdateBehavior::FailBeforeApplyOnce
                     if is_update && !self.failed_once.swap(true, Ordering::SeqCst) =>
@@ -371,6 +387,26 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.rename_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn store_that_ignores_if_none_match_is_rejected() {
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(TestStore::new(UpdateBehavior::IgnoreIfNoneMatch));
+        let err = check_if_match_support(&store, "db")
+            .await
+            .expect_err("a store that ignores If-None-Match must be rejected");
+        assert!(err.to_string().contains("If-None-Match"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn store_that_rejects_current_if_match_is_rejected() {
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(TestStore::new(UpdateBehavior::RejectCurrentIfMatch));
+        let err = check_if_match_support(&store, "db")
+            .await
+            .expect_err("a store that rejects the current If-Match must be rejected");
+        assert!(err.to_string().contains("current version"), "{err}");
     }
 
     #[tokio::test]

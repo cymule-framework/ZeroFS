@@ -151,10 +151,12 @@ impl StartupContext {
         );
         info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
-        info!("Checking bucket identity...");
-        let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-            .await
-            .context("Failed to resolve bucket identity")?;
+        let bucket = resolve_bucket_identity_after_storage_preflight(
+            &object_store,
+            &actual_db_path,
+            db_mode,
+        )
+        .await?;
 
         let cache_config = CacheConfig {
             root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
@@ -166,11 +168,6 @@ impl StartupContext {
             bucket.id(),
             cache_config.root_folder.display()
         );
-
-        if !db_mode.is_read_only() {
-            crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
-                .await?;
-        }
 
         crate::cli::password::validate_password(password.expose_secret())
             .context("Password validation failed")?;
@@ -707,6 +704,21 @@ impl StartupContext {
     }
 }
 
+async fn resolve_bucket_identity_after_storage_preflight(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    actual_db_path: &str,
+    db_mode: DatabaseMode,
+) -> Result<bucket_identity::BucketIdentity> {
+    if !db_mode.is_read_only() {
+        crate::storage_compatibility::check_if_match_support(object_store, actual_db_path).await?;
+    }
+
+    info!("Checking bucket identity...");
+    bucket_identity::BucketIdentity::get_or_create(object_store, actual_db_path)
+        .await
+        .context("Failed to resolve bucket identity")
+}
+
 impl DbOpen {
     /// Reconcile a standby's frozen tail before serving.
     async fn reconcile_tail(mut self, startup: &mut StartupContext) -> Result<ReconcileOutcome> {
@@ -1067,10 +1079,14 @@ pub async fn initialize_filesystem(
 
 #[cfg(test)]
 mod role_decision_tests {
-    use super::{ImmediateRoleDecision, StartupContext, immediate_role_decision};
+    use super::{
+        ImmediateRoleDecision, StartupContext, immediate_role_decision,
+        resolve_bucket_identity_after_storage_preflight,
+    };
     use crate::config::{CompressionConfig, ReplicationRole};
     use crate::fault_store::FaultStore;
     use crate::replication::ReplicationParams;
+    use crate::storage_compatibility::tests::{TestStore, UpdateBehavior};
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
     use std::{sync::Arc, time::Duration};
 
@@ -1085,6 +1101,38 @@ mod role_decision_tests {
             Some(ImmediateRoleDecision::FollowActivePeer)
         );
         assert_eq!(immediate_role_decision(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn incompatible_storage_stops_before_bucket_identity_mutation() {
+        let test_store = Arc::new(TestStore::new(UpdateBehavior::IgnoreIfNoneMatch));
+        let store: Arc<dyn ObjectStore> = test_store.clone();
+
+        resolve_bucket_identity_after_storage_preflight(
+            &store,
+            "db",
+            super::DatabaseMode::ReadWrite,
+        )
+        .await
+        .expect_err("an incompatible backend must stop startup");
+
+        assert!(
+            matches!(
+                test_store
+                    .inner()
+                    .head(&Path::from("db").join(".zerofs_bucket_id"))
+                    .await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "bucket identity must not be written before native-CAS compatibility passes"
+        );
+        assert!(
+            test_store
+                .observed_overwrite_paths()
+                .iter()
+                .all(|path| path.as_ref().contains(".zerofs_compatibility_test_")),
+            "only bounded compatibility-probe writes may occur"
+        );
     }
 
     #[tokio::test]

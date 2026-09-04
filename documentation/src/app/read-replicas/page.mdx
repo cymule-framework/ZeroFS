@@ -83,7 +83,7 @@ Cannot initialize encryption key in read-only mode. Please initialize the databa
 
 ### Exactly one writer
 
-Only one read-write instance can run against a volume at a time. ZeroFS depends on conditional writes in the object store to fence writers, and a read-write instance verifies this support at startup by writing a probe object and then attempting a create-only (put-if-absent) write of the same key, which the store must reject as already existing. A read-only instance skips the probe.
+Only one read-write instance can run against a volume at a time. ZeroFS depends on native conditional writes in the object store to fence writers. Before any persistent startup write, a read-write instance verifies `If-None-Match`, a current `If-Match`, and rejection of a stale `If-Match` against a probe object. A read-only instance skips the probe.
 
 ## --read-only vs --checkpoint
 

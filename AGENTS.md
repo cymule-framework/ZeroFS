@@ -180,6 +180,10 @@ attribution intact.
   conditional Create followed by exact-key byte/digest readback. Never replace
   this with HEAD-before-PUT, overwrite, retrying an unknown mutation, or Redis
   authority.
+- The object-store stack requires native `If-Match` and `If-None-Match`
+  semantics. Do not reintroduce Redis or another hidden conditional-write
+  coordinator; keep the startup compatibility probe as the fail-closed gate and
+  run it before bucket identity or any other persistent startup mutation.
 - The generic ZeroFS object-store stack is not a genesis mutation executor: it
   may contain automatic or unbounded PUT retries. Genesis uses a dedicated
   single-dispatch adapter. The production adapter is intentionally unavailable

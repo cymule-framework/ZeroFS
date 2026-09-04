@@ -302,14 +302,10 @@ All tests run on every pull request and merge to the main branch.
 
 ZeroFS uses conditional writes (put-if-not-exists) for fencing to prevent split-brain scenarios when multiple instances access the same storage backend. This ensures that only one writer can be active at a time.
 
-AWS S3, Azure Blob Storage, and Google Cloud Storage support conditional writes natively. For S3-compatible object stores that do not support conditional puts, ZeroFS can use Redis as a coordination backend:
-
-```toml
-[aws]
-conditional_put = "redis://localhost:6379"
-```
-
-When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [configuration reference](/configuration) for details.
+AWS S3, Azure Blob Storage, and Google Cloud Storage support conditional writes
+natively. S3-compatible services must correctly implement both `If-Match` and
+`If-None-Match`; ZeroFS rejects a backend that fails its startup compatibility
+probe.
 
 ## Backend Durability
 
