@@ -2232,6 +2232,96 @@ mod tests {
         root.join(format!("{scenario}.exit"))
     }
 
+    fn read_root_owned_scenario_file(root: &std::path::Path, name: &str) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        assert!(!name.is_empty() && !name.contains('/') && name != "." && name != "..");
+        let directory = std::fs::File::open(root).unwrap();
+        let fd = rustix::fs::openat(
+            &directory,
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(fd);
+        let metadata = file.metadata().unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.gid(), 0);
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn read_closed_scenario_record(
+        root: &std::path::Path,
+        name: &str,
+        expected_fields: &[&str],
+    ) -> std::collections::BTreeMap<String, String> {
+        let bytes = read_root_owned_scenario_file(root, name);
+        parse_closed_record(std::str::from_utf8(&bytes).unwrap(), expected_fields)
+    }
+
+    fn read_exit_record(
+        root: &std::path::Path,
+        scenario: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        read_closed_scenario_record(
+            root,
+            &format!("{scenario}.exit"),
+            &[
+                "schema",
+                "run_id",
+                "scenario",
+                "pid",
+                "pid_start_time_ticks",
+                "linux_boot_id",
+                "signal",
+                "joined_at_unix_seconds",
+                "joined_at_unix_nanos",
+                "joined_at_boot_millis",
+                "supervisor_unit",
+                "supervisor_cgroup",
+                "preflight_receipt_sha256",
+                "request_digest",
+                "barrier_id",
+                "effect_claim_digest",
+                "claim_record_digest",
+                "handshake_digest",
+                "included_write_sequence",
+                "receipt_digest",
+            ],
+        )
+    }
+
+    fn read_handshake_record(
+        root: &std::path::Path,
+        scenario: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        read_closed_scenario_record(
+            root,
+            &format!("{scenario}.handshake"),
+            &[
+                "schema",
+                "run_id",
+                "scenario",
+                "point",
+                "pid",
+                "preflight_receipt_sha256",
+                "request_digest",
+                "barrier_id",
+                "effect_claim_digest",
+                "claim_record_digest",
+                "included_write_sequence",
+                "receipt_digest",
+            ],
+        )
+    }
+
     fn write_new_durable(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -2344,8 +2434,8 @@ mod tests {
         );
         let expected_cgroup = std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_CGROUP").unwrap();
         assert_eq!(process.cgroup, expected_cgroup);
-        let handshake_bytes = std::fs::read(root.join(format!("{scenario}.handshake"))).unwrap();
-        let claim_bytes = std::fs::read(claim_path(root, scenario)).unwrap();
+        let handshake_bytes = read_root_owned_scenario_file(root, &format!("{scenario}.handshake"));
+        let claim_bytes = read_root_owned_scenario_file(root, &format!("{scenario}.claim"));
         let joined = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let uptime = std::fs::read_to_string("/proc/uptime").unwrap();
         let boot_seconds = uptime.split_whitespace().next().unwrap();
@@ -2378,37 +2468,13 @@ mod tests {
             handshake["receipt_digest"],
         );
         write_new_durable_atomic_no_replace(&exit_path(root, scenario), bytes.as_bytes());
-        let record = parse_closed_record(
-            &std::fs::read_to_string(exit_path(root, scenario)).unwrap(),
-            &[
-                "schema",
-                "run_id",
-                "scenario",
-                "pid",
-                "pid_start_time_ticks",
-                "linux_boot_id",
-                "signal",
-                "joined_at_unix_seconds",
-                "joined_at_unix_nanos",
-                "joined_at_boot_millis",
-                "supervisor_unit",
-                "supervisor_cgroup",
-                "preflight_receipt_sha256",
-                "request_digest",
-                "barrier_id",
-                "effect_claim_digest",
-                "claim_record_digest",
-                "handshake_digest",
-                "included_write_sequence",
-                "receipt_digest",
-            ],
-        );
+        let record = read_exit_record(root, scenario);
         assert_eq!(record["pid"], process.pid.to_string());
         assert_eq!(record["signal"], libc::SIGKILL.to_string());
     }
 
     fn read_fault_context(root: &std::path::Path, scenario: &str) -> FoundationFaultContext {
-        let bytes = std::fs::read(context_path(root, scenario)).unwrap();
+        let bytes = read_root_owned_scenario_file(root, &format!("{scenario}.context"));
         codec().deserialize(&bytes).unwrap()
     }
 
@@ -2442,6 +2508,21 @@ mod tests {
         fields
     }
 
+    fn assert_lower_hex_digest(value: &str) {
+        assert_eq!(value.len(), 64);
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    fn assert_uuid_v4(value: &str) {
+        let parsed = uuid::Uuid::parse_str(value).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.to_string(), value);
+    }
+
     fn persist_claim_record(
         root: &std::path::Path,
         scenario: &str,
@@ -2467,9 +2548,9 @@ mod tests {
         root: &std::path::Path,
         scenario: &str,
     ) -> std::collections::BTreeMap<String, String> {
-        let contents = std::fs::read_to_string(claim_path(root, scenario)).unwrap();
-        parse_closed_record(
-            &contents,
+        read_closed_scenario_record(
+            root,
+            &format!("{scenario}.claim"),
             &[
                 "schema",
                 "scenario",
@@ -2574,15 +2655,15 @@ mod tests {
     }
 
     async fn foundation_fault_recovery_child(scenario: &str) {
-        let (_, root, base_prefix) = foundation_fault_run();
+        let (run_id, root, base_prefix) = foundation_fault_run();
         let context = read_fault_context(&root, scenario);
-        let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
-        let (fault_store, recovery_io) = crate::fault_store::FaultStore::new(raw_store);
-        recovery_io.set_put_limits(128, 16 * 1024 * 1024);
-        let object_store: Arc<dyn ObjectStore> = fault_store;
-        let (fs, reader) = open_persistent_read_only(object_store).await;
         let command = context.command();
         let claim_record = read_claim_record(&root, scenario);
+        let exit_record = read_exit_record(&root, scenario);
+        let handshake_record = read_handshake_record(&root, scenario);
+        let claim_bytes = read_root_owned_scenario_file(&root, &format!("{scenario}.claim"));
+        let handshake_bytes =
+            read_root_owned_scenario_file(&root, &format!("{scenario}.handshake"));
         assert_eq!(claim_record["schema"], "1");
         assert_eq!(claim_record["scenario"], scenario);
         assert_eq!(
@@ -2590,6 +2671,122 @@ mod tests {
             lower_hex(&context.request_digest)
         );
         assert_eq!(claim_record["included_write_sequence"], "1");
+        assert_lower_hex_digest(&claim_record["request_digest"]);
+        assert_lower_hex_digest(&claim_record["effect_claim_digest"]);
+        assert_uuid_v4(&claim_record["barrier_id"]);
+
+        assert_eq!(handshake_record["schema"], "1");
+        assert_eq!(handshake_record["run_id"], run_id);
+        assert_eq!(handshake_record["scenario"], scenario);
+        assert_eq!(handshake_record["point"], scenario);
+        assert_eq!(
+            handshake_record["preflight_receipt_sha256"],
+            std::env::var("RHIZOME_BARRIER_FAULT_PREFLIGHT_RECEIPT_SHA256").unwrap()
+        );
+        assert_eq!(
+            handshake_record["request_digest"],
+            claim_record["request_digest"]
+        );
+        assert_eq!(handshake_record["barrier_id"], claim_record["barrier_id"]);
+        assert_eq!(
+            handshake_record["effect_claim_digest"],
+            claim_record["effect_claim_digest"]
+        );
+        assert_eq!(
+            handshake_record["claim_record_digest"],
+            lower_hex(&Sha256::digest(&claim_bytes))
+        );
+        assert_eq!(handshake_record["included_write_sequence"], "1");
+        assert_lower_hex_digest(&handshake_record["preflight_receipt_sha256"]);
+        assert_lower_hex_digest(&handshake_record["request_digest"]);
+        assert_lower_hex_digest(&handshake_record["effect_claim_digest"]);
+        assert_lower_hex_digest(&handshake_record["claim_record_digest"]);
+        assert_uuid_v4(&handshake_record["barrier_id"]);
+
+        assert_eq!(exit_record["schema"], "1");
+        assert_eq!(exit_record["run_id"], run_id);
+        assert_eq!(exit_record["scenario"], scenario);
+        assert_eq!(exit_record["signal"], libc::SIGKILL.to_string());
+        assert_eq!(exit_record["pid"], handshake_record["pid"]);
+        assert_eq!(
+            exit_record["request_digest"],
+            handshake_record["request_digest"]
+        );
+        assert_eq!(exit_record["barrier_id"], handshake_record["barrier_id"]);
+        assert_eq!(
+            exit_record["effect_claim_digest"],
+            handshake_record["effect_claim_digest"]
+        );
+        assert_eq!(
+            exit_record["claim_record_digest"],
+            handshake_record["claim_record_digest"]
+        );
+        assert_eq!(
+            exit_record["handshake_digest"],
+            lower_hex(&Sha256::digest(&handshake_bytes))
+        );
+        assert_eq!(exit_record["included_write_sequence"], "1");
+        assert_eq!(
+            exit_record["receipt_digest"],
+            handshake_record["receipt_digest"]
+        );
+        assert_eq!(
+            exit_record["preflight_receipt_sha256"],
+            std::env::var("RHIZOME_BARRIER_FAULT_PREFLIGHT_RECEIPT_SHA256").unwrap()
+        );
+        assert_eq!(
+            exit_record["supervisor_unit"],
+            std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_UNIT").unwrap()
+        );
+        assert_eq!(
+            exit_record["supervisor_cgroup"],
+            std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_CGROUP").unwrap()
+        );
+        assert_eq!(
+            exit_record["linux_boot_id"],
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+        );
+        assert!(exit_record["pid_start_time_ticks"].parse::<u64>().unwrap() > 0);
+        let child_start_ticks = exit_record["pid_start_time_ticks"].parse::<u64>().unwrap();
+        assert!(
+            exit_record["joined_at_unix_seconds"]
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+        assert!(exit_record["joined_at_unix_nanos"].parse::<u32>().unwrap() < 1_000_000_000);
+        assert!(exit_record["joined_at_boot_millis"].parse::<u64>().unwrap() > 0);
+        let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        assert!(clock_ticks > 0);
+        assert!(
+            exit_record["joined_at_boot_millis"].parse::<u64>().unwrap()
+                >= child_start_ticks.saturating_mul(1000) / clock_ticks as u64
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{}", exit_record["pid"])).exists());
+        assert_uuid_v4(&exit_record["run_id"]);
+        assert_uuid_v4(&exit_record["barrier_id"]);
+        for field in [
+            "preflight_receipt_sha256",
+            "request_digest",
+            "effect_claim_digest",
+            "claim_record_digest",
+            "handshake_digest",
+        ] {
+            assert_lower_hex_digest(&exit_record[field]);
+        }
+        if exit_record["receipt_digest"] != "none" {
+            assert_lower_hex_digest(&exit_record["receipt_digest"]);
+        }
+
+        // Only after the complete local crash provenance graph is closed may
+        // recovery construct an object-store client and issue any S3 read.
+        let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
+        let (fault_store, recovery_io) = crate::fault_store::FaultStore::new(raw_store);
+        recovery_io.set_put_limits(128, 16 * 1024 * 1024);
+        let object_store: Arc<dyn ObjectStore> = fault_store;
+        let (fs, reader) = open_persistent_read_only(object_store).await;
         let lookup = fs
             .workspace_barriers
             .lookup_materialized(&command)
@@ -2622,11 +2819,13 @@ mod tests {
             .unwrap();
         let (outcome, receipt_digest, included_sequence, payload_state) = match scenario {
             "before-data-cut" => {
+                assert_eq!(exit_record["receipt_digest"], "none");
                 assert!(lookup.is_none());
                 assert_eq!(bytes, Bytes::from(vec![0; context.payload.len()]));
                 ("unknown", "none".to_string(), 0, "absent")
             }
             "after-0x0d-apply" => {
+                assert_ne!(exit_record["receipt_digest"], "none");
                 assert!(lookup.is_none());
                 assert_eq!(bytes.as_ref(), context.payload.as_slice());
                 ("unknown", "none".to_string(), 0, "durable")
@@ -2636,6 +2835,10 @@ mod tests {
                 assert_eq!(receipt.included_write_sequence, 1);
                 assert_eq!(receipt.effect_claim, effect_claim);
                 assert_eq!(receipt.barrier_id, claim_record["barrier_id"]);
+                assert_eq!(
+                    exit_record["receipt_digest"],
+                    lower_hex(&receipt.receipt_digest)
+                );
                 assert_eq!(bytes.as_ref(), context.payload.as_slice());
                 (
                     "materialized",
@@ -2709,7 +2912,19 @@ mod tests {
     }
 
     fn spawn_fault_child(mode: &str, scenario: &str) -> KillJoinChild {
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        use std::os::unix::fs::MetadataExt;
+
+        let executable_fd = std::env::var("RHIZOME_BARRIER_FAULT_TEST_EXECUTABLE_FD").unwrap();
+        let parsed_fd = executable_fd.parse::<u32>().unwrap();
+        assert!(parsed_fd > 2 && parsed_fd.to_string() == executable_fd);
+        let executable = format!("/proc/self/fd/{parsed_fd}");
+        let executable_metadata = std::fs::metadata(&executable).unwrap();
+        let process_metadata = std::fs::metadata("/proc/self/exe").unwrap();
+        assert!(executable_metadata.is_file());
+        assert_eq!(executable_metadata.dev(), process_metadata.dev());
+        assert_eq!(executable_metadata.ino(), process_metadata.ino());
+        assert_eq!(executable_metadata.size(), process_metadata.size());
+        let child = std::process::Command::new(executable)
             .arg("--exact")
             .arg(FOUNDATION_FAULT_TEST)
             .arg("--ignored")
@@ -2834,9 +3049,10 @@ mod tests {
                 );
                 assert_eq!(
                     handshake["claim_record_digest"],
-                    lower_hex(&Sha256::digest(
-                        std::fs::read(claim_path(&root, scenario)).unwrap()
-                    ))
+                    lower_hex(&Sha256::digest(read_root_owned_scenario_file(
+                        &root,
+                        &format!("{scenario}.claim")
+                    )))
                 );
                 match scenario {
                     "before-data-cut" => {

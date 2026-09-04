@@ -184,22 +184,38 @@ It binds the Linux boot ID, child PID and procfs start-time ticks, signal, wall
 and boot-time join observations, exact systemd unit and cgroup, the pre-effect
 preflight-receipt SHA-256, and the exact request, barrier, claim, handshake and
 receipt digests. Recovery cannot start before this exit receipt is durably
-readable. The operator must provide the exact supervisor unit/cgroup and a
+readable. Before constructing its S3 client, the recovery child opens the
+root-owned context, claim, handshake, and exit artifacts without following
+links, requires their closed schemas and file identities, and cross-checks
+every run/scenario, process, preflight, request, barrier, claim, handshake,
+included-sequence, and receipt binding. The operator must provide the exact supervisor unit/cgroup and a
 lowercase SHA-256 for a preflight receipt that already seals source, executable,
 toolchain binaries, non-secret backend generation/config identity, and the
 collector itself; all three are required before the first S3 access.
 
 `zerofs/scripts/run-rhizome-barrier-foundation.sh` is the versioned inner
 systemd runner. Before the test can touch S3 it verifies the fresh root/evidence
-directories, seals the clean source tree, exact test executable and build
+directories and durably burns the UUID with a no-replace attempt receipt. It
+seals the clean source tree, exact test executable and build
 record, `rustc`/`cargo` binaries plus the complete sysroot file manifest, runner
 and terminal-collector hashes, Linux boot, supervisor cgroup, and RustFS PID,
-start time, invocation, cgroup, binary/unit/config label, endpoint and CA. It
-rechecks the same RustFS PID/start/invocation after the matrix. Status is excluded
+start time, invocation, cgroup, binary/unit/config label, listener, endpoint and
+CA. The runner holds stable file descriptions for every executable/build input,
+the backend binary and unit, and the process-scoped CA; the test inherits the CA
+description rather than reopening its pathname, and every crash/recovery child
+executes through the inherited test-executable description after matching it to
+the parent process executable. It rechecks the same paths,
+file descriptions, RustFS PID/start/invocation/cgroup/executable/unit/listener
+generation after the matrix. Status is excluded
 from the pre-exit file manifest so the final transition cannot invalidate that
 manifest. `collect-rhizome-barrier-foundation.sh` verifies the runner/run
-manifests after the transient unit is collected, seals both the unit-wide and
-exact-invocation journals plus cgroup absence, and only then publishes PASS.
+manifests after the transient unit is collected. It independently holds stable
+collector, preflight, attempt, CA, backend executable and unit descriptions;
+requires exact START/END records in a non-empty journal for the sealed systemd
+Invocation/cgroup; revalidates the live RustFS process, unit and listener before
+and after the final empty S3 inventory; and proves the transient cgroup is absent.
+Only then does it atomically replace the intermediate status with PASS and
+publish a final recursive manifest that includes PASS and all terminal evidence.
 Both scripts fail closed and a partially created run is permanently unusable.
 
 The closed scenarios are:

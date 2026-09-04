@@ -298,13 +298,23 @@ attribution intact.
   and request/barrier/claim/handshake/receipt digests. The preflight receipt must
   already seal exact source/executable, toolchain binaries, non-secret RustFS
   generation/config identity, and collector identity. Never reconstruct an exit
-  receipt after the process has disappeared.
+  receipt after the process has disappeared. Recovery must strictly decode and
+  cross-check the complete context/claim/handshake/exit graph from root-owned,
+  no-follow file descriptions before constructing an object-store client or
+  issuing any S3 read; a matching exit pathname or digest alone is insufficient.
 - Use the versioned Foundation runner and terminal collector. The runner must
   seal complete pre-effect source/build/toolchain/collector and non-secret
   backend process-generation identity, recheck the backend generation after the
-  matrix, and never hash a mutable status value into the pre-exit manifest. The
-  collector must seal unit and invocation journals plus cgroup absence before
-  terminal PASS. Any partial runner or collector state burns the run UUID.
+  matrix, hold stable file descriptions for its executable inputs, backend
+  binary/unit and process-scoped CA, launch every crash/recovery child through
+  the inherited exact test-executable description, and never hash a mutable status value into
+  the pre-exit manifest. The collector must independently reopen stable file
+  descriptions, prove the same RustFS PID/start/invocation/cgroup/executable/
+  unit/listener generation before and after its final S3 inventory, bind a
+  non-empty exact systemd invocation journal to the preflight cgroup, and prove
+  cgroup absence before terminal PASS. Publish PASS before one final recursive
+  manifest that seals PASS and the complete terminal evidence. Any partial
+  runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
   poller, then assert zero object-store PUTs and drop the filesystem. Never open
