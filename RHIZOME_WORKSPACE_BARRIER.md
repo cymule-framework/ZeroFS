@@ -343,9 +343,55 @@ passed exact CI and both code reviews. Foundation run
 but remains `BEHAVIOR_PASS_PROVENANCE_INCOMPLETE`: it did not publish durable
 per-scenario exit receipts and its sealed run preflight did not bind complete
 toolchain/backend process generations or the collector. It must never be reused
-or promoted. This successor exit-receipt contract is unexecuted pending fresh
-CI and review; only a new canonical UUID may exercise it.
+or promoted. That run did not exercise the successor exit-receipt contract;
+only a later fresh canonical UUID could do so.
 
-Even after a future pass this harness is
+Source `9b5bb795baf8dbc5c8d8c69866e7a34da4499170`, tree
+`50e11f048d44aa5a19ff568c51b38027ab8d2927`, closes that successor contract.
+GitHub Actions run `33851129613` completed all three jobs, including
+the mandatory root PONR test in an isolated mount namespace. The exact source
+bundle SHA-256 is
+`26040146883ae59185ff09c21cbe52103aabceb0f31ebe0ec6fe3ceb7c3c42f7`.
+Foundation build `build-9b5bb795-b4` used a closed offline environment and
+produced test executable SHA-256
+`68fdd719e7355dd5647ad37f0ed77c66826759c423ce2ab0351a326ed4cd8f68`;
+its build-environment, sysroot-manifest, and build-JSON SHA-256 values are
+`f8b3ad715e87c54f5cf1017ba78920f0087d0929f6fe556379b6d79e24dbaac2`,
+`f65cc6b9e7515d0362d30347d2a09562a74d7be88cf05f1100cb9eaef6ce7b15`,
+and `ffb94ac37e0c4d2c791d25f2889975a157d5c6646c259404ef144d5b2646aad6`.
+The preceding build candidates remain non-qualifying: `b1` could not locate
+`rustc`, `b2` lacked a closed build environment, and `b3` exited during
+post-build evidence comparison. None received a run UUID.
+
+Foundation run `4a56166f-e203-46bc-b4f0-5f529d18e5d2` is permanent setup-only
+failed evidence. Its systemd wrapper exited 127 in 2 ms because the runner
+environment option was placed after the command; the versioned runner never
+entered and no test or S3 effect ran. Its setup-failure receipt and invocation
+journal are retained and the UUID must never be reused.
+
+Foundation formal run `ed63788f-5b6d-48ee-976b-1ef81b687146`, systemd
+invocation `4b8bc5853b62419399782fc90b536b0b`, is PASS for this exact harness
+scope. Its preflight SHA-256 is
+`fd25d694f5286b611c5783cd71308beae35c1b86887e07f4ba1387a5cc20c06c`;
+final manifest, final seal, terminal manifest, retry manifest and retry FINAL
+SHA-256 values are respectively
+`92597ca3ea94ba48f68eccdf92fd462896e8e15b6dd6d27108dd8681b27f7888`,
+`dc5734bc2efcfc123bb3e4f8d3954c01e1d14a8cfbd4d720e8f0b12fafdd8357`,
+`eef23a0b06ed52f8f0e2776a5288fcbd4b0bb2cd71faa91c616a0a0b235002f1`,
+`b2e1a7c4ddf0368a27fd0966f438dd0d17f8b55b45e144c9a360e651fb4c52d3`,
+and `d0ed92da7618fe1d0d9d8094d9e871abd91ef64e8ba43cceadccddc7b785d3dd`.
+Both independent evidence reviews passed. They recomputed every manifest and
+all four context/claim/handshake/exit/recovery chains, confirmed the expected
+two UNKNOWN and two MATERIALIZED outcomes, exact payload/sequence/receipt
+states, SIGKILL and direct-child join identities, and zero recovery PUTs. The
+runner and collector retries were rejected with a byte-identical source
+inventory (`463a8156d0be7be0edcafb65766658dc49f989af942371d75e59f8c310c33852`),
+and a second finalizer call converged read-only with unchanged full three-tree
+digest `c92aa4a9e6f410399574418266d2e9d2838895335d5ac9cb24f938a5430566bc`.
+The transient unit and cgroup are absent, the retained S3 base and four
+scenario inventories are empty, and the immutable source/run/retry trees keep
+their exact root-owned 0400/0500 profile.
+
+This passing harness is
 not NBD FLUSH, Firecracker, production COSE/receipt, external-production-S3,
 power-loss, HA, release, or Actor READY evidence.

@@ -361,6 +361,17 @@ attribution intact.
   bounded tmpfs; do not weaken the production ancestor policy for a hosted
   runner's writable `/opt`. Any partial
   runner or collector state burns the run UUID.
+- Exact source `9b5bb795baf8dbc5c8d8c69866e7a34da4499170` has one
+  Foundation RustFS process-fault qualification run
+  `ed63788f-5b6d-48ee-976b-1ef81b687146`, recorded in
+  `RHIZOME_WORKSPACE_BARRIER.md`. Its two independent evidence reviews passed.
+  It qualifies only the four versioned barrier crash/recovery scenarios,
+  exact export Write sequence, RustFS response-loss boundary, root-owned
+  runner/collector/finalizer mechanics, and read-only recovery with zero PUTs.
+  It is not NBD FLUSH, Firecracker, production COSE/receipt,
+  external-production-S3, power-loss, HA, release, or Actor READY evidence.
+  Preserve setup-only failed run `4a56166f-e203-46bc-b4f0-5f529d18e5d2`
+  and non-qualifying builds b1/b2/b3; never reuse or relabel them.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
   poller, then assert zero object-store PUTs and drop the filesystem. Never open
