@@ -285,9 +285,13 @@ attribution intact.
   crash window. The manifest response-loss boundary must block after the real
   inner manifest PUT succeeds and before SlateDB observes a response.
 - The after-claim hook must persist the exact barrier ID and full 0x0A claim
-  digest. Context, claim, atomic no-replace handshake, and read-only recovery
-  must all match that same command/claim; accepting any EffectDispatched value
-  is not sufficient. Retain child ownership until bounded wait confirms reap.
+  bytes plus digest. The versioned closed context record, claim, atomic
+  no-replace handshake, exit and read-only recovery records must form one
+  digest chain and match that same complete command/claim before recovery may
+  construct an S3 client; accepting any EffectDispatched value or matching
+  copied scalar digests is not sufficient. Bind the recovery child PID/start/
+  boot/cgroup and exact input-record digests into its retained record. Retain
+  child ownership until bounded wait confirms reap.
   The final handshake pathname alone is not readiness: child holds its file
   lock across no-replace publish and directory fsync, and parent may kill only
   after it acquires that lock. If bounded reap fails, abort without S3 cleanup
@@ -307,14 +311,18 @@ attribution intact.
   backend process-generation identity, recheck the backend generation after the
   matrix, hold stable file descriptions for its executable inputs, backend
   binary/unit and process-scoped CA, launch every crash/recovery child through
-  the inherited exact test-executable description, and never hash a mutable status value into
-  the pre-exit manifest. The collector must independently reopen stable file
-  descriptions, prove the same RustFS PID/start/invocation/cgroup/executable/
-  unit/listener generation before and after its final S3 inventory, bind a
-  non-empty exact systemd invocation journal to the preflight cgroup, and prove
-  cgroup absence before terminal PASS. Publish PASS before one final recursive
-  manifest that seals PASS and the complete terminal evidence. Any partial
-  runner or collector state burns the run UUID.
+  the inherited exact test-executable description, and never hash a mutable
+  status value into the pre-exit manifest. The collector must durably publish
+  its root-level atomic attempt receipt before creating the terminal directory.
+  It must independently reopen stable file descriptions, prove the same RustFS
+  PID/start/invocation/cgroup/executable/unit/listener generation before and
+  after its final S3 inventory, bind a non-empty exact systemd invocation
+  journal to the preflight cgroup, and prove cgroup absence before terminal
+  PASS. Publish an immutable PASS body, then a complete recursive manifest and
+  its read-back-bound final seal; only that final seal may be terminal PASS
+  authority. The convenience `status` pathname may transition to the already
+  sealed PASS inode only afterward. Any partial runner or collector state burns
+  the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
   poller, then assert zero object-store PUTs and drop the filesystem. Never open

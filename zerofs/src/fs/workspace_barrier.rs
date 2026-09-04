@@ -1120,8 +1120,9 @@ pub(crate) async fn foundation_process_crash_point(
     let mut file = std::fs::File::from(fd);
     file.write_all(
         format!(
-            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\npreflight_receipt_sha256={preflight_receipt_sha256}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\npreflight_receipt_sha256={preflight_receipt_sha256}\ncontext_record_digest={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
             std::process::id(),
+            claim_field("context_record_digest"),
             hex(command.request_digest.as_bytes()),
             claim_field("barrier_id"),
             claim_field("effect_claim_digest"),
@@ -2287,6 +2288,7 @@ mod tests {
                 "supervisor_unit",
                 "supervisor_cgroup",
                 "preflight_receipt_sha256",
+                "context_record_digest",
                 "request_digest",
                 "barrier_id",
                 "effect_claim_digest",
@@ -2312,12 +2314,46 @@ mod tests {
                 "point",
                 "pid",
                 "preflight_receipt_sha256",
+                "context_record_digest",
                 "request_digest",
                 "barrier_id",
                 "effect_claim_digest",
                 "claim_record_digest",
                 "included_write_sequence",
                 "receipt_digest",
+            ],
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_recovery_record(
+        root: &std::path::Path,
+        scenario: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        read_closed_scenario_record(
+            root,
+            &format!("{scenario}.recovery"),
+            &[
+                "schema",
+                "run_id",
+                "scenario",
+                "recovery_pid",
+                "recovery_pid_start_time_ticks",
+                "recovery_linux_boot_id",
+                "recovery_cgroup",
+                "preflight_receipt_sha256",
+                "context_record_digest",
+                "request_digest",
+                "barrier_id",
+                "effect_claim_digest",
+                "claim_record_digest",
+                "handshake_digest",
+                "exit_receipt_digest",
+                "outcome",
+                "included_write_sequence",
+                "receipt_digest",
+                "payload",
+                "recovery_puts",
             ],
         )
     }
@@ -2450,7 +2486,7 @@ mod tests {
         }
         let joined_at_boot_millis = whole.parse::<u64>().unwrap() * 1000 + millis;
         let bytes = format!(
-            "schema=1\nrun_id={run_id}\nscenario={scenario}\npid={}\npid_start_time_ticks={}\nlinux_boot_id={}\nsignal={}\njoined_at_unix_seconds={}\njoined_at_unix_nanos={}\njoined_at_boot_millis={joined_at_boot_millis}\nsupervisor_unit={expected_unit}\nsupervisor_cgroup={}\npreflight_receipt_sha256={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nhandshake_digest={}\nincluded_write_sequence={}\nreceipt_digest={}\n",
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npid={}\npid_start_time_ticks={}\nlinux_boot_id={}\nsignal={}\njoined_at_unix_seconds={}\njoined_at_unix_nanos={}\njoined_at_boot_millis={joined_at_boot_millis}\nsupervisor_unit={expected_unit}\nsupervisor_cgroup={}\npreflight_receipt_sha256={}\ncontext_record_digest={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nhandshake_digest={}\nincluded_write_sequence={}\nreceipt_digest={}\n",
             process.pid,
             process.start_time_ticks,
             process.boot_id,
@@ -2459,6 +2495,7 @@ mod tests {
             joined.subsec_nanos(),
             process.cgroup,
             handshake["preflight_receipt_sha256"],
+            handshake["context_record_digest"],
             handshake["request_digest"],
             handshake["barrier_id"],
             handshake["effect_claim_digest"],
@@ -2473,20 +2510,50 @@ mod tests {
         assert_eq!(record["signal"], libc::SIGKILL.to_string());
     }
 
+    fn decode_fault_context_record(bytes: &[u8], scenario: &str) -> FoundationFaultContext {
+        let record = parse_closed_record(
+            std::str::from_utf8(bytes).unwrap(),
+            &[
+                "schema",
+                "run_id",
+                "scenario",
+                "context_payload_hex",
+                "context_payload_sha256",
+            ],
+        );
+        assert_eq!(record["schema"], "1");
+        assert_eq!(
+            record["run_id"],
+            std::env::var("RHIZOME_BARRIER_FAULT_RUN_ID").unwrap()
+        );
+        assert_eq!(record["scenario"], scenario);
+        let payload = decode_lower_hex(&record["context_payload_hex"]);
+        assert_eq!(
+            lower_hex(&Sha256::digest(&payload)),
+            record["context_payload_sha256"]
+        );
+        codec().deserialize(&payload).unwrap()
+    }
+
     fn read_fault_context(root: &std::path::Path, scenario: &str) -> FoundationFaultContext {
         let bytes = read_root_owned_scenario_file(root, &format!("{scenario}.context"));
-        codec().deserialize(&bytes).unwrap()
+        decode_fault_context_record(&bytes, scenario)
     }
 
     fn persist_fault_context(
         root: &std::path::Path,
         scenario: &str,
         context: &FoundationFaultContext,
-    ) {
-        write_new_durable(
-            &context_path(root, scenario),
-            &codec().serialize(context).unwrap(),
+    ) -> [u8; 32] {
+        let payload = codec().serialize(context).unwrap();
+        let run_id = std::env::var("RHIZOME_BARRIER_FAULT_RUN_ID").unwrap();
+        let record = format!(
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\ncontext_payload_hex={}\ncontext_payload_sha256={}\n",
+            lower_hex(&payload),
+            lower_hex(&Sha256::digest(&payload))
         );
+        write_new_durable(&context_path(root, scenario), record.as_bytes());
+        Sha256::digest(record.as_bytes()).into()
     }
 
     fn parse_closed_record(
@@ -2517,6 +2584,25 @@ mod tests {
         );
     }
 
+    fn decode_lower_hex(value: &str) -> Vec<u8> {
+        assert!(
+            !value.is_empty()
+                && value.len() <= MAX_RECORD_BYTES * 2
+                && value.len().is_multiple_of(2)
+        );
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
     fn assert_uuid_v4(value: &str) {
         let parsed = uuid::Uuid::parse_str(value).unwrap();
         assert_eq!(parsed.get_version_num(), 4);
@@ -2527,6 +2613,7 @@ mod tests {
         root: &std::path::Path,
         scenario: &str,
         request_digest: [u8; 32],
+        context_record_digest: [u8; 32],
         claim: &[u8],
         barrier_id: &str,
     ) {
@@ -2536,8 +2623,10 @@ mod tests {
         write_new_durable(
             &claim_path(root, scenario),
             format!(
-                "schema=1\nscenario={scenario}\nrequest_digest={}\nbarrier_id={barrier_id}\neffect_claim_digest={}\nincluded_write_sequence=1\n",
+                "schema=1\nscenario={scenario}\ncontext_record_digest={}\nrequest_digest={}\nbarrier_id={barrier_id}\neffect_claim_hex={}\neffect_claim_digest={}\nincluded_write_sequence=1\n",
+                lower_hex(&context_record_digest),
                 lower_hex(&request_digest),
+                lower_hex(claim),
                 lower_hex(&Sha256::digest(claim)),
             )
             .as_bytes(),
@@ -2554,8 +2643,10 @@ mod tests {
             &[
                 "schema",
                 "scenario",
+                "context_record_digest",
                 "request_digest",
                 "barrier_id",
+                "effect_claim_hex",
                 "effect_claim_digest",
                 "included_write_sequence",
             ],
@@ -2567,6 +2658,7 @@ mod tests {
         root: &std::path::Path,
         scenario: &str,
         context: &FoundationFaultContext,
+        context_record_digest: [u8; 32],
     ) {
         let store = fs.export_authority.clone();
         let root = root.to_path_buf();
@@ -2603,7 +2695,14 @@ mod tests {
                     if outcome.mutation.sequence != 1 {
                         return Err(BarrierError::Corrupt);
                     }
-                    persist_claim_record(&root, &scenario, request_digest, &claim, &barrier_id);
+                    persist_claim_record(
+                        &root,
+                        &scenario,
+                        request_digest,
+                        context_record_digest,
+                        &claim,
+                        &barrier_id,
+                    );
                     Ok(())
                 })
             }));
@@ -2637,8 +2736,8 @@ mod tests {
             payload: b"rhizome-export-data-after-durable-barrier-claim".to_vec(),
             mutation_operation_id: operation_id,
         };
-        persist_fault_context(&root, scenario, &context);
-        install_after_claim_write(&fs, &root, scenario, &context);
+        let context_record_digest = persist_fault_context(&root, scenario, &context);
+        install_after_claim_write(&fs, &root, scenario, &context, context_record_digest);
         if scenario == "manifest-applied-before-response" {
             let armed_faults = faults.clone();
             fs.write_coordinator
@@ -2654,11 +2753,15 @@ mod tests {
         panic!("crash child returned before SIGKILL: {result:?}");
     }
 
+    #[cfg(target_os = "linux")]
     async fn foundation_fault_recovery_child(scenario: &str) {
         let (run_id, root, base_prefix) = foundation_fault_run();
-        let context = read_fault_context(&root, scenario);
+        let context_bytes = read_root_owned_scenario_file(&root, &format!("{scenario}.context"));
+        let context_record_digest = lower_hex(&Sha256::digest(&context_bytes));
+        let context = decode_fault_context_record(&context_bytes, scenario);
         let command = context.command();
         let claim_record = read_claim_record(&root, scenario);
+        let exit_bytes = read_root_owned_scenario_file(&root, &format!("{scenario}.exit"));
         let exit_record = read_exit_record(&root, scenario);
         let handshake_record = read_handshake_record(&root, scenario);
         let claim_bytes = read_root_owned_scenario_file(&root, &format!("{scenario}.claim"));
@@ -2671,9 +2774,21 @@ mod tests {
             lower_hex(&context.request_digest)
         );
         assert_eq!(claim_record["included_write_sequence"], "1");
+        assert_eq!(claim_record["context_record_digest"], context_record_digest);
+        assert_lower_hex_digest(&claim_record["context_record_digest"]);
         assert_lower_hex_digest(&claim_record["request_digest"]);
         assert_lower_hex_digest(&claim_record["effect_claim_digest"]);
         assert_uuid_v4(&claim_record["barrier_id"]);
+        let exact_effect_claim = decode_lower_hex(&claim_record["effect_claim_hex"]);
+        assert_eq!(
+            lower_hex(&Sha256::digest(&exact_effect_claim)),
+            claim_record["effect_claim_digest"]
+        );
+        assert!(claim_matches(
+            &exact_effect_claim,
+            &command,
+            &claim_record["barrier_id"]
+        ));
 
         assert_eq!(handshake_record["schema"], "1");
         assert_eq!(handshake_record["run_id"], run_id);
@@ -2697,6 +2812,10 @@ mod tests {
             lower_hex(&Sha256::digest(&claim_bytes))
         );
         assert_eq!(handshake_record["included_write_sequence"], "1");
+        assert_eq!(
+            handshake_record["context_record_digest"],
+            claim_record["context_record_digest"]
+        );
         assert_lower_hex_digest(&handshake_record["preflight_receipt_sha256"]);
         assert_lower_hex_digest(&handshake_record["request_digest"]);
         assert_lower_hex_digest(&handshake_record["effect_claim_digest"]);
@@ -2726,6 +2845,10 @@ mod tests {
             lower_hex(&Sha256::digest(&handshake_bytes))
         );
         assert_eq!(exit_record["included_write_sequence"], "1");
+        assert_eq!(
+            exit_record["context_record_digest"],
+            handshake_record["context_record_digest"]
+        );
         assert_eq!(
             exit_record["receipt_digest"],
             handshake_record["receipt_digest"]
@@ -2769,6 +2892,7 @@ mod tests {
         assert_uuid_v4(&exit_record["barrier_id"]);
         for field in [
             "preflight_receipt_sha256",
+            "context_record_digest",
             "request_digest",
             "effect_claim_digest",
             "claim_record_digest",
@@ -2779,6 +2903,11 @@ mod tests {
         if exit_record["receipt_digest"] != "none" {
             assert_lower_hex_digest(&exit_record["receipt_digest"]);
         }
+        let recovery_process = read_linux_process_identity(std::process::id());
+        assert_eq!(
+            recovery_process.cgroup,
+            std::env::var("RHIZOME_BARRIER_FAULT_SUPERVISOR_CGROUP").unwrap()
+        );
 
         // Only after the complete local crash provenance graph is closed may
         // recovery construct an object-store client and issue any S3 read.
@@ -2803,6 +2932,7 @@ mod tests {
         let WorkspaceOperationState::EffectDispatched(effect_claim) = operation.state else {
             panic!("crash recovery must retain the exact effect-dispatch claim");
         };
+        assert_eq!(effect_claim, exact_effect_claim);
         assert_eq!(
             claim_record["effect_claim_digest"],
             lower_hex(&Sha256::digest(&effect_claim))
@@ -2856,8 +2986,18 @@ mod tests {
         write_new_durable(
             &recovery_path(&root, scenario),
             format!(
-                "schema=1\nscenario={scenario}\noutcome={outcome}\nrequest_digest={}\nincluded_write_sequence={included_sequence}\nreceipt_digest={receipt_digest}\npayload={payload_state}\nrecovery_puts=0\n",
+                "schema=1\nrun_id={run_id}\nscenario={scenario}\nrecovery_pid={}\nrecovery_pid_start_time_ticks={}\nrecovery_linux_boot_id={}\nrecovery_cgroup={}\npreflight_receipt_sha256={}\ncontext_record_digest={context_record_digest}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nhandshake_digest={}\nexit_receipt_digest={}\noutcome={outcome}\nincluded_write_sequence={included_sequence}\nreceipt_digest={receipt_digest}\npayload={payload_state}\nrecovery_puts=0\n",
+                recovery_process.pid,
+                recovery_process.start_time_ticks,
+                recovery_process.boot_id,
+                recovery_process.cgroup,
+                exit_record["preflight_receipt_sha256"],
                 lower_hex(&context.request_digest),
+                claim_record["barrier_id"],
+                claim_record["effect_claim_digest"],
+                exit_record["claim_record_digest"],
+                exit_record["handshake_digest"],
+                lower_hex(&Sha256::digest(&exit_bytes)),
             )
             .as_bytes(),
         );
@@ -2970,6 +3110,7 @@ mod tests {
                                 "point",
                                 "pid",
                                 "preflight_receipt_sha256",
+                                "context_record_digest",
                                 "request_digest",
                                 "barrier_id",
                                 "effect_claim_digest",
@@ -3037,7 +3178,18 @@ mod tests {
                 let crash_process = read_linux_process_identity(crash.child().id());
                 let context = read_fault_context(&root, scenario);
                 let claim_record = read_claim_record(&root, scenario);
+                assert_eq!(
+                    handshake["context_record_digest"],
+                    lower_hex(&Sha256::digest(read_root_owned_scenario_file(
+                        &root,
+                        &format!("{scenario}.context")
+                    )))
+                );
                 assert_eq!(handshake["run_id"], run_id);
+                assert_eq!(
+                    handshake["context_record_digest"],
+                    claim_record["context_record_digest"]
+                );
                 assert_eq!(
                     handshake["request_digest"],
                     lower_hex(&context.request_digest)
@@ -3074,11 +3226,68 @@ mod tests {
                 );
 
                 let mut recovery = spawn_fault_child("recover", scenario);
+                let recovery_process = read_linux_process_identity(recovery.child().id());
                 let recovery_status = recovery
                     .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(120));
                 assert!(recovery_status.success());
-                let recovery_result =
-                    std::fs::read_to_string(recovery_path(&root, scenario)).unwrap();
+                let recovery_record = read_recovery_record(&root, scenario);
+                assert_eq!(recovery_record["run_id"], run_id);
+                assert_eq!(recovery_record["scenario"], scenario);
+                assert_eq!(
+                    recovery_record["preflight_receipt_sha256"],
+                    handshake["preflight_receipt_sha256"]
+                );
+                assert_eq!(
+                    recovery_record["request_digest"],
+                    handshake["request_digest"]
+                );
+                assert_eq!(recovery_record["barrier_id"], handshake["barrier_id"]);
+                assert_eq!(
+                    recovery_record["effect_claim_digest"],
+                    handshake["effect_claim_digest"]
+                );
+                assert_eq!(
+                    recovery_record["recovery_pid"],
+                    recovery_process.pid.to_string()
+                );
+                assert_eq!(
+                    recovery_record["recovery_pid_start_time_ticks"],
+                    recovery_process.start_time_ticks.to_string()
+                );
+                assert_eq!(
+                    recovery_record["recovery_linux_boot_id"],
+                    recovery_process.boot_id
+                );
+                assert_eq!(recovery_record["recovery_cgroup"], recovery_process.cgroup);
+                assert!(!std::path::Path::new(&format!("/proc/{}", recovery_process.pid)).exists());
+                assert_eq!(
+                    recovery_record["context_record_digest"],
+                    handshake["context_record_digest"]
+                );
+                assert_eq!(
+                    recovery_record["claim_record_digest"],
+                    handshake["claim_record_digest"]
+                );
+                assert_eq!(
+                    recovery_record["handshake_digest"],
+                    lower_hex(&Sha256::digest(read_root_owned_scenario_file(
+                        &root,
+                        &format!("{scenario}.handshake")
+                    )))
+                );
+                assert_eq!(
+                    recovery_record["exit_receipt_digest"],
+                    lower_hex(&Sha256::digest(read_root_owned_scenario_file(
+                        &root,
+                        &format!("{scenario}.exit")
+                    )))
+                );
+                let recovery_result = std::str::from_utf8(&read_root_owned_scenario_file(
+                    &root,
+                    &format!("{scenario}.recovery"),
+                ))
+                .unwrap()
+                .to_owned();
                 assert!(recovery_result.contains(&format!("scenario={scenario}\n")));
                 assert!(recovery_result.contains("recovery_puts=0\n"));
                 match scenario {

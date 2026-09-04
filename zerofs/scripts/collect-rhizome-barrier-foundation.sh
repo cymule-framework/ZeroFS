@@ -25,33 +25,9 @@ for path in sys.argv[1:]:
         assert not stat.S_ISLNK(info.st_mode)
     assert stat.S_ISDIR(os.lstat(path).st_mode)
 PY
-TERMINAL="$EVIDENCE_ROOT/terminal"
-umask 077
-mkdir -m 0700 "$TERMINAL"
-chown root:root "$TERMINAL"
-sync -f "$EVIDENCE_ROOT"
-[[ $(stat -c '%a:%U:%G' "$TERMINAL") == 700:root:root ]]
-[[ $(find "$TERMINAL" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
-
-# This durable attempt is the collector PONR. Any later error burns the run.
 COLLECTOR=$(readlink -f "$0")
 exec {COLLECTOR_FD}<"$COLLECTOR"
 COLLECTOR_FD_PATH="/proc/self/fd/$COLLECTOR_FD"
-cat >"$TERMINAL/attempt.pending" <<EOF
-schema=1
-run_id=$RUN_ID
-collector_sha256=$(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1)
-collector_device_inode_size=$(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH")
-collector_pid=$$
-linux_boot_id=$(tr -d '\n' </proc/sys/kernel/random/boot_id)
-attempted_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF
-chmod 0600 "$TERMINAL/attempt.pending"
-sync -f "$TERMINAL/attempt.pending"
-ln "$TERMINAL/attempt.pending" "$TERMINAL/attempt"
-sync -f "$TERMINAL"
-unlink "$TERMINAL/attempt.pending"
-sync -f "$TERMINAL"
 python3 - "$COLLECTOR" <<'PY'
 import os,stat,sys
 path=sys.argv[1]; assert os.path.isabs(path) and os.path.realpath(path)==path
@@ -62,6 +38,47 @@ for part in (part for part in path.split('/') if part):
     assert not stat.S_ISLNK(info.st_mode)
 final=os.lstat(path); assert stat.S_ISREG(final.st_mode) and final.st_nlink==1
 PY
+COLLECTOR_SHA=$(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1)
+COLLECTOR_IDENTITY=$(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH")
+COLLECTOR_START=$(python3 - $$ <<'PY'
+import sys
+text=open(f'/proc/{sys.argv[1]}/stat').read()
+print(text[text.rfind(')') + 2:].split()[19])
+PY
+)
+COLLECTOR_BOOT=$(tr -d '\n' </proc/sys/kernel/random/boot_id)
+COLLECTOR_ATTEMPT="$EVIDENCE_ROOT/collector-attempt.receipt"
+COLLECTOR_ATTEMPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+python3 - "$COLLECTOR_ATTEMPT.pending" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" "$COLLECTOR_ATTEMPTED_AT" <<'PY'
+import os,sys
+path,run,pid,start,boot,digest,identity,when=sys.argv[1:]
+data=f'schema=1\nrun_id={run}\ncollector_pid={pid}\ncollector_pid_start_time_ticks={start}\nlinux_boot_id={boot}\ncollector_sha256={digest}\ncollector_device_inode_size={identity}\nattempted_at_utc={when}\n'.encode()
+fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try:
+    view=memoryview(data)
+    while view:
+        written=os.write(fd,view); assert written>0; view=view[written:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+ln "$COLLECTOR_ATTEMPT.pending" "$COLLECTOR_ATTEMPT"
+sync -f "$EVIDENCE_ROOT"
+unlink "$COLLECTOR_ATTEMPT.pending"
+sync -f "$EVIDENCE_ROOT"
+exec {COLLECTOR_ATTEMPT_FD}<"$COLLECTOR_ATTEMPT"
+COLLECTOR_ATTEMPT_FD_PATH="/proc/self/fd/$COLLECTOR_ATTEMPT_FD"
+COLLECTOR_ATTEMPT_IDENTITY=$(stat -Lc '%d:%i:%s' "$COLLECTOR_ATTEMPT_FD_PATH")
+COLLECTOR_ATTEMPT_SHA=$(sha256sum "$COLLECTOR_ATTEMPT_FD_PATH" | cut -d' ' -f1)
+
+# The durable attempt above is the collector PONR. Any later error burns the run.
+TERMINAL="$EVIDENCE_ROOT/terminal"
+umask 077
+mkdir -m 0700 "$TERMINAL"
+chown root:root "$TERMINAL"
+sync -f "$EVIDENCE_ROOT"
+[[ $(stat -c '%a:%U:%G' "$TERMINAL") == 700:root:root ]]
+[[ $(find "$TERMINAL" -mindepth 1 -maxdepth 1 | wc -l) == 0 ]]
 
 [[ -n ${AWS_ACCESS_KEY_ID:-} && -n ${AWS_SECRET_ACCESS_KEY:-} && -n ${SSL_CERT_FILE:-} && -n ${AWS_DEFAULT_REGION:-} && -n ${RHIZOME_BARRIER_S3_BUCKET:-} ]] || {
     echo "standard AWS credentials, region, bucket, and process-scoped trust are required" >&2
@@ -145,9 +162,27 @@ field() { awk -F= -v key="$1" '$1 == key { print substr($0, length(key) + 2) }' 
 INVOCATION_ID=$(field supervisor_invocation_id)
 SUPERVISOR_CGROUP=$(field supervisor_cgroup)
 EXPECTED_HASH=$(field terminal_collector_sha256)
-[[ $(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1) == "$EXPECTED_HASH" ]]
+[[ $COLLECTOR_SHA == "$EXPECTED_HASH" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH") == "$(field terminal_collector_device_inode_size)" ]]
 [[ $(stat -Lc '%d:%i:%s' "$COLLECTOR") == "$(field terminal_collector_device_inode_size)" ]]
+[[ $(sha256sum "$COLLECTOR_ATTEMPT_FD_PATH" | cut -d' ' -f1) == "$COLLECTOR_ATTEMPT_SHA" ]]
+[[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_ATTEMPT_FD_PATH") == "$COLLECTOR_ATTEMPT_IDENTITY" ]]
+[[ $(stat -Lc '%d:%i:%s' "$COLLECTOR_ATTEMPT") == "$COLLECTOR_ATTEMPT_IDENTITY" ]]
+python3 - "$COLLECTOR_ATTEMPT_FD_PATH" "$RUN_ID" "$$" "$COLLECTOR_START" "$COLLECTOR_BOOT" "$COLLECTOR_SHA" "$COLLECTOR_IDENTITY" <<'PY'
+import re,sys
+path,run,pid,start,boot,digest,identity=sys.argv[1:]
+expected={'schema','run_id','collector_pid','collector_pid_start_time_ticks','linux_boot_id',
+          'collector_sha256','collector_device_inode_size','attempted_at_utc'}
+values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
+for line in text.splitlines():
+    key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
+    values[key]=value
+assert set(values)==expected and values['schema']=='1' and values['run_id']==run
+assert values['collector_pid']==pid and values['collector_pid_start_time_ticks']==start
+assert values['linux_boot_id']==boot and values['collector_sha256']==digest
+assert values['collector_device_inode_size']==identity
+assert re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z',values['attempted_at_utc'])
+PY
 [[ $RUN_ATTEMPT_SHA == "$(field attempt_receipt_sha256)" ]]
 CA_FILE=$(readlink -f "$SSL_CERT_FILE")
 exec {CA_FD}<"$CA_FILE"
@@ -206,7 +241,9 @@ for path in sys.argv[1:]:
         current=os.path.join(current,part); info=os.lstat(current)
         assert info.st_uid==0 and info.st_gid==0 and info.st_mode & 0o022 == 0
         assert not stat.S_ISLNK(info.st_mode)
-    final=os.lstat(path); assert stat.S_ISREG(final.st_mode) and final.st_nlink==1
+    final=os.lstat(path)
+    if stat.S_ISREG(final.st_mode): assert final.st_nlink==1
+    else: assert stat.S_ISDIR(final.st_mode)
 PY
 
 journalctl -u "$UNIT" --no-pager -o json >"$TERMINAL/unit-journal.jsonl"
@@ -260,29 +297,45 @@ def record(name, fields):
         result[key]=value
     assert set(result)==set(fields),(name,set(result),set(fields))
     return result,raw
-claim_fields=('schema','scenario','request_digest','barrier_id','effect_claim_digest','included_write_sequence')
-handshake_fields=('schema','run_id','scenario','point','pid','preflight_receipt_sha256','request_digest',
-                  'barrier_id','effect_claim_digest','claim_record_digest','included_write_sequence','receipt_digest')
+context_fields=('schema','run_id','scenario','context_payload_hex','context_payload_sha256')
+claim_fields=('schema','scenario','context_record_digest','request_digest','barrier_id','effect_claim_hex',
+              'effect_claim_digest','included_write_sequence')
+handshake_fields=('schema','run_id','scenario','point','pid','preflight_receipt_sha256','context_record_digest',
+                  'request_digest','barrier_id','effect_claim_digest','claim_record_digest',
+                  'included_write_sequence','receipt_digest')
 exit_fields=('schema','run_id','scenario','pid','pid_start_time_ticks','linux_boot_id','signal',
              'joined_at_unix_seconds','joined_at_unix_nanos','joined_at_boot_millis','supervisor_unit',
-             'supervisor_cgroup','preflight_receipt_sha256','request_digest','barrier_id','effect_claim_digest',
-             'claim_record_digest','handshake_digest','included_write_sequence','receipt_digest')
-recovery_fields=('schema','scenario','outcome','request_digest','included_write_sequence','receipt_digest',
-                 'payload','recovery_puts')
+             'supervisor_cgroup','preflight_receipt_sha256','context_record_digest','request_digest','barrier_id',
+             'effect_claim_digest','claim_record_digest','handshake_digest','included_write_sequence','receipt_digest')
+recovery_fields=('schema','run_id','scenario','recovery_pid','recovery_pid_start_time_ticks',
+                 'recovery_linux_boot_id','recovery_cgroup','preflight_receipt_sha256','context_record_digest',
+                 'request_digest','barrier_id','effect_claim_digest','claim_record_digest','handshake_digest',
+                 'exit_receipt_digest','outcome','included_write_sequence','receipt_digest','payload','recovery_puts')
 run=os.path.basename(root); assert uuid.UUID(run).version==4 and str(uuid.UUID(run))==run
 hex64=lambda value: bool(re.fullmatch(r'[0-9a-f]{64}',value))
 boot=open('/proc/sys/kernel/random/boot_id').read().strip()
 for scenario in scenarios:
+    context,context_raw=record(scenario+'.context',context_fields)
     claim,claim_raw=record(scenario+'.claim',claim_fields)
     handshake,handshake_raw=record(scenario+'.handshake',handshake_fields)
-    values,_=record(scenario+'.exit',exit_fields)
+    values,exit_raw=record(scenario+'.exit',exit_fields)
     recovery,_=record(scenario+'.recovery',recovery_fields)
+    assert context['schema']=='1' and context['run_id']==run and context['scenario']==scenario
+    assert context['context_payload_hex'] and len(context['context_payload_hex'])<=262144 and len(context['context_payload_hex'])%2==0
+    assert re.fullmatch(r'[0-9a-f]+',context['context_payload_hex'])
+    assert hex64(context['context_payload_sha256'])
+    assert hashlib.sha256(bytes.fromhex(context['context_payload_hex'])).hexdigest()==context['context_payload_sha256']
     assert claim['schema']=='1' and claim['scenario']==scenario and claim['included_write_sequence']=='1'
+    assert claim['context_record_digest']==hashlib.sha256(context_raw).hexdigest()
     assert hex64(claim['request_digest']) and hex64(claim['effect_claim_digest'])
+    assert claim['effect_claim_hex'] and len(claim['effect_claim_hex'])<=262144 and len(claim['effect_claim_hex'])%2==0
+    assert re.fullmatch(r'[0-9a-f]+',claim['effect_claim_hex'])
+    assert hashlib.sha256(bytes.fromhex(claim['effect_claim_hex'])).hexdigest()==claim['effect_claim_digest']
     assert uuid.UUID(claim['barrier_id']).version==4 and str(uuid.UUID(claim['barrier_id']))==claim['barrier_id']
     assert handshake['schema']=='1' and handshake['run_id']==run and handshake['scenario']==scenario
     assert handshake['point']==scenario and handshake['included_write_sequence']=='1'
     assert handshake['preflight_receipt_sha256']==preflight_sha
+    assert handshake['context_record_digest']==claim['context_record_digest']
     assert handshake['request_digest']==claim['request_digest']
     assert handshake['barrier_id']==claim['barrier_id']
     assert handshake['effect_claim_digest']==claim['effect_claim_digest']
@@ -291,6 +344,7 @@ for scenario in scenarios:
     assert values['signal']=='9' and values['preflight_receipt_sha256']==preflight_sha
     assert values['supervisor_unit']==f'zerofs-barrier-fault-{run}.service'
     assert values['supervisor_cgroup']==cgroup and values['linux_boot_id']==boot
+    assert values['context_record_digest']==handshake['context_record_digest']
     assert values['pid']==handshake['pid'] and int(values['pid'])>1
     assert values['request_digest']==handshake['request_digest']
     assert values['barrier_id']==handshake['barrier_id']
@@ -302,8 +356,19 @@ for scenario in scenarios:
     assert 0 <= int(values['joined_at_unix_nanos']) < 1_000_000_000
     assert int(values['joined_at_boot_millis']) >= int(values['pid_start_time_ticks'])*1000//os.sysconf('SC_CLK_TCK')
     assert not os.path.exists('/proc/'+values['pid'])
-    assert recovery['schema']=='1' and recovery['scenario']==scenario and recovery['recovery_puts']=='0'
+    assert recovery['schema']=='1' and recovery['run_id']==run and recovery['scenario']==scenario
+    assert recovery['recovery_puts']=='0' and recovery['recovery_linux_boot_id']==boot
+    assert recovery['recovery_cgroup']==cgroup and int(recovery['recovery_pid'])>1
+    assert int(recovery['recovery_pid_start_time_ticks'])>0
+    assert not os.path.exists('/proc/'+recovery['recovery_pid'])
+    assert recovery['preflight_receipt_sha256']==preflight_sha
+    assert recovery['context_record_digest']==claim['context_record_digest']
     assert recovery['request_digest']==claim['request_digest']
+    assert recovery['barrier_id']==claim['barrier_id']
+    assert recovery['effect_claim_digest']==claim['effect_claim_digest']
+    assert recovery['claim_record_digest']==handshake['claim_record_digest']
+    assert recovery['handshake_digest']==hashlib.sha256(handshake_raw).hexdigest()
+    assert recovery['exit_receipt_digest']==hashlib.sha256(exit_raw).hexdigest()
     if scenario=='before-data-cut':
         assert values['receipt_digest']=='none'
         assert recovery['outcome']=='unknown' and recovery['included_write_sequence']=='0'
@@ -397,6 +462,7 @@ preflight_receipt_sha256=$(sha256sum "$PREFLIGHT_FD_PATH" | cut -d' ' -f1)
 pre_exit_manifest_sha256=$(sha256sum "$EVIDENCE_ROOT/SHA256SUMS" | cut -d' ' -f1)
 run_manifest_sha256=$(sha256sum "$EVIDENCE_ROOT/RUN-SHA256SUMS" | cut -d' ' -f1)
 collector_sha256=$EXPECTED_HASH
+collector_attempt_receipt_sha256=$COLLECTOR_ATTEMPT_SHA
 collected_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 chmod 0600 "$TERMINAL/receipt.pending"
@@ -405,22 +471,65 @@ ln "$TERMINAL/receipt.pending" "$TERMINAL/receipt"
 sync -f "$TERMINAL"
 unlink "$TERMINAL/receipt.pending"
 sync -f "$TERMINAL"
+printf 'PASS\n' >"$TERMINAL/status-pass.receipt.pending"
+chmod 0600 "$TERMINAL/status-pass.receipt.pending"
+sync -f "$TERMINAL/status-pass.receipt.pending"
+ln "$TERMINAL/status-pass.receipt.pending" "$TERMINAL/status-pass.receipt"
+sync -f "$TERMINAL"
+unlink "$TERMINAL/status-pass.receipt.pending"
+sync -f "$TERMINAL"
 find "$TERMINAL" -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.pending' -print0 | sort -z | xargs -0 sha256sum >"$TERMINAL/SHA256SUMS"
 chmod 0600 "$TERMINAL/SHA256SUMS"
 sync -f "$TERMINAL/SHA256SUMS"
 sync -f "$TERMINAL"
 [[ $(cat "$EVIDENCE_ROOT/status") == BEHAVIOR_PASS_AWAITING_TERMINAL_COLLECTION ]]
-printf 'PASS\n' >"$EVIDENCE_ROOT/status.final.pending"
-chmod 0600 "$EVIDENCE_ROOT/status.final.pending"
-sync -f "$EVIDENCE_ROOT/status.final.pending"
-mv -T "$EVIDENCE_ROOT/status.final.pending" "$EVIDENCE_ROOT/status"
-sync -f "$EVIDENCE_ROOT"
 cd "$EVIDENCE_ROOT"
-find . -type f ! -name FINAL-SHA256SUMS ! -name 'FINAL-SHA256SUMS.pending' -print0 | \
+find . -type f ! -name status ! -name FINAL-SHA256SUMS ! -name 'FINAL-SHA256SUMS.pending' \
+    ! -name FINAL-SEAL.receipt ! -name 'FINAL-SEAL.receipt.pending' -print0 | \
     sort -z | xargs -0 sha256sum >FINAL-SHA256SUMS.pending
 chmod 0600 FINAL-SHA256SUMS.pending
 sync -f FINAL-SHA256SUMS.pending
 ln FINAL-SHA256SUMS.pending FINAL-SHA256SUMS
 sync -f "$EVIDENCE_ROOT"
 unlink FINAL-SHA256SUMS.pending
+sync -f "$EVIDENCE_ROOT"
+sha256sum -c FINAL-SHA256SUMS >/dev/null
+FINAL_MANIFEST_SHA=$(sha256sum FINAL-SHA256SUMS | cut -d' ' -f1)
+STATUS_PASS_SHA=$(sha256sum "$TERMINAL/status-pass.receipt" | cut -d' ' -f1)
+TERMINAL_MANIFEST_SHA=$(sha256sum "$TERMINAL/SHA256SUMS" | cut -d' ' -f1)
+cat >FINAL-SEAL.receipt.pending <<EOF
+schema=1
+run_id=$RUN_ID
+verdict=PASS
+final_manifest_sha256=$FINAL_MANIFEST_SHA
+final_manifest_readback=verified
+terminal_manifest_sha256=$TERMINAL_MANIFEST_SHA
+status_pass_receipt_sha256=$STATUS_PASS_SHA
+collector_attempt_receipt_sha256=$COLLECTOR_ATTEMPT_SHA
+EOF
+chmod 0600 FINAL-SEAL.receipt.pending
+sync -f FINAL-SEAL.receipt.pending
+ln FINAL-SEAL.receipt.pending FINAL-SEAL.receipt
+sync -f "$EVIDENCE_ROOT"
+unlink FINAL-SEAL.receipt.pending
+sync -f "$EVIDENCE_ROOT"
+python3 - FINAL-SEAL.receipt "$RUN_ID" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
+import sys
+path,run,manifest,terminal,status,attempt=sys.argv[1:]
+expected={'schema','run_id','verdict','final_manifest_sha256','final_manifest_readback',
+          'terminal_manifest_sha256','status_pass_receipt_sha256','collector_attempt_receipt_sha256'}
+values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
+for line in text.splitlines():
+    key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
+    values[key]=value
+assert set(values)==expected
+assert values=={'schema':'1','run_id':run,'verdict':'PASS','final_manifest_sha256':manifest,
+                'final_manifest_readback':'verified','terminal_manifest_sha256':terminal,
+                'status_pass_receipt_sha256':status,'collector_attempt_receipt_sha256':attempt}
+PY
+ln "$TERMINAL/status-pass.receipt" "$EVIDENCE_ROOT/status.pass.pending"
+sync -f "$EVIDENCE_ROOT"
+[[ $(cat "$EVIDENCE_ROOT/status.pass.pending") == PASS ]]
+[[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT/status.pass.pending") == "$(stat -Lc '%d:%i' "$TERMINAL/status-pass.receipt")" ]]
+mv -T "$EVIDENCE_ROOT/status.pass.pending" "$EVIDENCE_ROOT/status"
 sync -f "$EVIDENCE_ROOT"

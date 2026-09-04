@@ -163,12 +163,14 @@ the barrier continue. Thus earlier PENDING/claim flushes cannot make the
 barrier's data cut a no-op. The resulting receipt must include write sequence 1,
 and cold recovery verifies the exact payload from the segment store.
 
-Each process-crash scenario has its own child process and S3 sub-prefix. A
-root-only durable context plus an exact claim record binds the original barrier
-command, full durable 0x0A claim digest, barrier ID, installer-bearing claim,
-and included sequence. The handshake also binds run/scenario, child PID,
-request/claim record digests, barrier ID, included sequence, and expected
-receipt digest. It is written to a temporary inode, file-synced, atomically
+Each process-crash scenario has its own child process and S3 sub-prefix. The
+root-only context is a closed schema-1 record containing a checksummed encoded
+command context. The exact claim record binds that whole record's digest, the
+original barrier command, full durable 0x0A claim bytes plus digest, barrier ID,
+installer-bearing claim, and included sequence. This lets recovery execute the
+same complete `claim_matches` check without consulting S3. The handshake also
+binds run/scenario, child PID, context/request/claim record digests, barrier ID,
+included sequence, and expected receipt digest. It is written to a temporary inode, file-synced, atomically
 published no-replace, and parent-directory-synced before the parent can observe
 it. The parent strictly decodes the closed field set, kills only after that
 publication and acquisition of the child's handshake lock (released only after
@@ -188,7 +190,10 @@ readable. Before constructing its S3 client, the recovery child opens the
 root-owned context, claim, handshake, and exit artifacts without following
 links, requires their closed schemas and file identities, and cross-checks
 every run/scenario, process, preflight, request, barrier, claim, handshake,
-included-sequence, and receipt binding. The operator must provide the exact supervisor unit/cgroup and a
+included-sequence, and receipt binding. Its retained recovery record binds the
+same digest graph plus the successful recovery child's PID/start/boot/cgroup,
+the exact exit-receipt digest, observed outcome/payload and zero PUT count; the
+parent records that identity before joining the exact child. The operator must provide the exact supervisor unit/cgroup and a
 lowercase SHA-256 for a preflight receipt that already seals source, executable,
 toolchain binaries, non-secret backend generation/config identity, and the
 collector itself; all three are required before the first S3 access.
@@ -211,11 +216,16 @@ from the pre-exit file manifest so the final transition cannot invalidate that
 manifest. `collect-rhizome-barrier-foundation.sh` verifies the runner/run
 manifests after the transient unit is collected. It independently holds stable
 collector, preflight, attempt, CA, backend executable and unit descriptions;
+publishes a root-level no-replace collector-attempt receipt before creating any
+terminal directory;
 requires exact START/END records in a non-empty journal for the sealed systemd
 Invocation/cgroup; revalidates the live RustFS process, unit and listener before
 and after the final empty S3 inventory; and proves the transient cgroup is absent.
-Only then does it atomically replace the intermediate status with PASS and
-publish a final recursive manifest that includes PASS and all terminal evidence.
+Only then does it publish an immutable PASS body, the recursive evidence
+manifest, verify that manifest, and publish a final seal binding the manifest,
+terminal manifest, PASS body, and collector attempt. That final seal is the
+terminal PASS authority. The convenience status path is changed to a hard link
+of the already sealed PASS body only after the final seal is durable.
 Both scripts fail closed and a partially created run is permanently unusable.
 
 The closed scenarios are:
