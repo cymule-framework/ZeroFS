@@ -164,10 +164,15 @@ barrier's data cut a no-op. The resulting receipt must include write sequence 1,
 and cold recovery verifies the exact payload from the segment store.
 
 Each process-crash scenario has its own child process and S3 sub-prefix. A
-root-only durable context plus an exact handshake binds run/scenario, child PID,
-request digest, included sequence, and expected receipt digest. The parent
-kills only after reading that handshake and must observe `SIGKILL`; a child
-guard kills and joins on every parent failure path.
+root-only durable context plus an exact claim record binds the original barrier
+command, full durable 0x0A claim digest, barrier ID, installer-bearing claim,
+and included sequence. The handshake also binds run/scenario, child PID,
+request/claim record digests, barrier ID, included sequence, and expected
+receipt digest. It is written to a temporary inode, file-synced, atomically
+published no-replace, and parent-directory-synced before the parent can observe
+it. The parent strictly decodes the closed field set, kills only after that
+publication, and must observe `SIGKILL`; a child guard retains process ownership
+until successful reap and applies a deadline to both crash and recovery paths.
 
 The closed scenarios are:
 
@@ -189,10 +194,13 @@ remote-durable operation/head/receipt and extent reads, asserts the object-store
 PUT count remains zero, and drops the reader. It never opens an RW writer,
 calls `materialize`, retries a barrier, or invokes `close`/flush.
 
-The parent bounds the retained S3 inventory to 512 objects and 64 MiB, deletes
-only paths returned through its exact `PrefixStore`, and requires the final
-prefix to be empty. Context, handshake, and recovery records are intentionally
-retained in the operator run directory for later evidence hashing.
+Every crash child uses a test-only object-store hard limit of 128 PUT attempts
+and 16 MiB before forwarding each write; multipart is rejected. The parent also
+checks the cumulative 512-object/64-MiB inventory before every new scenario and
+after the matrix, deletes only paths returned through its exact `PrefixStore`,
+and requires the final prefix to be empty. Context, claim, handshake, and
+recovery records are intentionally retained in the operator run directory for
+later evidence hashing.
 
 The ordinary unit suite separately verifies an applied manifest response error
 against a real coordinated SlateDB stack and exact read-only recovery. That is

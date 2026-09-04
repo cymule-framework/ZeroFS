@@ -194,8 +194,11 @@ pub(crate) struct WorkspaceBarrierStore {
 }
 
 #[cfg(test)]
-type BarrierAfterClaimHook =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), BarrierError>> + Send>> + Send + Sync>;
+type BarrierAfterClaimHook = Arc<
+    dyn Fn(&Bytes, &str) -> Pin<Box<dyn Future<Output = Result<(), BarrierError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl WorkspaceBarrierStore {
     pub(crate) fn new(
@@ -283,7 +286,7 @@ impl WorkspaceBarrierStore {
         let after_claim = self.after_claim_hook.lock().unwrap().take();
         #[cfg(test)]
         if let Some(hook) = after_claim {
-            hook().await?;
+            hook(&candidate, &barrier_id).await?;
         }
 
         let request = WorkspaceBarrierRequest {
@@ -1039,7 +1042,7 @@ pub(crate) async fn foundation_process_crash_point(
     receipt: Option<&BarrierDurabilityReceipt>,
 ) {
     use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let Ok(configured) = std::env::var("RHIZOME_BARRIER_FAULT_CRASH_POINT") else {
         return;
@@ -1073,13 +1076,14 @@ pub(crate) async fn foundation_process_crash_point(
     assert_eq!(metadata.gid(), 0);
     assert_eq!(metadata.mode() & 0o7777, 0o700);
 
-    let marker = configured_root.join(format!("{scenario}.handshake"));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&marker)
-        .unwrap();
+    let claim_bytes = std::fs::read(configured_root.join(format!("{scenario}.claim"))).unwrap();
+    let claim_text = std::str::from_utf8(&claim_bytes).unwrap();
+    let claim_field = |name: &str| {
+        claim_text
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .expect("claim record field is present")
+    };
     let hex = |bytes: &[u8]| {
         use std::fmt::Write as _;
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -1091,20 +1095,43 @@ pub(crate) async fn foundation_process_crash_point(
     let receipt_digest = receipt
         .map(|value| hex(&value.receipt_digest))
         .unwrap_or_else(|| "none".into());
+    let directory = std::fs::File::open(&configured_root).unwrap();
+    let pending_name = format!("{scenario}.handshake.pending");
+    let final_name = format!("{scenario}.handshake");
+    let fd = rustix::fs::openat(
+        &directory,
+        pending_name.as_str(),
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    let mut file = std::fs::File::from(fd);
     file.write_all(
         format!(
-            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\nrequest_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
+            "schema=1\nrun_id={run_id}\nscenario={scenario}\npoint={point}\npid={}\nrequest_digest={}\nbarrier_id={}\neffect_claim_digest={}\nclaim_record_digest={}\nincluded_write_sequence={included_write_sequence}\nreceipt_digest={receipt_digest}\n",
             std::process::id(),
             hex(command.request_digest.as_bytes()),
+            claim_field("barrier_id"),
+            claim_field("effect_claim_digest"),
+            hex(&Sha256::digest(&claim_bytes)),
         )
         .as_bytes(),
     )
     .unwrap();
     file.sync_all().unwrap();
-    std::fs::File::open(&configured_root)
-        .unwrap()
-        .sync_all()
-        .unwrap();
+    rustix::fs::renameat_with(
+        &directory,
+        pending_name.as_str(),
+        &directory,
+        final_name.as_str(),
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .unwrap();
+    directory.sync_all().unwrap();
     std::future::pending::<()>().await;
 }
 
@@ -1679,7 +1706,7 @@ mod tests {
         let mutation_token = token.clone();
         let mutation_payload = payload.clone();
         fs.workspace_barriers
-            .dst_set_after_claim_hook(Arc::new(move || {
+            .dst_set_after_claim_hook(Arc::new(move |_, _| {
                 let store = mutation_store.clone();
                 let token = mutation_token.clone();
                 let payload = mutation_payload.clone();
@@ -1994,6 +2021,22 @@ mod tests {
             .unwrap()
     }
 
+    async fn assert_inventory_bound(
+        store: &Arc<dyn ObjectStore>,
+        maximum_objects: usize,
+        maximum_bytes: u64,
+    ) {
+        let inventory = listed_objects(store).await;
+        assert!(inventory.len() <= maximum_objects);
+        let mut total = 0u64;
+        for location in inventory {
+            total = total
+                .checked_add(store.head(&location).await.unwrap().size)
+                .unwrap();
+            assert!(total <= maximum_bytes);
+        }
+    }
+
     fn lower_hex(bytes: &[u8]) -> String {
         use std::fmt::Write;
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -2095,6 +2138,10 @@ mod tests {
         root.join(format!("{scenario}.context"))
     }
 
+    fn claim_path(root: &std::path::Path, scenario: &str) -> std::path::PathBuf {
+        root.join(format!("{scenario}.claim"))
+    }
+
     fn recovery_path(root: &std::path::Path, scenario: &str) -> std::path::PathBuf {
         root.join(format!("{scenario}.recovery"))
     }
@@ -2133,16 +2180,86 @@ mod tests {
         );
     }
 
-    fn install_after_claim_write(fs: &ZeroFS, context: &FoundationFaultContext) {
+    fn parse_closed_record(
+        contents: &str,
+        expected_fields: &[&str],
+    ) -> std::collections::BTreeMap<String, String> {
+        assert!(contents.ends_with('\n'));
+        let mut fields = std::collections::BTreeMap::new();
+        for line in contents.lines() {
+            let (key, value) = line.split_once('=').expect("record line has one separator");
+            assert!(expected_fields.contains(&key));
+            assert!(!value.is_empty());
+            assert!(fields.insert(key.to_owned(), value.to_owned()).is_none());
+        }
+        assert_eq!(fields.len(), expected_fields.len());
+        for field in expected_fields {
+            assert!(fields.contains_key(*field));
+        }
+        fields
+    }
+
+    fn persist_claim_record(
+        root: &std::path::Path,
+        scenario: &str,
+        request_digest: [u8; 32],
+        claim: &[u8],
+        barrier_id: &str,
+    ) {
+        let parsed = uuid::Uuid::parse_str(barrier_id).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.to_string(), barrier_id);
+        write_new_durable(
+            &claim_path(root, scenario),
+            format!(
+                "schema=1\nscenario={scenario}\nrequest_digest={}\nbarrier_id={barrier_id}\neffect_claim_digest={}\nincluded_write_sequence=1\n",
+                lower_hex(&request_digest),
+                lower_hex(&Sha256::digest(claim)),
+            )
+            .as_bytes(),
+        );
+    }
+
+    fn read_claim_record(
+        root: &std::path::Path,
+        scenario: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        let contents = std::fs::read_to_string(claim_path(root, scenario)).unwrap();
+        parse_closed_record(
+            &contents,
+            &[
+                "schema",
+                "scenario",
+                "request_digest",
+                "barrier_id",
+                "effect_claim_digest",
+                "included_write_sequence",
+            ],
+        )
+    }
+
+    fn install_after_claim_write(
+        fs: &ZeroFS,
+        root: &std::path::Path,
+        scenario: &str,
+        context: &FoundationFaultContext,
+    ) {
         let store = fs.export_authority.clone();
+        let root = root.to_path_buf();
+        let scenario = scenario.to_owned();
+        let request_digest = context.request_digest;
         let token = context.token.clone();
         let payload = Bytes::copy_from_slice(&context.payload);
         let operation_id = context.mutation_operation_id;
         fs.workspace_barriers
-            .dst_set_after_claim_hook(Arc::new(move || {
+            .dst_set_after_claim_hook(Arc::new(move |claim, barrier_id| {
                 let store = store.clone();
                 let token = token.clone();
                 let payload = payload.clone();
+                let claim = claim.clone();
+                let barrier_id = barrier_id.to_owned();
+                let root = root.clone();
+                let scenario = scenario.clone();
                 Box::pin(async move {
                     let outcome = store
                         .commit_mutation(
@@ -2159,9 +2276,11 @@ mod tests {
                         )
                         .await
                         .map_err(|_| BarrierError::Storage)?;
-                    (outcome.mutation.sequence == 1)
-                        .then_some(())
-                        .ok_or(BarrierError::Corrupt)
+                    if outcome.mutation.sequence != 1 {
+                        return Err(BarrierError::Corrupt);
+                    }
+                    persist_claim_record(&root, &scenario, request_digest, &claim, &barrier_id);
+                    Ok(())
                 })
             }));
     }
@@ -2174,6 +2293,7 @@ mod tests {
         );
         let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
         let (fault_store, faults) = crate::fault_store::FaultStore::new(raw_store);
+        faults.set_put_limits(128, 16 * 1024 * 1024);
         let object_store: Arc<dyn ObjectStore> = fault_store;
         assert!(listed_objects(&object_store).await.is_empty());
         let fs = open_persistent(object_store).await;
@@ -2194,7 +2314,7 @@ mod tests {
             mutation_operation_id: operation_id,
         };
         persist_fault_context(&root, scenario, &context);
-        install_after_claim_write(&fs, &context);
+        install_after_claim_write(&fs, &root, scenario, &context);
         if scenario == "manifest-applied-before-response" {
             let armed_faults = faults.clone();
             fs.write_coordinator
@@ -2215,9 +2335,18 @@ mod tests {
         let context = read_fault_context(&root, scenario);
         let raw_store = foundation_fault_store(&scenario_prefix(&base_prefix, scenario));
         let (fault_store, recovery_io) = crate::fault_store::FaultStore::new(raw_store);
+        recovery_io.set_put_limits(128, 16 * 1024 * 1024);
         let object_store: Arc<dyn ObjectStore> = fault_store;
         let fs = open_persistent_read_only(object_store).await;
         let command = context.command();
+        let claim_record = read_claim_record(&root, scenario);
+        assert_eq!(claim_record["schema"], "1");
+        assert_eq!(claim_record["scenario"], scenario);
+        assert_eq!(
+            claim_record["request_digest"],
+            lower_hex(&context.request_digest)
+        );
+        assert_eq!(claim_record["included_write_sequence"], "1");
         let lookup = fs
             .workspace_barriers
             .lookup_materialized(&command)
@@ -2231,9 +2360,18 @@ mod tests {
         let WorkspaceOperationLookup::Known(operation) = operation else {
             panic!("durable barrier claim is absent");
         };
-        let WorkspaceOperationState::EffectDispatched(_) = operation.state else {
+        let WorkspaceOperationState::EffectDispatched(effect_claim) = operation.state else {
             panic!("crash recovery must retain the exact effect-dispatch claim");
         };
+        assert_eq!(
+            claim_record["effect_claim_digest"],
+            lower_hex(&Sha256::digest(&effect_claim))
+        );
+        assert!(claim_matches(
+            &effect_claim,
+            &command,
+            &claim_record["barrier_id"]
+        ));
         let bytes = fs
             .extent_store
             .read(context.export_inode, 0, context.payload.len() as u64)
@@ -2253,6 +2391,8 @@ mod tests {
             "manifest-applied-before-response" | "after-manifest-publish" => {
                 let receipt = lookup.expect("published manifest must expose exact barrier");
                 assert_eq!(receipt.included_write_sequence, 1);
+                assert_eq!(receipt.effect_claim, effect_claim);
+                assert_eq!(receipt.barrier_id, claim_record["barrier_id"]);
                 assert_eq!(bytes.as_ref(), context.payload.as_slice());
                 (
                     "materialized",
@@ -2283,13 +2423,25 @@ mod tests {
         }
 
         fn kill_and_wait(&mut self) -> std::process::ExitStatus {
-            let mut child = self.0.take().unwrap();
+            let child = self.0.as_mut().unwrap();
             child.kill().unwrap();
-            child.wait().unwrap()
+            let status = child.wait().unwrap();
+            self.0 = None;
+            status
         }
 
-        fn wait(&mut self) -> std::process::ExitStatus {
-            self.0.take().unwrap().wait().unwrap()
+        fn wait_until(&mut self, deadline: std::time::Instant) -> std::process::ExitStatus {
+            loop {
+                if let Some(status) = self.0.as_mut().unwrap().try_wait().unwrap() {
+                    self.0 = None;
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child process exceeded its join deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
     }
 
@@ -2320,18 +2472,35 @@ mod tests {
         root: &std::path::Path,
         scenario: &str,
         child: &mut std::process::Child,
-    ) -> String {
+    ) -> std::collections::BTreeMap<String, String> {
         let child_pid = child.id();
         let marker = root.join(format!("{scenario}.handshake"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             match std::fs::read_to_string(&marker) {
                 Ok(contents) => {
-                    assert!(contents.contains(&format!("scenario={scenario}\n")));
-                    assert!(contents.contains(&format!("point={scenario}\n")));
-                    assert!(contents.contains(&format!("pid={child_pid}\n")));
-                    assert!(contents.contains("included_write_sequence=1\n"));
-                    return contents;
+                    let fields = parse_closed_record(
+                        &contents,
+                        &[
+                            "schema",
+                            "run_id",
+                            "scenario",
+                            "point",
+                            "pid",
+                            "request_digest",
+                            "barrier_id",
+                            "effect_claim_digest",
+                            "claim_record_digest",
+                            "included_write_sequence",
+                            "receipt_digest",
+                        ],
+                    );
+                    assert_eq!(fields["schema"], "1");
+                    assert_eq!(fields["scenario"], scenario);
+                    assert_eq!(fields["point"], scenario);
+                    assert_eq!(fields["pid"], child_pid.to_string());
+                    assert_eq!(fields["included_write_sequence"], "1");
+                    return fields;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => panic!("read handshake: {error}"),
@@ -2345,13 +2514,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-    }
-
-    fn handshake_value<'a>(handshake: &'a str, field: &str) -> &'a str {
-        handshake
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{field}=")))
-            .expect("handshake field is present")
     }
 
     #[cfg(target_os = "linux")]
@@ -2372,31 +2534,46 @@ mod tests {
             return;
         }
 
-        let (_, root, base_prefix) = foundation_fault_run();
+        let (run_id, root, base_prefix) = foundation_fault_run();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         let base_store = foundation_fault_store(&base_prefix);
         assert!(listed_objects(&base_store).await.is_empty());
 
         let run = std::panic::AssertUnwindSafe(async {
             for scenario in FOUNDATION_FAULT_SCENARIOS {
+                assert_inventory_bound(&base_store, 512, 64 * 1024 * 1024).await;
                 let mut crash = spawn_fault_child("crash", scenario);
                 let handshake = wait_for_fault_handshake(&root, scenario, crash.child());
                 let context = read_fault_context(&root, scenario);
-                assert!(handshake.contains(&format!(
-                    "request_digest={}\n",
+                let claim_record = read_claim_record(&root, scenario);
+                assert_eq!(handshake["run_id"], run_id);
+                assert_eq!(
+                    handshake["request_digest"],
                     lower_hex(&context.request_digest)
-                )));
+                );
+                assert_eq!(handshake["barrier_id"], claim_record["barrier_id"]);
+                assert_eq!(
+                    handshake["effect_claim_digest"],
+                    claim_record["effect_claim_digest"]
+                );
+                assert_eq!(
+                    handshake["claim_record_digest"],
+                    lower_hex(&Sha256::digest(
+                        std::fs::read(claim_path(&root, scenario)).unwrap()
+                    ))
+                );
                 match scenario {
                     "before-data-cut" => {
-                        assert!(handshake.contains("receipt_digest=none\n"));
+                        assert_eq!(handshake["receipt_digest"], "none");
                     }
-                    _ => assert!(!handshake.contains("receipt_digest=none\n")),
+                    _ => assert_ne!(handshake["receipt_digest"], "none"),
                 }
                 let status = crash.kill_and_wait();
                 assert_eq!(status.signal(), Some(libc::SIGKILL));
 
                 let mut recovery = spawn_fault_child("recover", scenario);
-                let recovery_status = recovery.wait();
+                let recovery_status = recovery
+                    .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(120));
                 assert!(recovery_status.success());
                 let recovery_result =
                     std::fs::read_to_string(recovery_path(&root, scenario)).unwrap();
@@ -2417,24 +2594,13 @@ mod tests {
                         assert!(recovery_result.contains("payload=durable\n"));
                         assert!(recovery_result.contains(&format!(
                             "receipt_digest={}\n",
-                            handshake_value(&handshake, "receipt_digest")
+                            handshake["receipt_digest"]
                         )));
                     }
                     _ => unreachable!(),
                 }
             }
-            let inventory = listed_objects(&base_store).await;
-            assert!(inventory.len() <= 512);
-            let total_bytes = {
-                let mut total = 0u64;
-                for location in &inventory {
-                    total = total
-                        .checked_add(base_store.head(location).await.unwrap().size)
-                        .unwrap();
-                }
-                total
-            };
-            assert!(total_bytes <= 64 * 1024 * 1024);
+            assert_inventory_bound(&base_store, 512, 64 * 1024 * 1024).await;
         })
         .catch_unwind()
         .await;
@@ -2462,6 +2628,7 @@ mod tests {
             .flat_map(|scenario| {
                 [
                     format!("{scenario}.context"),
+                    format!("{scenario}.claim"),
                     format!("{scenario}.handshake"),
                     format!("{scenario}.recovery"),
                 ]
@@ -2504,7 +2671,7 @@ mod tests {
         let mutation_token = token.clone();
         let mutation_payload = payload.clone();
         fs.workspace_barriers
-            .dst_set_after_claim_hook(Arc::new(move || {
+            .dst_set_after_claim_hook(Arc::new(move |_, _| {
                 let store = mutation_store.clone();
                 let token = mutation_token.clone();
                 let payload = mutation_payload.clone();

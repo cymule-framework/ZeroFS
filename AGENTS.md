@@ -276,10 +276,16 @@ attribution intact.
   never use sleeps, PUT ordinals, logs, or function-return failpoints to guess a
   crash window. The manifest response-loss boundary must block after the real
   inner manifest PUT succeeds and before SlateDB observes a response.
+- The after-claim hook must persist the exact barrier ID and full 0x0A claim
+  digest. Context, claim, atomic no-replace handshake, and read-only recovery
+  must all match that same command/claim; accepting any EffectDispatched value
+  is not sufficient. Retain child ownership until bounded wait confirms reap.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, assert zero object-store PUTs, and drop the reader. Never open an RW
   writer, call materialize, or close/flush during recovery.
 - Each Foundation scenario uses its own child and exact UUID-prefixed S3
   namespace. Enforce the pre-run empty inventory, 512-object/64-MiB cap,
   exact-prefix deletion, final empty inventory, and kill/join cleanup before
-  any real effect. Do not execute an unreviewed harness.
+  any real effect. Enforce the per-scenario PUT-count/byte limit before every
+  forwarded write and reject multipart while it is active; a final-only size
+  assertion is not a bound. Do not execute an unreviewed harness.

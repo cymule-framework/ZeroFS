@@ -34,6 +34,12 @@ pub struct FaultControls {
     manifest_response_losses: AtomicUsize,
     #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
     block_next_manifest_after_apply: AtomicBool,
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    maximum_puts: AtomicUsize,
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    maximum_put_bytes: AtomicUsize,
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    attempted_put_bytes: AtomicUsize,
     /// Return a body `truncate_bytes` short of the claimed length on the next N gets.
     truncate_next_gets: AtomicUsize,
     truncate_bytes: AtomicUsize,
@@ -83,6 +89,15 @@ impl FaultControls {
                 .swap(true, Ordering::SeqCst),
             "manifest post-apply blocker already armed"
         );
+    }
+    #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+    pub(crate) fn set_put_limits(&self, maximum_puts: usize, maximum_put_bytes: usize) {
+        assert!(maximum_puts > 0 && maximum_put_bytes > 0);
+        assert_eq!(self.put_count(), 0);
+        assert_eq!(self.attempted_put_bytes.load(Ordering::SeqCst), 0);
+        self.maximum_puts.store(maximum_puts, Ordering::SeqCst);
+        self.maximum_put_bytes
+            .store(maximum_put_bytes, Ordering::SeqCst);
     }
 }
 
@@ -147,6 +162,29 @@ impl ObjectStore for FaultStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.ctl.puts.fetch_add(1, Ordering::SeqCst);
+        #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+        {
+            let maximum_puts = self.ctl.maximum_puts.load(Ordering::SeqCst);
+            if maximum_puts > 0 && self.ctl.put_count() > maximum_puts {
+                return Err(Self::transient("put count limit"));
+            }
+            let payload_bytes = payload.content_length();
+            let previous = self
+                .ctl
+                .attempted_put_bytes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(payload_bytes)
+                })
+                .map_err(|_| Self::transient("put byte counter overflow"))?;
+            let maximum_put_bytes = self.ctl.maximum_put_bytes.load(Ordering::SeqCst);
+            if maximum_put_bytes > 0
+                && previous
+                    .checked_add(payload_bytes)
+                    .is_none_or(|total| total > maximum_put_bytes)
+            {
+                return Err(Self::transient("put byte limit"));
+            }
+        }
         let is_manifest = location.extension() == Some("manifest");
         if is_manifest {
             self.ctl.manifest_puts.fetch_add(1, Ordering::SeqCst);
@@ -183,6 +221,10 @@ impl ObjectStore for FaultStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        #[cfg(all(test, feature = "rhizome-workspace-barrier-core"))]
+        if self.ctl.maximum_puts.load(Ordering::SeqCst) > 0 {
+            return Err(Self::transient("multipart forbidden by put budget"));
+        }
         self.check_writable("put_multipart")?;
         self.inner.put_multipart_opts(location, opts).await
     }
