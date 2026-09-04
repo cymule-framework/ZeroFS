@@ -233,7 +233,13 @@ Only then does it publish an immutable PASS body, the recursive evidence
 manifest, verify that manifest, and publish a final seal binding the manifest,
 terminal manifest, PASS body, and collector attempt. That final seal is the
 terminal PASS authority. The convenience status path is changed to a hard link
-of the already sealed PASS body only after the final seal is durable.
+of the already sealed PASS body only after the final seal is durable and every
+retained file is root:root 0400, the run/terminal directories are 0500, and the
+evidence root is 0500. A qualification collection must then retry both scripts
+with the preflight-bound versioned
+`verify-rhizome-barrier-sealed-retry.sh`. It archives an exact before/after
+content and filesystem-identity inventory proving both retries fail without
+changing the sealed tree; its report remains outside that immutable tree.
 Both scripts fail closed and a partially created run is permanently unusable.
 
 The closed scenarios are:

@@ -107,6 +107,7 @@ for name in \
     RHIZOME_BARRIER_BACKEND_CONFIG_REVISION \
     RHIZOME_BARRIER_CA_FILE \
     RHIZOME_BARRIER_TERMINAL_COLLECTOR \
+    RHIZOME_BARRIER_SEALED_RETRY_VERIFIER \
     AWS_ACCESS_KEY_ID \
     AWS_SECRET_ACCESS_KEY \
     AWS_ENDPOINT \
@@ -143,6 +144,7 @@ EXPECTED_PREFIX="rhizome/zerofs-barrier-fault/$RUN_ID"
 [[ $RHIZOME_BARRIER_S3_PREFIX == "$EXPECTED_PREFIX" ]]
 
 COLLECTOR=$(readlink -f "$RHIZOME_BARRIER_TERMINAL_COLLECTOR")
+RETRY_VERIFIER=$(readlink -f "$RHIZOME_BARRIER_SEALED_RETRY_VERIFIER")
 SOURCE=$(readlink -f "$RHIZOME_BARRIER_SOURCE_ROOT")
 TEST_EXE=$(readlink -f "$RHIZOME_BARRIER_TEST_EXECUTABLE")
 BUILD_RECORD=$(readlink -f "$RHIZOME_BARRIER_BUILD_RECORD")
@@ -152,11 +154,11 @@ BACKEND_BINARY=$(readlink -f "$RHIZOME_BARRIER_BACKEND_BINARY")
 BACKEND_UNIT_FILE=$(readlink -f "$RHIZOME_BARRIER_BACKEND_UNIT_FILE")
 CA_FILE=$(readlink -f "$RHIZOME_BARRIER_CA_FILE")
 [[ $(readlink -f "$SSL_CERT_FILE") == "$CA_FILE" ]]
-for path in "$COLLECTOR" "$TEST_EXE" "$BUILD_RECORD" "$RUSTC" "$CARGO" "$BACKEND_BINARY" "$BACKEND_UNIT_FILE" "$CA_FILE"; do
+for path in "$COLLECTOR" "$RETRY_VERIFIER" "$TEST_EXE" "$BUILD_RECORD" "$RUSTC" "$CARGO" "$BACKEND_BINARY" "$BACKEND_UNIT_FILE" "$CA_FILE"; do
     [[ -f $path && ! -L $path ]]
 done
 [[ -d $SOURCE && ! -L $SOURCE ]]
-python3 - "$EXPECTED_ROOT" "$EXPECTED_EVIDENCE" "$SELF" "$COLLECTOR" "$TEST_EXE" "$BUILD_RECORD" "$RUSTC" "$CARGO" "$BACKEND_BINARY" "$BACKEND_UNIT_FILE" "$CA_FILE" "$SOURCE" <<'PY'
+python3 - "$EXPECTED_ROOT" "$EXPECTED_EVIDENCE" "$SELF" "$COLLECTOR" "$RETRY_VERIFIER" "$TEST_EXE" "$BUILD_RECORD" "$RUSTC" "$CARGO" "$BACKEND_BINARY" "$BACKEND_UNIT_FILE" "$CA_FILE" "$SOURCE" <<'PY'
 import os, stat, sys
 for raw in sys.argv[1:]:
     assert os.path.isabs(raw) and os.path.realpath(raw) == raw
@@ -177,6 +179,7 @@ PY
 [[ $(git -C "$SOURCE" status --porcelain=v1 | wc -l) == 0 ]]
 exec {SELF_FD}<"$SELF"
 exec {COLLECTOR_FD}<"$COLLECTOR"
+exec {RETRY_VERIFIER_FD}<"$RETRY_VERIFIER"
 exec {TEST_FD}<"$TEST_EXE"
 exec {BUILD_RECORD_FD}<"$BUILD_RECORD"
 exec {RUSTC_FD}<"$RUSTC"
@@ -186,6 +189,7 @@ exec {BACKEND_UNIT_FD}<"$BACKEND_UNIT_FILE"
 exec {CA_FD}<"$CA_FILE"
 SELF_FD_PATH="/proc/self/fd/$SELF_FD"
 COLLECTOR_FD_PATH="/proc/self/fd/$COLLECTOR_FD"
+RETRY_VERIFIER_FD_PATH="/proc/self/fd/$RETRY_VERIFIER_FD"
 TEST_FD_PATH="/proc/self/fd/$TEST_FD"
 export RHIZOME_BARRIER_FAULT_TEST_EXECUTABLE_FD=$TEST_FD
 BUILD_RECORD_FD_PATH="/proc/self/fd/$BUILD_RECORD_FD"
@@ -265,6 +269,8 @@ RUNNER_SHA=$(sha256sum "$SELF_FD_PATH" | cut -d' ' -f1)
 RUNNER_IDENTITY=$(stat -Lc '%d:%i:%s' "$SELF_FD_PATH")
 COLLECTOR_SHA=$(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1)
 COLLECTOR_IDENTITY=$(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH")
+RETRY_VERIFIER_SHA=$(sha256sum "$RETRY_VERIFIER_FD_PATH" | cut -d' ' -f1)
+RETRY_VERIFIER_IDENTITY=$(stat -Lc '%d:%i:%s' "$RETRY_VERIFIER_FD_PATH")
 BACKEND_BINARY_SHA=$(sha256sum "$BACKEND_BINARY_FD_PATH" | cut -d' ' -f1)
 BACKEND_BINARY_IDENTITY=$(stat -Lc '%d:%i:%s' "$BACKEND_BINARY_FD_PATH")
 BACKEND_UNIT_SHA=$(sha256sum "$BACKEND_UNIT_FD_PATH" | cut -d' ' -f1)
@@ -299,6 +305,8 @@ runner_pid=$$
 runner_pid_start_time_ticks=$SELF_START
 terminal_collector_sha256=$COLLECTOR_SHA
 terminal_collector_device_inode_size=$COLLECTOR_IDENTITY
+sealed_retry_verifier_sha256=$RETRY_VERIFIER_SHA
+sealed_retry_verifier_device_inode_size=$RETRY_VERIFIER_IDENTITY
 linux_boot_id=$LINUX_BOOT_ID
 supervisor_unit=$EXPECTED_UNIT
 supervisor_cgroup=$CGROUP
@@ -385,6 +393,9 @@ if [[ $(git -C "$SOURCE" rev-parse HEAD) != "$SOURCE_COMMIT" || \
       $(sha256sum "$COLLECTOR_FD_PATH" | cut -d' ' -f1) != "$COLLECTOR_SHA" || \
       $(stat -Lc '%d:%i:%s' "$COLLECTOR_FD_PATH") != "$COLLECTOR_IDENTITY" || \
       $(stat -Lc '%d:%i:%s' "$COLLECTOR") != "$COLLECTOR_IDENTITY" || \
+      $(sha256sum "$RETRY_VERIFIER_FD_PATH" | cut -d' ' -f1) != "$RETRY_VERIFIER_SHA" || \
+      $(stat -Lc '%d:%i:%s' "$RETRY_VERIFIER_FD_PATH") != "$RETRY_VERIFIER_IDENTITY" || \
+      $(stat -Lc '%d:%i:%s' "$RETRY_VERIFIER") != "$RETRY_VERIFIER_IDENTITY" || \
       $(sha256sum "$TEST_FD_PATH" | cut -d' ' -f1) != "$TEST_EXE_SHA" || \
       $(stat -Lc '%d:%i:%s' "$TEST_FD_PATH") != "$TEST_EXE_IDENTITY" || \
       $(stat -Lc '%d:%i:%s' "$TEST_EXE") != "$TEST_EXE_IDENTITY" || \

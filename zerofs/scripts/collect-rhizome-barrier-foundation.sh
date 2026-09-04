@@ -122,7 +122,8 @@ expected={
 'test_executable_device_inode_size','test_executable_fd_number','build_record_sha256','build_record_device_inode_size','rustc_version','rustc_sha256',
 'rustc_device_inode_size','cargo_version','cargo_sha256','cargo_device_inode_size','toolchain_tree_sha256',
 'runner_sha256','runner_device_inode_size','runner_pid','runner_pid_start_time_ticks',
-'terminal_collector_sha256','terminal_collector_device_inode_size','linux_boot_id','supervisor_unit','supervisor_cgroup',
+'terminal_collector_sha256','terminal_collector_device_inode_size','sealed_retry_verifier_sha256',
+'sealed_retry_verifier_device_inode_size','linux_boot_id','supervisor_unit','supervisor_cgroup',
 'supervisor_invocation_id','supervisor_main_pid','backend_unit','backend_main_pid','backend_pid_start_time_ticks',
 'backend_linux_boot_id','backend_invocation_id','backend_cgroup','backend_fragment_path',
 'backend_executable_device_inode','backend_listener_socket_inode','backend_active_enter_monotonic',
@@ -158,11 +159,11 @@ assert re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*',d['evidence_root_device_inode'])
 assert d['endpoint_origin']=='https://127.0.0.1:19000' and d['addressing']=='path'
 assert d['prefix']==f'rhizome/zerofs-barrier-fault/{run}' and d['credential_values_recorded']=='false'
 for key in ('attempt_receipt_sha256','test_executable_sha256','build_record_sha256','rustc_sha256','cargo_sha256',
-            'toolchain_tree_sha256','runner_sha256','terminal_collector_sha256','backend_binary_sha256',
+            'toolchain_tree_sha256','runner_sha256','terminal_collector_sha256','sealed_retry_verifier_sha256','backend_binary_sha256',
             'backend_unit_file_sha256','ca_sha256'):
     assert re.fullmatch(r'[0-9a-f]{64}',d[key]),(key,d[key])
 for key in ('test_executable_device_inode_size','build_record_device_inode_size','rustc_device_inode_size',
-            'cargo_device_inode_size','runner_device_inode_size','terminal_collector_device_inode_size',
+            'cargo_device_inode_size','runner_device_inode_size','terminal_collector_device_inode_size','sealed_retry_verifier_device_inode_size',
             'backend_binary_device_inode_size','backend_unit_file_device_inode_size','ca_device_inode_size'):
     assert re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*',d[key]),(key,d[key])
 open(output,'x').write('\n'.join(f'{key}={d[key]}' for key in (
@@ -543,6 +544,7 @@ schema=1
 run_id=$RUN_ID
 verdict=PASS
 evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
+mode_profile=root-read-only-v1
 final_manifest_sha256=$FINAL_MANIFEST_SHA
 final_manifest_readback=verified
 terminal_manifest_sha256=$TERMINAL_MANIFEST_SHA
@@ -558,20 +560,44 @@ sync -f "$EVIDENCE_ROOT"
 python3 - FINAL-SEAL.receipt "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
 import sys
 path,run,evidence,manifest,terminal,status,attempt=sys.argv[1:]
-expected={'schema','run_id','verdict','evidence_root_device_inode','final_manifest_sha256','final_manifest_readback',
+expected={'schema','run_id','verdict','evidence_root_device_inode','mode_profile','final_manifest_sha256','final_manifest_readback',
           'terminal_manifest_sha256','status_pass_receipt_sha256','collector_attempt_receipt_sha256'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
     values[key]=value
 assert set(values)==expected
-assert values=={'schema':'1','run_id':run,'verdict':'PASS','evidence_root_device_inode':evidence,'final_manifest_sha256':manifest,
+assert values=={'schema':'1','run_id':run,'verdict':'PASS','evidence_root_device_inode':evidence,
+                'mode_profile':'root-read-only-v1','final_manifest_sha256':manifest,
                 'final_manifest_readback':'verified','terminal_manifest_sha256':terminal,
                 'status_pass_receipt_sha256':status,'collector_attempt_receipt_sha256':attempt}
 PY
+find "$RUN_ROOT" -type f -exec chmod 0400 {} \;
+find "$EVIDENCE_ROOT" -type f -exec chmod 0400 {} \;
+find "$RUN_ROOT" "$TERMINAL" -type d -exec chmod 0500 {} \;
+sync -f "$RUN_ROOT"
+sync -f "$TERMINAL"
 ln "$TERMINAL/status-pass.receipt" "$EVIDENCE_ROOT/status.pass.pending"
 sync -f "$EVIDENCE_ROOT"
 [[ $(cat "$EVIDENCE_ROOT/status.pass.pending") == PASS ]]
 [[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT/status.pass.pending") == "$(stat -Lc '%d:%i' "$TERMINAL/status-pass.receipt")" ]]
+python3 - "$RUN_ROOT" "$EVIDENCE_ROOT" "$TERMINAL" <<'PY'
+import os,stat,sys
+run,evidence,terminal=sys.argv[1:]
+for root in (run,evidence):
+    for current,dirs,files in os.walk(root,followlinks=False):
+        for name in files:
+            path=os.path.join(current,name); info=os.lstat(path)
+            assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode)==0o400
+            expected_links=2 if path in (os.path.join(terminal,'status-pass.receipt'),
+                                         os.path.join(evidence,'status.pass.pending')) else 1
+            assert info.st_uid==0 and info.st_gid==0 and info.st_nlink==expected_links
+for path in (run,terminal):
+    info=os.lstat(path); assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode)==0o500
+    assert info.st_uid==0 and info.st_gid==0
+assert stat.S_IMODE(os.lstat(evidence).st_mode)==0o700
+PY
+chmod 0500 "$EVIDENCE_ROOT"
+sync -f "$EVIDENCE_ROOT"
 mv -T "$EVIDENCE_ROOT/status.pass.pending" "$EVIDENCE_ROOT/status"
 sync -f "$EVIDENCE_ROOT"

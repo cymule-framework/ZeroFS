@@ -329,8 +329,14 @@ attribution intact.
   PASS. Publish an immutable PASS body, then a complete recursive manifest and
   its read-back-bound final seal; only that final seal may be terminal PASS
   authority. The convenience `status` pathname may transition to the already
-  sealed PASS inode only afterward. Any partial runner or collector state burns
-  the run UUID.
+  sealed PASS inode only afterward. Before that transition, make every retained
+  file root:root 0400, the run/terminal directories 0500, and then the evidence
+  root 0500. A post-PASS runner/collector retry must fail before any write and
+  an exact external before/after inventory must remain byte-identical. Bind the
+  versioned `verify-rhizome-barrier-sealed-retry.sh` hash and file identity in
+  the runner preflight, then use it after collection; its stdout is external
+  evidence and must never be written into the sealed run tree. Any partial
+  runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest
   poller, then assert zero object-store PUTs and drop the filesystem. Never open
