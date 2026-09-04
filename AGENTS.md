@@ -325,17 +325,25 @@ attribution intact.
   It must independently reopen stable file descriptions, prove the same RustFS
   PID/start/invocation/cgroup/executable/unit/listener generation before and
   after its final S3 inventory, bind a non-empty exact systemd invocation
-  journal to the preflight cgroup, and prove cgroup absence before terminal
-  PASS. Publish an immutable PASS body, then a complete recursive manifest and
-  its read-back-bound `SEALED_AWAITING_STATUS` final seal. Neither the PASS body
-  nor that seal alone is terminal success. Before the canonical `status`
-  pathname may atomically transition to the already sealed PASS inode, make every retained
-  file root:root 0400, the run/terminal directories 0500, and then the evidence
-  root 0500. A post-PASS runner/collector retry must fail before any write and
-  an exact external before/after inventory must remain byte-identical. Bind the
+  journal to the preflight cgroup, and prove cgroup absence before sealing.
+  Publish an immutable PASS body, then a complete recursive manifest and its
+  read-back-bound `SEALED_AWAITING_RETRY_VERIFICATION` final seal. The collector
+  must leave canonical status non-PASS and make every retained file root:root
+  0400 plus the run/terminal/evidence directories 0500 before exiting. Bind the
   versioned `verify-rhizome-barrier-sealed-retry.sh` hash and file identity in
-  the runner preflight, then use it after collection; its stdout is external
-  evidence and must never be written into the sealed run tree. Keep all three
+  the runner preflight. That script is the sole finalizer: it holds the same
+  evidence-root lock, requires the exact sealed state, persists a fresh
+  root-owned external retry-evidence directory containing before/after
+  inventories, both retry logs, receipts, manifest and readback, and only then
+  atomically replaces canonical status with the presealed PASS inode. It must
+  compare both stable FDs and locator device/inode/size against preflight, not
+  hashes alone. A partial finalizer burns that run and never publishes PASS;
+  its external records must not be deleted or written into the sealed run tree.
+  Pre-create only the root:root 0700
+  `/opt/rhizome/validation/zerofs-barrier-fault/retry-evidence` parent; the
+  finalizer must atomically create the UUID child and finish it root:root 0500
+  with 0400 files.
+  Keep all three
   scripts under the exact CI `bash -n` and ShellCheck gate. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data

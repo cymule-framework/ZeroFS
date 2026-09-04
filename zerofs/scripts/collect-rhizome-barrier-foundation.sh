@@ -504,6 +504,13 @@ ln "$TERMINAL/status-pass.receipt.pending" "$TERMINAL/status-pass.receipt"
 sync -f "$TERMINAL"
 unlink "$TERMINAL/status-pass.receipt.pending"
 sync -f "$TERMINAL"
+printf 'SEALED_AWAITING_RETRY_VERIFICATION\n' >"$TERMINAL/status-sealed-awaiting-retry.receipt.pending"
+chmod 0600 "$TERMINAL/status-sealed-awaiting-retry.receipt.pending"
+sync -f "$TERMINAL/status-sealed-awaiting-retry.receipt.pending"
+ln "$TERMINAL/status-sealed-awaiting-retry.receipt.pending" "$TERMINAL/status-sealed-awaiting-retry.receipt"
+sync -f "$TERMINAL"
+unlink "$TERMINAL/status-sealed-awaiting-retry.receipt.pending"
+sync -f "$TERMINAL"
 find "$TERMINAL" -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.pending' -print0 | sort -z | xargs -0 sha256sum >"$TERMINAL/SHA256SUMS"
 chmod 0600 "$TERMINAL/SHA256SUMS"
 sync -f "$TERMINAL/SHA256SUMS"
@@ -516,7 +523,7 @@ expected_evidence={'attempt.receipt','preflight.receipt','toolchain-tree.sha256'
 actual_evidence=set(os.listdir(evidence)); assert actual_evidence==expected_evidence,(actual_evidence,expected_evidence)
 expected_terminal={'preflight-selection','unit-journal.jsonl','invocation-journal.jsonl','journal-validation',
                    'post-terminal-inventory','pre-exit-manifest-check','run-manifest-check','receipt',
-                   'status-pass.receipt','SHA256SUMS'}
+                   'status-pass.receipt','status-sealed-awaiting-retry.receipt','SHA256SUMS'}
 actual_terminal=set(os.listdir(terminal)); assert actual_terminal==expected_terminal,(actual_terminal,expected_terminal)
 for root in (evidence,terminal,run):
     for current,dirs,files in os.walk(root,followlinks=False):
@@ -538,17 +545,19 @@ sync -f "$EVIDENCE_ROOT"
 sha256sum -c FINAL-SHA256SUMS >/dev/null
 FINAL_MANIFEST_SHA=$(sha256sum FINAL-SHA256SUMS | cut -d' ' -f1)
 STATUS_PASS_SHA=$(sha256sum "$TERMINAL/status-pass.receipt" | cut -d' ' -f1)
+STATUS_SEALED_SHA=$(sha256sum "$TERMINAL/status-sealed-awaiting-retry.receipt" | cut -d' ' -f1)
 TERMINAL_MANIFEST_SHA=$(sha256sum "$TERMINAL/SHA256SUMS" | cut -d' ' -f1)
 cat >FINAL-SEAL.receipt.pending <<EOF
 schema=1
 run_id=$RUN_ID
-verdict=SEALED_AWAITING_STATUS
+verdict=SEALED_AWAITING_RETRY_VERIFICATION
 evidence_root_device_inode=$EVIDENCE_ROOT_DEVICE_INODE
 mode_profile=root-read-only-v1
 final_manifest_sha256=$FINAL_MANIFEST_SHA
 final_manifest_readback=verified
 terminal_manifest_sha256=$TERMINAL_MANIFEST_SHA
 status_pass_receipt_sha256=$STATUS_PASS_SHA
+status_sealed_receipt_sha256=$STATUS_SEALED_SHA
 collector_attempt_receipt_sha256=$COLLECTOR_ATTEMPT_SHA
 EOF
 chmod 0600 FINAL-SEAL.receipt.pending
@@ -557,30 +566,32 @@ ln FINAL-SEAL.receipt.pending FINAL-SEAL.receipt
 sync -f "$EVIDENCE_ROOT"
 unlink FINAL-SEAL.receipt.pending
 sync -f "$EVIDENCE_ROOT"
-python3 - FINAL-SEAL.receipt "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
+python3 - FINAL-SEAL.receipt "$RUN_ID" "$EVIDENCE_ROOT_DEVICE_INODE" "$FINAL_MANIFEST_SHA" "$TERMINAL_MANIFEST_SHA" "$STATUS_PASS_SHA" "$STATUS_SEALED_SHA" "$COLLECTOR_ATTEMPT_SHA" <<'PY'
 import sys
-path,run,evidence,manifest,terminal,status,attempt=sys.argv[1:]
+path,run,evidence,manifest,terminal,status,sealed,attempt=sys.argv[1:]
 expected={'schema','run_id','verdict','evidence_root_device_inode','mode_profile','final_manifest_sha256','final_manifest_readback',
-          'terminal_manifest_sha256','status_pass_receipt_sha256','collector_attempt_receipt_sha256'}
+          'terminal_manifest_sha256','status_pass_receipt_sha256','status_sealed_receipt_sha256',
+          'collector_attempt_receipt_sha256'}
 values={}; raw=open(path,'rb').read(); text=raw.decode(); assert text.endswith('\n')
 for line in text.splitlines():
     key,value=line.split('=',1); assert key in expected and key not in values and value and '=' not in value
     values[key]=value
 assert set(values)==expected
-assert values=={'schema':'1','run_id':run,'verdict':'SEALED_AWAITING_STATUS','evidence_root_device_inode':evidence,
+assert values=={'schema':'1','run_id':run,'verdict':'SEALED_AWAITING_RETRY_VERIFICATION','evidence_root_device_inode':evidence,
                 'mode_profile':'root-read-only-v1','final_manifest_sha256':manifest,
                 'final_manifest_readback':'verified','terminal_manifest_sha256':terminal,
-                'status_pass_receipt_sha256':status,'collector_attempt_receipt_sha256':attempt}
+                'status_pass_receipt_sha256':status,'status_sealed_receipt_sha256':sealed,
+                'collector_attempt_receipt_sha256':attempt}
 PY
 find "$RUN_ROOT" -type f -exec chmod 0400 {} \;
 find "$EVIDENCE_ROOT" -type f -exec chmod 0400 {} \;
 find "$RUN_ROOT" "$TERMINAL" -type d -exec chmod 0500 {} \;
 sync -f "$RUN_ROOT"
 sync -f "$TERMINAL"
-ln "$TERMINAL/status-pass.receipt" "$EVIDENCE_ROOT/status.pass.pending"
+ln "$TERMINAL/status-sealed-awaiting-retry.receipt" "$EVIDENCE_ROOT/status.sealed.pending"
 sync -f "$EVIDENCE_ROOT"
-[[ $(cat "$EVIDENCE_ROOT/status.pass.pending") == PASS ]]
-[[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT/status.pass.pending") == "$(stat -Lc '%d:%i' "$TERMINAL/status-pass.receipt")" ]]
+[[ $(cat "$EVIDENCE_ROOT/status.sealed.pending") == SEALED_AWAITING_RETRY_VERIFICATION ]]
+[[ $(stat -Lc '%d:%i' "$EVIDENCE_ROOT/status.sealed.pending") == "$(stat -Lc '%d:%i' "$TERMINAL/status-sealed-awaiting-retry.receipt")" ]]
 python3 - "$RUN_ROOT" "$EVIDENCE_ROOT" "$TERMINAL" <<'PY'
 import os,stat,sys
 run,evidence,terminal=sys.argv[1:]
@@ -589,8 +600,8 @@ for root in (run,evidence):
         for name in files:
             path=os.path.join(current,name); info=os.lstat(path)
             assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode)==0o400
-            expected_links=2 if path in (os.path.join(terminal,'status-pass.receipt'),
-                                         os.path.join(evidence,'status.pass.pending')) else 1
+            expected_links=2 if path in (os.path.join(terminal,'status-sealed-awaiting-retry.receipt'),
+                                         os.path.join(evidence,'status.sealed.pending')) else 1
             assert info.st_uid==0 and info.st_gid==0 and info.st_nlink==expected_links
 for path in (run,terminal):
     info=os.lstat(path); assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode)==0o500
@@ -599,5 +610,5 @@ assert stat.S_IMODE(os.lstat(evidence).st_mode)==0o700
 PY
 chmod 0500 "$EVIDENCE_ROOT"
 sync -f "$EVIDENCE_ROOT"
-mv -T "$EVIDENCE_ROOT/status.pass.pending" "$EVIDENCE_ROOT/status"
+mv -T "$EVIDENCE_ROOT/status.sealed.pending" "$EVIDENCE_ROOT/status"
 sync -f "$EVIDENCE_ROOT"

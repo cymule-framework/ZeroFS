@@ -225,23 +225,29 @@ terminal directory; and holds the same evidence-root flock while requiring the
 exact sealed runner inventory. Concurrent collection cannot race publication,
 and a repeated collector after terminal sealing exits before modifying the
 evidence tree. The final pre-seal inventory rejects every unknown or pending
-artifact.
-requires exact START/END records in a non-empty journal for the sealed systemd
+artifact. Collection requires exact START/END records in a non-empty journal for the sealed systemd
 Invocation/cgroup; revalidates the live RustFS process, unit and listener before
 and after the final empty S3 inventory; and proves the transient cgroup is absent.
 Only then does it publish an immutable PASS body, the recursive evidence
 manifest, verify that manifest, and publish a final seal binding the manifest,
 terminal manifest, PASS body, and collector attempt. The seal remains
-`SEALED_AWAITING_STATUS`; neither it nor the non-canonical PASS body is terminal
-success. The canonical status path is changed to a hard link of the already
-sealed PASS body only after the final seal is durable and every
-retained file is root:root 0400, the run/terminal directories are 0500, and the
-evidence root is 0500. A qualification collection must then retry both scripts
-with the preflight-bound versioned
-`verify-rhizome-barrier-sealed-retry.sh`. It archives an exact before/after
-content and filesystem-identity inventory proving both retries fail without
-changing the sealed tree; its report remains outside that immutable tree.
-Both scripts fail closed and a partially created run is permanently unusable.
+`SEALED_AWAITING_RETRY_VERIFICATION`; neither it nor the non-canonical PASS body
+is terminal success. The collector switches canonical status only to that
+non-PASS state and makes every retained file root:root 0400 plus the
+run/terminal/evidence directories 0500 before exiting.
+
+The preflight-bound `verify-rhizome-barrier-sealed-retry.sh` is the unique root
+finalizer. While holding the same evidence-root lock it verifies stable FD and
+locator identities, atomically creates a fresh UUID child below the pre-created
+root:root 0700
+`/opt/rhizome/validation/zerofs-barrier-fault/retry-evidence/` parent,
+retains exact before/after content and filesystem-identity inventories plus both
+retry logs, and seals them with a manifest and readback receipt. Only after the
+two scripts have failed without changing the source tree and the external report
+is durable does the finalizer atomically switch canonical status to the already
+sealed PASS inode. A partial finalizer leaves the source non-PASS and its external
+directory permanently retained. All three scripts fail closed and a partially
+created run is permanently unusable.
 
 The closed scenarios are:
 
