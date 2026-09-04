@@ -256,8 +256,9 @@ retry. The explicit post-rename fsync-error mode exists only to exercise that
 unknown-outcome/readback path before qualification. All three scripts fail
 closed and a partial pre-PONR run is permanently unusable. The CI-only,
 explicitly opted-in `test-rhizome-barrier-finalizer-ponr.sh` builds a synthetic
-sealed graph, injects the post-rename fsync error, then invokes the same
-finalizer again and requires its read-only convergence path to succeed.
+sealed graph, proves an in-place same-inode/same-size runner rewrite is rejected,
+injects the post-rename fsync error, then invokes the same finalizer again and
+requires its read-only convergence path to succeed.
 
 The closed scenarios are:
 

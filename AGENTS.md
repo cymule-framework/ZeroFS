@@ -353,7 +353,8 @@ attribution intact.
   with 0400 files.
   Keep the three production scripts and the explicitly opted-in synthetic PONR
   test under the exact CI `bash -n` and ShellCheck gate; CI must execute the
-  rename-success/fsync-error/read-only-convergence test as root. Any partial
+  same-inode/same-size locator rewrite rejection and the rename-success/
+  fsync-error/read-only-convergence test as root. Any partial
   runner or collector state burns the run UUID.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, explicitly call `DbReader::close` to cancel and join the FollowLatest

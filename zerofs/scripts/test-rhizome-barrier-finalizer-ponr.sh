@@ -86,6 +86,34 @@ for root in (run_root,evidence):
     os.chmod(root,0o500)
 PY
 
+# A same-inode, same-size locator rewrite must be rejected by content readback,
+# even though every device/inode/size comparison still matches preflight.
+RUNNER_IDENTITY=$(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner")
+cp -p "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/runner.saved"
+python3 - "$SCRIPT_ROOT/runner" <<'PY'
+import os,sys
+path=sys.argv[1]
+with open(path,'r+b',buffering=0) as target:
+    first=target.read(1); assert first
+    target.seek(0); target.write(bytes([first[0]^1])); target.flush(); os.fsync(target.fileno())
+PY
+[[ $(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner") == "$RUNNER_IDENTITY" ]]
+set +e
+"$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector"
+MUTATION_EXIT=$?
+set -e
+[[ $MUTATION_EXIT != 0 ]]
+[[ ! -e $RETRY_PARENT/$RUN_ID ]]
+[[ $(cat "$EVIDENCE_ROOT/status") == SEALED_AWAITING_RETRY_VERIFICATION ]]
+python3 - "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/runner.saved" <<'PY'
+import os,sys
+path,source=sys.argv[1:]; data=open(source,'rb').read()
+with open(path,'r+b',buffering=0) as target:
+    target.seek(0); target.write(data); target.truncate(); target.flush(); os.fsync(target.fileno())
+PY
+rm -f "$SCRIPT_ROOT/runner.saved"
+[[ $(stat -Lc '%d:%i:%s' "$SCRIPT_ROOT/runner") == "$RUNNER_IDENTITY" ]]
+
 set +e
 RHIZOME_BARRIER_FINALIZER_TEST_POST_RENAME_FSYNC_ERROR=1 \
     "$SCRIPT_ROOT/finalizer" "$RUN_ID" "$SCRIPT_ROOT/runner" "$SCRIPT_ROOT/collector"
