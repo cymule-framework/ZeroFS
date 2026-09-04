@@ -280,6 +280,10 @@ attribution intact.
   digest. Context, claim, atomic no-replace handshake, and read-only recovery
   must all match that same command/claim; accepting any EffectDispatched value
   is not sufficient. Retain child ownership until bounded wait confirms reap.
+  The final handshake pathname alone is not readiness: child holds its file
+  lock across no-replace publish and directory fsync, and parent may kill only
+  after it acquires that lock. If bounded reap fails, abort without S3 cleanup
+  rather than detach a possible writer.
 - Cold fault recovery is read-only: use DbReader and remote-durable graph/data
   reads, assert zero object-store PUTs, and drop the reader. Never open an RW
   writer, call materialize, or close/flush during recovery.

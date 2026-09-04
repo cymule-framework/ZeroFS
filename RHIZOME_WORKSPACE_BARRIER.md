@@ -171,8 +171,12 @@ request/claim record digests, barrier ID, included sequence, and expected
 receipt digest. It is written to a temporary inode, file-synced, atomically
 published no-replace, and parent-directory-synced before the parent can observe
 it. The parent strictly decodes the closed field set, kills only after that
-publication, and must observe `SIGKILL`; a child guard retains process ownership
-until successful reap and applies a deadline to both crash and recovery paths.
+publication and acquisition of the child's handshake lock (released only after
+the directory fsync), and must observe `SIGKILL`; a child guard retains process
+ownership until successful reap and applies a deadline to both crash and
+recovery paths. If the guard cannot reap even after SIGKILL within its bounded
+cleanup window, the parent aborts rather than detach a possible writer and run
+S3 cleanup concurrently.
 
 The closed scenarios are:
 
@@ -201,6 +205,11 @@ after the matrix, deletes only paths returned through its exact `PrefixStore`,
 and requires the final prefix to be empty. Context, claim, handshake, and
 recovery records are intentionally retained in the operator run directory for
 later evidence hashing.
+
+Unit tests drive the quota at its exact count/byte boundary, reject count+1 and
+byte+1 before the inner store observes them, reject multipart, and race
+concurrent writers while proving the retained object count/bytes cannot exceed
+the configured limit.
 
 The ordinary unit suite separately verifies an applied manifest response error
 against a real coordinated SlateDB stack and exact read-only recovery. That is

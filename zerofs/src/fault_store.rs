@@ -295,6 +295,7 @@ impl ObjectStore for FaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
@@ -392,5 +393,93 @@ mod tests {
             store.get(&manifest).await.unwrap().bytes().await.unwrap(),
             bytes::Bytes::from_static(b"manifest")
         );
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    #[tokio::test]
+    async fn put_limits_reject_before_forwarding() {
+        let inner = Arc::new(InMemory::new());
+        let (store, ctl) = FaultStore::new(inner.clone());
+        ctl.set_put_limits(2, 4);
+        store
+            .put(&Path::from("a"), b"aa".to_vec().into())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("b"), b"bb".to_vec().into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .put(&Path::from("c"), Vec::<u8>::new().into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let inner = Arc::new(InMemory::new());
+        let (store, ctl) = FaultStore::new(inner.clone());
+        ctl.set_put_limits(8, 3);
+        store
+            .put(&Path::from("exact"), b"abc".to_vec().into())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .put(&Path::from("over"), b"d".to_vec().into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.put_multipart(&Path::from("multipart")).await.is_err());
+        assert_eq!(
+            inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(feature = "rhizome-workspace-barrier-core")]
+    #[tokio::test]
+    async fn concurrent_puts_cannot_exceed_the_forwarded_byte_budget() {
+        let inner = Arc::new(InMemory::new());
+        let (store, ctl) = FaultStore::new(inner.clone());
+        ctl.set_put_limits(64, 64);
+        let attempts = (0..32).map(|index| {
+            let store = store.clone();
+            async move {
+                store
+                    .put(
+                        &Path::from(format!("key-{index}")),
+                        vec![index as u8; 4].into(),
+                    )
+                    .await
+            }
+        });
+        let results = futures::future::join_all(attempts).await;
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 16);
+        let retained = inner.list(None).try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(retained.len(), 16);
+        assert_eq!(retained.iter().map(|object| object.size).sum::<u64>(), 64);
     }
 }

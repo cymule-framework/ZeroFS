@@ -1122,6 +1122,7 @@ pub(crate) async fn foundation_process_crash_point(
         .as_bytes(),
     )
     .unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
     file.sync_all().unwrap();
     rustix::fs::renameat_with(
         &directory,
@@ -1132,6 +1133,7 @@ pub(crate) async fn foundation_process_crash_point(
     )
     .unwrap();
     directory.sync_all().unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock).unwrap();
     std::future::pending::<()>().await;
 }
 
@@ -2189,7 +2191,7 @@ mod tests {
         for line in contents.lines() {
             let (key, value) = line.split_once('=').expect("record line has one separator");
             assert!(expected_fields.contains(&key));
-            assert!(!value.is_empty());
+            assert!(!value.is_empty() && !value.contains('='));
             assert!(fields.insert(key.to_owned(), value.to_owned()).is_none());
         }
         assert_eq!(fields.len(), expected_fields.len());
@@ -2422,12 +2424,9 @@ mod tests {
             self.0.as_mut().unwrap()
         }
 
-        fn kill_and_wait(&mut self) -> std::process::ExitStatus {
-            let child = self.0.as_mut().unwrap();
-            child.kill().unwrap();
-            let status = child.wait().unwrap();
-            self.0 = None;
-            status
+        fn terminate_until(&mut self, deadline: std::time::Instant) -> std::process::ExitStatus {
+            self.0.as_mut().unwrap().kill().unwrap();
+            self.wait_until(deadline)
         }
 
         fn wait_until(&mut self, deadline: std::time::Instant) -> std::process::ExitStatus {
@@ -2447,9 +2446,21 @@ mod tests {
 
     impl Drop for KillJoinChild {
         fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
+            if let Some(child) = self.0.as_mut() {
                 let _ = child.kill();
-                let _ = child.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            self.0 = None;
+                            return;
+                        }
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        _ => std::process::abort(),
+                    }
+                }
             }
         }
     }
@@ -2473,12 +2484,27 @@ mod tests {
         scenario: &str,
         child: &mut std::process::Child,
     ) -> std::collections::BTreeMap<String, String> {
+        use std::io::Read;
+
         let child_pid = child.id();
         let marker = root.join(format!("{scenario}.handshake"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            match std::fs::read_to_string(&marker) {
-                Ok(contents) => {
+            match std::fs::File::open(&marker) {
+                Ok(mut file) => {
+                    match rustix::fs::flock(
+                        &file,
+                        rustix::fs::FlockOperation::NonBlockingLockShared,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(error) => panic!("lock durable handshake: {error}"),
+                    }
+                    let mut contents = String::new();
+                    file.read_to_string(&mut contents).unwrap();
                     let fields = parse_closed_record(
                         &contents,
                         &[
@@ -2500,6 +2526,7 @@ mod tests {
                     assert_eq!(fields["point"], scenario);
                     assert_eq!(fields["pid"], child_pid.to_string());
                     assert_eq!(fields["included_write_sequence"], "1");
+                    rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock).unwrap();
                     return fields;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2568,7 +2595,9 @@ mod tests {
                     }
                     _ => assert_ne!(handshake["receipt_digest"], "none"),
                 }
-                let status = crash.kill_and_wait();
+                let status = crash.terminate_until(
+                    std::time::Instant::now() + std::time::Duration::from_secs(120),
+                );
                 assert_eq!(status.signal(), Some(libc::SIGKILL));
 
                 let mut recovery = spawn_fault_child("recover", scenario);
