@@ -23,6 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+install -d -m 0755 -o root -g root /opt/rhizome /opt/rhizome/validation "$BASE"
 install -d -m 0700 -o root -g root "$BASE/runs" "$BASE/evidence" "$RETRY_PARENT" "$SCRIPT_ROOT"
 [[ ! -e $RUN_ROOT && ! -e $EVIDENCE_ROOT && ! -e $RETRY_PARENT/$RUN_ID ]]
 mkdir -m 0700 "$RUN_ROOT" "$EVIDENCE_ROOT"

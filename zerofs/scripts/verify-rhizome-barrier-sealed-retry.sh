@@ -32,7 +32,7 @@ for path in sys.argv[1:]:
     current='/'
     for part in (part for part in path.split('/') if part):
         current=os.path.join(current,part); info=os.lstat(current)
-        assert info.st_uid==0 and info.st_gid==0 and info.st_mode & 0o022 == 0
+        assert info.st_uid==0 and info.st_gid==0 and info.st_mode & 0o022 == 0,(current,info.st_uid,info.st_gid,oct(stat.S_IMODE(info.st_mode)))
         assert not stat.S_ISLNK(info.st_mode)
     assert stat.S_ISDIR(os.lstat(path).st_mode)
 PY
@@ -78,7 +78,7 @@ for path in sys.argv[1:]:
     current='/'
     for part in (part for part in path.split('/') if part):
         current=os.path.join(current,part); info=os.lstat(current)
-        assert info.st_uid==0 and info.st_gid==0 and info.st_mode & 0o022 == 0
+        assert info.st_uid==0 and info.st_gid==0 and info.st_mode & 0o022 == 0,(current,info.st_uid,info.st_gid,oct(stat.S_IMODE(info.st_mode)))
         assert not stat.S_ISLNK(info.st_mode)
     final=os.lstat(path); assert stat.S_ISREG(final.st_mode) and final.st_nlink==1
 PY
