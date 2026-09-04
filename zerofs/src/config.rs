@@ -666,6 +666,15 @@ pub struct PrometheusConfig {
 
 pub struct AwsConfig(pub std::collections::HashMap<String, String>);
 
+fn normalized_aws_option_key(key: &str) -> String {
+    let key = key.to_lowercase();
+    if key.starts_with("aws_") {
+        key
+    } else {
+        format!("aws_{key}")
+    }
+}
+
 impl std::fmt::Debug for AwsConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("AwsConfig([REDACTED])")
@@ -993,6 +1002,16 @@ impl Settings {
             );
         }
 
+        if let Some(aws) = &self.aws {
+            let mut normalized = HashSet::with_capacity(aws.0.len());
+            for key in aws.0.keys() {
+                let key = normalized_aws_option_key(key);
+                if !normalized.insert(key.clone()) {
+                    anyhow::bail!("duplicate normalized [aws] configuration key {key:?}");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1000,7 +1019,7 @@ impl Settings {
         let mut env_vars = Vec::new();
         if let Some(aws) = &self.aws {
             for (k, v) in &aws.0 {
-                env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
+                env_vars.push((normalized_aws_option_key(k), v.clone()));
             }
         }
         if let Some(azure) = &self.azure {
@@ -1536,6 +1555,51 @@ allow_http = "true"
         assert!(result.is_ok());
         let (settings, _) = result.unwrap();
         assert_eq!(settings.aws.unwrap().0.get("allow_http").unwrap(), "true");
+    }
+
+    #[test]
+    fn aws_prefixed_conditional_put_alias_reaches_the_native_only_parser() {
+        let mut settings = Settings::generate_default();
+        settings.aws = Some(AwsConfig(std::collections::HashMap::from([
+            (
+                "aws_conditional_put".to_owned(),
+                "redis://localhost:6379".to_owned(),
+            ),
+            ("skip_signature".to_owned(), "true".to_owned()),
+            ("region".to_owned(), "us-east-1".to_owned()),
+        ])));
+        let options = settings.cloud_provider_env_vars();
+        assert!(options.iter().any(|(key, value)| {
+            key == "aws_conditional_put" && value == "redis://localhost:6379"
+        }));
+
+        let error = crate::parse_object_store::parse_url_opts(
+            &settings.storage.url.parse().unwrap(),
+            options,
+        )
+        .expect_err("the real Settings conversion must not hide the removed Redis mode");
+        assert!(
+            error
+                .to_string()
+                .contains("requires native If-Match and If-None-Match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_normalized_aws_keys_are_rejected() {
+        let mut settings = Settings::generate_default();
+        settings.aws = Some(AwsConfig(std::collections::HashMap::from([
+            ("conditional_put".to_owned(), "etag".to_owned()),
+            ("aws_conditional_put".to_owned(), "etag".to_owned()),
+        ])));
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate normalized [aws]")
+        );
     }
 
     fn base_config_with_replication(replication: &str) -> String {

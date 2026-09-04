@@ -709,7 +709,12 @@ async fn resolve_bucket_identity_after_storage_preflight(
     actual_db_path: &str,
     db_mode: DatabaseMode,
 ) -> Result<bucket_identity::BucketIdentity> {
-    if !db_mode.is_read_only() {
+    if db_mode.is_read_only() {
+        info!("Reading bucket identity without mutation...");
+        return bucket_identity::BucketIdentity::get_existing(object_store, actual_db_path)
+            .await
+            .context("Failed to resolve existing bucket identity");
+    } else {
         crate::storage_compatibility::check_if_match_support(object_store, actual_db_path).await?;
     }
 
@@ -1133,6 +1138,22 @@ mod role_decision_tests {
                 .all(|path| path.as_ref().contains(".zerofs_compatibility_test_")),
             "only bounded compatibility-probe writes may occur"
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_startup_never_creates_a_missing_bucket_identity() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        resolve_bucket_identity_after_storage_preflight(
+            &store,
+            "db",
+            super::DatabaseMode::ReadOnly,
+        )
+        .await
+        .expect_err("read-only startup requires an existing bucket identity");
+        assert!(matches!(
+            store.get(&Path::from("db").join(".zerofs_bucket_id")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

@@ -11,6 +11,24 @@ pub struct BucketIdentity {
 }
 
 impl BucketIdentity {
+    /// Reads an existing bucket ID without creating persistent state.
+    pub async fn get_existing(
+        object_store: &Arc<dyn ObjectStore>,
+        db_path: &str,
+    ) -> anyhow::Result<Self> {
+        let marker_path = Path::from(db_path).join(BUCKET_ID_MARKER);
+        let bytes = object_store
+            .get(&marker_path)
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to read bucket ID marker: {error:#?}"))?
+            .bytes()
+            .await?;
+        let id_str = String::from_utf8(bytes.to_vec())?;
+        let id = Uuid::parse_str(id_str.trim())
+            .map_err(|error| anyhow::anyhow!("Invalid bucket ID format: {error:#?}"))?;
+        Ok(Self { id })
+    }
+
     /// Gets or creates a unique bucket ID for the given bucket
     /// This ID persists with the bucket and changes if the bucket is recreated
     pub async fn get_or_create(
@@ -116,5 +134,15 @@ mod tests {
             BucketIdentity::get_or_create(&store, "data"),
         );
         assert_eq!(a.unwrap().id(), b.unwrap().id(), "bucket ids must converge");
+    }
+
+    #[tokio::test]
+    async fn get_existing_never_creates_a_missing_marker() {
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        assert!(BucketIdentity::get_existing(&store, "data").await.is_err());
+        assert!(matches!(
+            store.get(&Path::from("data").join(BUCKET_ID_MARKER)).await,
+            Err(slatedb::object_store::Error::NotFound { .. })
+        ));
     }
 }

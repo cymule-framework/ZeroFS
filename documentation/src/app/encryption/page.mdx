@@ -173,7 +173,7 @@ ZeroFS writes three plaintext objects to the database path alongside the SST, ma
     A UUID written on first startup. ZeroFS namespaces the [local cache](/caching) with it: the cache lives in a per-bucket directory named after the UUID's first 8 characters. Deleting the object produces a new UUID and a fresh cache directory on the next startup; no filesystem data is lost.
   </Property>
   <Property name=".zerofs_compatibility_test_<uuid>" type="plaintext">
-    A transient probe created and deleted at every read-write startup to verify that the store supports conditional puts (`PutMode::Create`), which ZeroFS requires for fencing. Deletion is best-effort; leftovers from a crashed startup are cleaned at the next startup. Read-only mode skips the probe. On versioned buckets the put/delete cycle leaves noncurrent versions and delete markers.
+    A transient probe created and deleted before any other read-write startup mutation. It verifies `If-None-Match`, a current `If-Match`, and rejection of a stale `If-Match`, which ZeroFS requires for fencing. Deletion is best-effort; leftovers from a crashed startup are cleaned at the next startup. Read-only mode skips the probe and requires an existing bucket identity. On versioned buckets the put/delete cycle leaves noncurrent versions and delete markers.
   </Property>
 </Properties>
 

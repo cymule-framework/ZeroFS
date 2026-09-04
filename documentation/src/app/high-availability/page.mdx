@@ -226,7 +226,7 @@ peers = ["10.0.0.1:9000"]
 
 `role` is a bootstrap hint, not a permanent assignment. Configure both `replication_listen` and `peers` on both nodes so either can receive replication after a role swap. ZeroFS rejects a one-sided configuration instead of accepting a pair that cannot complete the reverse role swap.
 
-The storage backend must support exact conditional object updates, either natively or through the configured conditional-write adapter. The replication and client ports are unauthenticated; keep them on a trusted network. `node_id`, `replication_listen`, and `peers` support the same `${VAR}` substitution as the rest of the configuration.
+The storage backend must natively support exact `If-Match` and `If-None-Match` object updates. The replication and client ports are unauthenticated; keep them on a trusted network. `node_id`, `replication_listen`, and `peers` support the same `${VAR}` substitution as the rest of the configuration.
 
 Upgrade the two HA peers together. New releases understand the legacy leader marker, but old releases cannot participate after the phased marker has been written, and the replication handshake is release-coupled.
 
